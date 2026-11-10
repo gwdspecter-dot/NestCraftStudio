@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check core models ui tests
+      - name: mypy (non-blocking until cleaned up)
+        run: mypy core models
+        continue-on-error: true
+      # build123d в requirements, но тяжёлые B-Rep тесты помечены slow — здесь их пропускаем
+      - run: pytest -m "not slow and not gui"
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+  # Ревизия 3 §1.7: реальный build123d / OpenCASCADE (маркер slow)
+  slow:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        b123d: ["0.9.0", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install base deps (без pinned build123d из requirements)
+        run: |
+          pip install -r requirements-dev.txt
+          # Переустановим версию build123d из матрицы поверх requirements
+          if [ "${{ matrix.b123d }}" = "latest" ]; then
+            pip install -U "build123d"
+          else
+            pip install "build123d==${{ matrix.b123d }}"
+          fi
+          python -c "import build123d; print('build123d', getattr(build123d, '__version__', '?'))"
+      - name: Verify Extrinsic API (минимальная версия)
+        run: |
+          python - <<'PY'
+          from build123d import Extrinsic, Rotation
+          assert hasattr(Extrinsic, "XYZ"), "Extrinsic.XYZ required (min build123d 0.9.0)"
+          print("Extrinsic.XYZ OK")
+          PY
+      - name: Run slow B-Rep tests
+        run: pytest -m slow -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+  # Ревизия 4 §1.4: реальный probe PID на Windows (без os.kill → TerminateProcess)
+  windows-pid:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install minimal test deps
+        run: |
+          python -m pip install -U pip
+          pip install pytest
+          # project_io тянет models/logging — без PyQt6/build123d достаточно
+      - name: PID probe tests (native Windows API)
+        run: pytest tests/test_pid_alive_1_1.py tests/test_pid_start_1_3.py -v
+        env:
+          PYTHONPATH: .
+

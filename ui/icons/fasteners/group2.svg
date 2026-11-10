@@ -1,0 +1,35 @@
+<svg width="223" height="114" viewBox="0 0 223 114" fill="none" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<path d="M73.3996 56.302H30.8167V79.8346H73.3996V56.302Z" fill="#0F141C"/>
+<path d="M165.289 59.6638H73.3994V76.4728H165.289V59.6638Z" fill="#0F141C"/>
+<path d="M73.3996 28.8472H30.8167V56.302H73.3996V28.8472Z" fill="#1E293B"/>
+<use xlink:href="#stroke0_136_180" fill="#1E293B"/>
+<use xlink:href="#stroke0_136_180" fill="#787880" fill-opacity="0.16"/>
+<path d="M73.3994 45.6562H187.701V90.4804H73.3994V76.4728H165.289V59.6638H73.3994V45.6562Z" fill="#1E293B"/>
+<path d="M30.8167 28.8472V112.892" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke="#E2F1FF"/>
+<path d="M73.3994 28.8472V112.892" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke="#E2F1FF"/>
+<path d="M30.8167 56.302H73.3996" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke="#E2F1FF"/>
+<path d="M30.8167 79.8346H73.3996" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke="#E2F1FF"/>
+<path d="M73.3994 45.6562H187.701" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke="#E2F1FF"/>
+<path d="M73.3994 90.4804H187.701" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke="#E2F1FF"/>
+<path d="M73.3994 59.6638H165.289V76.4728H73.3994" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" stroke="#E2F1FF"/>
+<path d="M22.4121 68.0683H31.3589M176.495 68.0683H167.548M36.3293 68.0683H39.3115M44.2819 68.0683H62.1754M67.1459 68.0683H70.1281M75.0985 68.0683H92.992M97.9624 68.0683H100.945M105.915 68.0683H123.809M128.779 68.0683H131.761M136.732 68.0683H154.625M159.596 68.0683H162.578" stroke-width="1.4" stroke="#F43F5E" stroke-opacity="0.85"/>
+<path d="M30.8166 56.302H0" stroke-width="1.2" stroke="#38BDF8" stroke-opacity="0.75"/>
+<path d="M30.8166 79.8346H0" stroke-width="1.2" stroke="#38BDF8" stroke-opacity="0.75"/>
+<path d="M4.48242 56.302V79.8346" stroke-width="1.5" stroke="#38BDF8"/>
+<path d="M4.48242 56.302V13.7191H21.2915" stroke-width="1.2" stroke="#38BDF8" stroke-opacity="0.75"/>
+<path d="M15.8005 3.07333L18.1538 1.00021L16.4169 9.23665M7.84424 9.23665L9.6372 1.00021H12.5508C15.2402 1.00021 15.8005 3.35348 15.2402 5.09041C14.6239 7.44368 12.887 9.23665 10.5337 9.23665H7.84424Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#7DD3FC"/>
+<path d="M73.3994 28.8472V8.11603" stroke-width="1.2" stroke="#FBBF24" stroke-opacity="0.85"/>
+<path d="M165.289 59.6638V8.11603" stroke-width="1.2" stroke="#FBBF24" stroke-opacity="0.85"/>
+<path d="M73.3994 13.7191H165.289" stroke-width="1.5" stroke="#FBBF24"/>
+<path d="M113.181 9.23665L114.083 5.09041M114.083 5.09041L114.974 1.00021M114.083 5.09041H114.077M114.083 5.09041H118.784M117.887 9.23665L119.68 1.00021M121.697 3.07333L124.051 1.00021L122.314 9.23665" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#FDE68A"/>
+<path d="M165.289 59.6638H223" stroke-width="1.2" stroke="#38BDF8" stroke-opacity="0.75"/>
+<path d="M165.289 76.4728H223" stroke-width="1.2" stroke="#38BDF8" stroke-opacity="0.75"/>
+<path d="M218.518 46.2166V59.6638" stroke-width="1.5" stroke="#38BDF8"/>
+<path d="M218.518 89.92V76.4728" stroke-width="1.5" stroke="#38BDF8"/>
+<path d="M218.518 59.6638V76.4728" stroke-width="1.2" stroke="#38BDF8" stroke-opacity="0.75"/>
+<path d="M218.518 46.2165V13.7191H200.588" stroke-width="1.2" stroke="#38BDF8" stroke-opacity="0.75"/>
+<path d="M210.153 2.50832C209.768 1.64483 208.943 1.00021 207.536 1.00021H204.622L202.829 9.23665H205.519C207.872 9.23665 209.609 7.44368 210.225 5.09041C210.492 4.26255 210.505 3.29467 210.153 2.50832ZM210.153 2.50832C210.04 2.67853 209.95 2.86706 209.889 3.07333M210.153 2.50832C211.176 0.967762 214.063 0.926335 214.315 2.79318C214.595 4.53011 208.992 7.44368 208.712 9.23665H213.755" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#7DD3FC"/>
+<defs>
+<path id="stroke0_136_180" d="M73.3996 79.8346H30.8167V112.892H73.3996V79.8346Z"/>
+</defs>
+</svg>

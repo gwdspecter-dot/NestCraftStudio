@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local / runtime / test cache
+*.log
+.cache/
+.pytest_cache/
+
+# SQLite catalog (generated on first run; seed is in code)
+data/catalog/*.db
+data/catalog/*.db-shm
+data/catalog/*.db-wal
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Packaging output
+*.zip

@@ -1,0 +1,40 @@
+[project]
+name = "nestcraft-studio"
+version = "0.0.18"
+description = "NestCraft Studio — мебельный 3D CAD с поддержкой B-Rep (build123d)"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# S110: запрет except ...: pass; BLE001: слепой except Exception (ревизия 3 §1.6)
+select = ["E", "F", "S110", "BLE001"]
+ignore = ["E501", "E402"]  # E402: late imports (Qt/OpenGL/bootstrap)
+
+[tool.ruff.lint.per-file-ignores]
+# BLE001 только в точках интеграции (OpenGL / Qt / build123d / SQLite / IO).
+# models/ и core/joint.py — правило активно; осознанные границы помечены # noqa: BLE001.
+"core/cad_kernel.py" = ["BLE001"]
+"core/geometry_service.py" = ["BLE001"]
+"core/background_tasks.py" = ["BLE001"]
+"core/project_io.py" = ["BLE001"]
+"core/issues.py" = ["BLE001"]
+"core/logging_setup.py" = ["BLE001"]
+"core/scene_controller.py" = ["BLE001"]
+"core/undo.py" = ["BLE001"]
+"core/catalog/*.py" = ["BLE001"]
+"core/catalog/**/*.py" = ["BLE001"]
+"core/_qt_compat.py" = ["BLE001"]
+"ui/*.py" = ["BLE001"]  # OpenGL/Qt границы; F403/F405/E702/F841 включены (ревизия 4 §1.5)
+"ui/**/*.py" = ["BLE001"]
+"tests/*.py" = ["S110", "BLE001"]
+"tests/**/*.py" = ["S110", "BLE001"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["core", "models"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
