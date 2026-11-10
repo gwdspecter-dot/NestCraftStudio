@@ -131,12 +131,13 @@ def eval_math_expression(
 
     # Быстрый путь для обычного числа
     try:
-        direct = float(s)
+        direct: float | None = float(s)
+    except ValueError:
+        direct = None
+    if direct is not None:
         if not math.isfinite(direct):
             raise ValueError("Result is not finite")
         return direct
-    except ValueError:
-        pass
 
     # Обработка относительных операторов: +=, -=, *=, /=
     rel_op = None
