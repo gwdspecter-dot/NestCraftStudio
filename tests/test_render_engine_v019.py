@@ -235,7 +235,103 @@ class TestRenderEngineV019(unittest.TestCase):
         finally:
             Panel._controller_unbound = False
 
+    def test_live_panel_collisions_v019(self):
+        """Проверяем быстрый расчёт 3D-пересечений find_live_panel_collisions (касание 0 мм не является коллизией, врезание возвращает бокс пересечения)."""
+        from models.panel import Panel
+
+        Panel._controller_unbound = True
+        try:
+            # Левая стойка [0..16] и полка [16..584] ровно встык — коллизий быть не должно
+            left = Panel("Боковина Л", 0.0, 0.0, 0.0, 16.0, 720.0, 560.0, rebuild=False)
+            shelf_touch = Panel("Полка встык", 16.0, 350.0, 0.0, 568.0, 16.0, 540.0, rebuild=False)
+            hits_touch = glmath.find_live_panel_collisions([left, shelf_touch])
+            self.assertEqual(len(hits_touch), 0)
+
+            # Полка врезается в левую боковину на 8 мм (x=8.0 -> бокс пересечения x=8, y=350, z=0, w=8, h=16, d=540)
+            shelf_overlap = Panel("Полка с врезанием", 8.0, 350.0, 0.0, 568.0, 16.0, 540.0, rebuild=False)
+            hits_overlap = glmath.find_live_panel_collisions([left, shelf_overlap])
+            self.assertEqual(len(hits_overlap), 1)
+            pa, pb, ibox, vol = hits_overlap[0]
+            self.assertIs(pa, left)
+            self.assertIs(pb, shelf_overlap)
+            self.assertEqual(ibox, (8.0, 350.0, 0.0, 8.0, 16.0, 540.0))
+            self.assertAlmostEqual(vol, 8.0 * 16.0 * 540.0)
+        finally:
+            Panel._controller_unbound = False
+
+    def test_mirror_panel_and_linear_array_v019(self):
+        """Проверяем зеркальное копирование детали (с отражением кромок, пазов и сверловки) и линейный массив (шаг, просвет, деление проёма)."""
+        from core.array_mirror import (
+            build_linear_array_panels,
+            build_mirror_panel,
+            compute_mirror_plane_coord,
+        )
+        from models.panel import Block, Panel
+
+        Panel._controller_unbound = True
+        try:
+            blk = Block("Корпус 600", "1", "01.00")
+            blk.x = 0.0
+            blk.width = 600.0
+            left_side = Panel("Боковина левая", 0.0, 0.0, 0.0, 16.0, 720.0, 560.0, rebuild=False)
+            left_side.edges = {"left": "ПВХ 2 мм", "right": "ПВХ 0.4 мм", "front": "ПВХ 2 мм"}
+            left_side.holes = [(16.0, 100.0, 50.0, 4.0, 12.0, "-X")]
+            left_side.grooves = [{"face": "right", "axis": "Y", "offset": 20.0, "width": 4.0, "depth": 8.0}]
+            blk.add_panel(left_side)
+
+            plane_x = compute_mirror_plane_coord(left_side, "X", "cabinet", block=blk)
+            self.assertAlmostEqual(plane_x, 300.0)
+
+            right_side = build_mirror_panel(
+                left_side,
+                axis="X",
+                plane_coord=plane_x,
+                new_name="Боковина правая",
+                new_pos_num="1.2",
+                mirror_features=True,
+            )
+            # X: 2*300 - (0 + 16) = 584 мм
+            self.assertAlmostEqual(right_side.x, 584.0)
+            self.assertEqual(right_side.edges.get("left"), "ПВХ 0.4 мм")
+            self.assertEqual(right_side.edges.get("right"), "ПВХ 2 мм")
+            # Отверстие на x=16 со стороны -X отражается в x=0 со стороны +X
+            self.assertEqual(right_side.holes[0][0], 0.0)
+            self.assertEqual(right_side.holes[0][5], "+X")
+            # Паз на правой грани отражается на левую грань
+            self.assertEqual(right_side.grooves[0]["face"], "left")
+
+            # Линейный массив полок: 3 полки в проёме 688 мм (равные ниши по высоте)
+            base_shelf = Panel("Полка", 16.0, 0.0, 0.0, 568.0, 16.0, 540.0, rebuild=False)
+            shelves_span = build_linear_array_panels(
+                base_shelf,
+                axis="Y",
+                count=3,
+                mode="divide_span",
+                value=688.0,
+                include_ends=False,
+            )
+            self.assertEqual(len(shelves_span), 3)
+            # Просвет одной ниши: (688 - 3 * 16) / 4 = 640 / 4 = 160 мм -> шаги: 160, 336, 512
+            self.assertAlmostEqual(shelves_span[0].y, 160.0)
+            self.assertAlmostEqual(shelves_span[1].y, 336.0)
+            self.assertAlmostEqual(shelves_span[2].y, 512.0)
+
+            # Линейный массив с чистым просветом 200 мм (шаг = 200 + 16 = 216 мм)
+            shelves_gap = build_linear_array_panels(
+                base_shelf,
+                axis="Y",
+                count=2,
+                mode="clear_gap",
+                value=200.0,
+            )
+            self.assertEqual(len(shelves_gap), 2)
+            self.assertAlmostEqual(shelves_gap[0].y, 216.0)
+            self.assertAlmostEqual(shelves_gap[1].y, 432.0)
+        finally:
+            Panel._controller_unbound = False
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

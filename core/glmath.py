@@ -391,4 +391,99 @@ def compute_face_push_pull_box(
     return (coords[0], coords[1], coords[2], new_dims[0], new_dims[1], new_dims[2])
 
 
+def compute_aabb_intersection_box(
+    a0: tuple[float, float, float],
+    a1: tuple[float, float, float],
+    b0: tuple[float, float, float],
+    b1: tuple[float, float, float],
+    eps: float = 0.05,
+) -> tuple[float, float, float, float, float, float] | None:
+    """Возвращает 3D-бокс зоны взаимного врезания `(x, y, z, w, h, d)` двух AABB или `None`,
+    если детали лишь касаются гранями (`overlap <= eps`) либо не пересекаются."""
+    ix0 = max(float(a0[0]), float(b0[0]))
+    iy0 = max(float(a0[1]), float(b0[1]))
+    iz0 = max(float(a0[2]), float(b0[2]))
+    ix1 = min(float(a1[0]), float(b1[0]))
+    iy1 = min(float(a1[1]), float(b1[1]))
+    iz1 = min(float(a1[2]), float(b1[2]))
+    iw = ix1 - ix0
+    ih = iy1 - iy0
+    id_ = iz1 - iz0
+    if iw <= eps or ih <= eps or id_ <= eps:
+        return None
+    return (ix0, iy0, iz0, iw, ih, id_)
+
+
+def _obb_sat_overlaps(pa: Any, pb: Any, eps: float = 0.05) -> bool:
+    """Точная SAT-фильтрация для наклонных панелей (`has_rotation()`) по нормалям граней OBB."""
+    if not (hasattr(pa, "obb") and hasattr(pb, "obb")):
+        return True
+    ca, axes_a, half_a = pa.obb()
+    cb, axes_b, half_b = pb.obb()
+    dx = float(cb[0]) - float(ca[0])
+    dy = float(cb[1]) - float(ca[1])
+    dz = float(cb[2]) - float(ca[2])
+
+    for n in tuple(axes_a) + tuple(axes_b):
+        nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
+        dist = abs(dx * nx + dy * ny + dz * nz)
+        ra = sum(
+            float(half_a[k]) * abs(float(axes_a[k][0]) * nx + float(axes_a[k][1]) * ny + float(axes_a[k][2]) * nz)
+            for k in range(3)
+        )
+        rb = sum(
+            float(half_b[k]) * abs(float(axes_b[k][0]) * nx + float(axes_b[k][1]) * ny + float(axes_b[k][2]) * nz)
+            for k in range(3)
+        )
+        if (ra + rb) - dist <= eps:
+            return False
+    return True
+
+
+def find_live_panel_collisions(
+    panels: list[Any] | tuple[Any, ...],
+    eps: float = 0.05,
+    min_volume: float = 1.0,
+) -> list[tuple[Any, Any, tuple[float, float, float, float, float, float], float]]:
+    """Быстрый поиск живых 3D-коллизий деталей сцены в реальном времени (без блокировки UI).
+
+    Возвращает список `(panel_a, panel_b, overlap_box_xyzwhd, volume_mm3)`:
+    - Исключает касание смежных торцов/пластей (`overlap <= eps`);
+    - Для повёрнутых панелей дополнительно выполняет SAT-проверку по осям OBB.
+    """
+    vis_panels = [p for p in (panels or ()) if getattr(p, "visible", True)]
+    n = len(vis_panels)
+    if n < 2:
+        return []
+
+    aabbs = []
+    rots = []
+    for p in vis_panels:
+        if hasattr(p, "world_aabb"):
+            aabbs.append(p.world_aabb())
+        else:
+            x0, y0, z0 = float(p.x), float(p.y), float(p.z)
+            aabbs.append(((x0, y0, z0), (x0 + float(p.width), y0 + float(p.height), z0 + float(p.depth))))
+        rots.append(bool(hasattr(p, "has_rotation") and p.has_rotation()))
+
+    hits: list[tuple[Any, Any, tuple[float, float, float, float, float, float], float]] = []
+    for i in range(n):
+        a0, a1 = aabbs[i]
+        pa = vis_panels[i]
+        rot_a = rots[i]
+        for j in range(i + 1, n):
+            b0, b1 = aabbs[j]
+            box = compute_aabb_intersection_box(a0, a1, b0, b1, eps=eps)
+            if box is None:
+                continue
+            vol = box[3] * box[4] * box[5]
+            if vol < min_volume:
+                continue
+            pb = vis_panels[j]
+            if (rot_a or rots[j]) and not _obb_sat_overlaps(pa, pb, eps=eps):
+                continue
+            hits.append((pa, pb, box, float(vol)))
+    return hits
+
+
 

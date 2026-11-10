@@ -897,3 +897,45 @@ class PasteBlocksCommand(Command):
             b.selected = False
             for p in getattr(b, "panels", []) or []:
                 p.selected = False
+
+
+class AddMultiplePanelsCommand(Command):
+    """Добавление пачки панелей (Зеркальная копия / Линейный массив) за один шаг Undo/Redo."""
+
+    def __init__(self, blocks: list, block, panels: list, description: str = "Массив деталей"):
+        super().__init__(description)
+        self.blocks = blocks
+        self.block = block
+        self.panels = list(panels)
+        self._block_was_missing = False
+
+    def redo(self) -> None:
+        if self.block not in self.blocks:
+            self.blocks.append(self.block)
+            self._block_was_missing = True
+        for b in self.blocks:
+            b.selected = False
+            for existing in getattr(b, "panels", []) or []:
+                existing.selected = False
+        for p in self.panels:
+            p._block = self.block
+            if p not in self.block.panels:
+                self.block.panels.append(p)
+            p.selected = True
+        if getattr(self.block, "joints", None):
+            from core.joint import apply_joints
+
+            apply_joints(self.block)
+
+    def undo(self) -> None:
+        for p in self.panels:
+            p.selected = False
+            if p in self.block.panels:
+                self.block.panels.remove(p)
+        if getattr(self.block, "joints", None):
+            from core.joint import apply_joints
+
+            apply_joints(self.block)
+        if self._block_was_missing and self.block in self.blocks and not self.block.panels:
+            self.blocks.remove(self.block)
+

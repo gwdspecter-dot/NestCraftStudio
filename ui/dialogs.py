@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QLineEdit,
     QDoubleSpinBox,
+    QSpinBox,
     QCheckBox,
     QDialogButtonBox,
     QVBoxLayout,
@@ -344,3 +345,220 @@ class HoleDialog(QDialog):
         """id крепежа из каталога (пустая строка для «Свой размер»)."""
         p = self._current_preset()
         return (p or {}).get("id", "") or ""
+
+
+class MirrorPanelDialog(QDialog):
+    """Диалог создания зеркальной копии детали (Ctrl+M)."""
+
+    def __init__(self, panel, block=None, parent=None):
+        super().__init__(parent)
+        self.panel = panel
+        self.block = block if block is not None else getattr(panel, "_block", None)
+        self.setWindowTitle(f"Зеркальная копия — {panel.name}")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.axis_combo = QComboBox()
+        self.axis_combo.addItem("X — Слева ↔ Справа (боковины / фасады)", "X")
+        self.axis_combo.addItem("Y — Снизу ↔ Сверху (дно / крышка / полки)", "Y")
+        self.axis_combo.addItem("Z — Сзади ↔ Спереди (задняя / передняя)", "Z")
+        self.axis_combo.currentIndexChanged.connect(self._update_preview)
+        form.addRow("Ось отражения:", self.axis_combo)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Центр изделия / корпуса (авто)", "cabinet")
+        self.mode_combo.addItem("Вплотную за правым / верхним / передним торцом детали", "self_max")
+        self.mode_combo.addItem("Вплотную перед левым / нижним / задним торцом детали", "self_min")
+        self.mode_combo.addItem("Заданная координата плоскости, мм", "custom")
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addRow("Плоскость симметрии:", self.mode_combo)
+
+        self.custom_coord_spin = SmartDoubleSpinBox(context_obj=panel)
+        self.custom_coord_spin.setRange(-20000.0, 20000.0)
+        self.custom_coord_spin.setDecimals(1)
+        self.custom_coord_spin.setValue(300.0)
+        self.custom_coord_spin.setEnabled(False)
+        self.custom_coord_spin.valueChanged.connect(self._update_preview)
+        form.addRow("Координата плоскости, мм:", self.custom_coord_spin)
+
+        self.mirror_features_cb = QCheckBox("Зеркально отразить отверстия присадки, пазы и кромки")
+        self.mirror_features_cb.setChecked(True)
+        self.mirror_features_cb.toggled.connect(self._update_preview)
+        form.addRow("", self.mirror_features_cb)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet(
+            "color: #334155; font-size: 11px; background: #f1f5f9; "
+            "padding: 6px 8px; border-radius: 4px;"
+        )
+        form.addRow("Расчёт:", self.preview_label)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_preview()
+
+    def _on_mode_changed(self, _index: int) -> None:
+        is_custom = self.mode_combo.currentData() == "custom"
+        self.custom_coord_spin.setEnabled(is_custom)
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        from core.array_mirror import compute_mirror_plane_coord
+
+        ax = str(self.axis_combo.currentData() or "X")
+        mode = str(self.mode_combo.currentData() or "cabinet")
+        plane_c = compute_mirror_plane_coord(
+            self.panel,
+            axis=ax,
+            mode=mode,
+            custom_coord=float(self.custom_coord_spin.value()),
+            block=self.block,
+        )
+        if mode != "custom":
+            self.custom_coord_spin.blockSignals(True)
+            self.custom_coord_spin.setValue(plane_c)
+            self.custom_coord_spin.blockSignals(False)
+
+        x, y, z = float(self.panel.x), float(self.panel.y), float(self.panel.z)
+        w, h, d = float(self.panel.width), float(self.panel.height), float(self.panel.depth)
+        if ax == "X":
+            nx, ny, nz = 2.0 * plane_c - (x + w), y, z
+        elif ax == "Y":
+            nx, ny, nz = x, 2.0 * plane_c - (y + h), z
+        else:
+            nx, ny, nz = x, y, 2.0 * plane_c - (z + d)
+        holes_n = len(getattr(self.panel, "holes", []) or [])
+        grooves_n = len(getattr(self.panel, "grooves", []) or [])
+        self.preview_label.setText(
+            f"Плоскость {ax} = {plane_c:.1f} мм\n"
+            f"Новая позиция копии: X={nx:.1f}, Y={ny:.1f}, Z={nz:.1f} мм\n"
+            f"Отверстий: {holes_n}, пазов: {grooves_n}"
+        )
+
+    def get_mirror_params(self) -> dict:
+        return {
+            "axis": str(self.axis_combo.currentData() or "X"),
+            "mode": str(self.mode_combo.currentData() or "cabinet"),
+            "custom_coord": float(self.custom_coord_spin.value()),
+            "mirror_features": bool(self.mirror_features_cb.isChecked()),
+        }
+
+
+class LinearArrayDialog(QDialog):
+    """Диалог создания линейного массива деталей (полки, перегородки, фасады) (Ctrl+Shift+A)."""
+
+    def __init__(self, panel, parent=None):
+        super().__init__(parent)
+        self.panel = panel
+        self.setWindowTitle(f"Линейный массив — {panel.name}")
+        self.setMinimumWidth(440)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.axis_combo = QComboBox()
+        # По умолчанию для горизонтальной полки выбираем ось Y, для вертикальной — X
+        default_axis = "Y" if float(panel.width) >= float(panel.height) else "X"
+        self.axis_combo.addItem("Y — По высоте (полки / ящики)", "Y")
+        self.axis_combo.addItem("X — По ширине (перегородки / секции)", "X")
+        self.axis_combo.addItem("Z — По глубине", "Z")
+        idx_ax = self.axis_combo.findData(default_axis)
+        if idx_ax >= 0:
+            self.axis_combo.setCurrentIndex(idx_ax)
+        self.axis_combo.currentIndexChanged.connect(self._update_preview)
+        form.addRow("Направление массива:", self.axis_combo)
+
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 50)
+        self.count_spin.setValue(3)
+        self.count_spin.valueChanged.connect(self._update_preview)
+        form.addRow("Количество новых копий:", self.count_spin)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Шаг между базами деталей (step), мм", "step")
+        self.mode_combo.addItem("Зазор в свету между деталями (clear_gap), мм", "clear_gap")
+        self.mode_combo.addItem("Равномерно разделить проём (divide_span), мм", "divide_span")
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addRow("Режим расчёта:", self.mode_combo)
+
+        self.value_spin = SmartDoubleSpinBox(context_obj=panel)
+        self.value_spin.setRange(-20000.0, 20000.0)
+        self.value_spin.setDecimals(1)
+        self.value_spin.setValue(320.0)
+        self.value_spin.valueChanged.connect(self._update_preview)
+        self.value_label = QLabel("Шаг / проём (или формула), мм:")
+        form.addRow(self.value_label, self.value_spin)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet(
+            "color: #334155; font-size: 11px; background: #f1f5f9; "
+            "padding: 6px 8px; border-radius: 4px;"
+        )
+        form.addRow("Координаты копий:", self.preview_label)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_preview()
+
+    def _on_mode_changed(self, _index: int) -> None:
+        mode = str(self.mode_combo.currentData() or "step")
+        if mode == "divide_span":
+            self.value_label.setText("Внутренний проём секции, мм:")
+            if abs(float(self.value_spin.value())) < 400.0:
+                self.value_spin.setValue(688.0)
+        elif mode == "clear_gap":
+            self.value_label.setText("Чистый просвет между деталями, мм:")
+            if abs(float(self.value_spin.value())) > 600.0:
+                self.value_spin.setValue(300.0)
+        else:
+            self.value_label.setText("Шаг между копиями (или формула), мм:")
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        from core.array_mirror import compute_linear_array_offsets
+
+        ax = str(self.axis_combo.currentData() or "Y")
+        cnt = int(self.count_spin.value())
+        mode = str(self.mode_combo.currentData() or "step")
+        val = float(self.value_spin.value())
+        coords = compute_linear_array_offsets(
+            self.panel,
+            axis=ax,
+            count=cnt,
+            spacing_mode=mode,
+            value_mm=val,
+        )
+        preview_items = ", ".join(f"{c:.1f}" for c in coords[:6])
+        if len(coords) > 6:
+            preview_items += f" … (+{len(coords) - 6})"
+        self.preview_label.setText(
+            f"Ось {ax}: будет создано {cnt} дет.\n"
+            f"Координаты {ax}: [{preview_items}] мм"
+        )
+
+    def get_array_params(self) -> dict:
+        return {
+            "axis": str(self.axis_combo.currentData() or "Y"),
+            "count": int(self.count_spin.value()),
+            "spacing_mode": str(self.mode_combo.currentData() or "step"),
+            "value_mm": float(self.value_spin.value()),
+        }
+

@@ -279,6 +279,12 @@ class Viewport3D(QOpenGLWidget):
         self.ghost_alpha: float = 0.18
         self._clip_plane_active: bool = False
 
+        # Пункт 3: Живая подсветка 3D-коллизий в реальном времени
+        self.live_collision_mode: bool = True
+        self._live_collision_cache_key: tuple | None = None
+        self._live_collision_hits: list[tuple[Panel, Panel, tuple[float, float, float, float, float, float], float]] = []
+        self._live_colliding_panels: set[Panel] = set()
+
         # Состояния мыши и рамки выделения
         self.last_mouse_pos = QPoint()
         self.press_pos = QPoint()
@@ -982,6 +988,13 @@ class Viewport3D(QOpenGLWidget):
             glDisable(GL_CLIP_DISTANCE0)
             self._clip_plane_active = False
 
+        # Обновляем быстрый список живых 3D-коллизий по текущим позам панелей
+        if self.live_collision_mode:
+            self._refresh_live_collisions()
+        else:
+            self._live_collision_hits = []
+            self._live_colliding_panels = set()
+
         if self.display_mode == "xray":
             self._draw_scene_xray()
         else:
@@ -1016,13 +1029,19 @@ class Viewport3D(QOpenGLWidget):
             glDepthFunc(GL_LEQUAL)
             self._begin_line_batch()
             try:
+                colliding_set = self._live_colliding_panels
                 for block in self.blocks:
                     for panel in block.panels:
                         if has_ghosts and panel not in focus_set:
                             self._draw_panel_edges(panel, (0.72, 0.75, 0.80), include_features=False)
                         else:
                             is_selected = panel.selected or block.selected
-                            color = (0.95, 0.1, 0.1) if is_selected else (0.15, 0.15, 0.15)
+                            if panel in colliding_set:
+                                color = (0.98, 0.08, 0.16)
+                            elif is_selected:
+                                color = (0.95, 0.1, 0.1)
+                            else:
+                                color = (0.15, 0.15, 0.15)
                             self._draw_panel_edges(panel, color, include_features=True)
             finally:
                 self._flush_line_batch()
@@ -1034,6 +1053,9 @@ class Viewport3D(QOpenGLWidget):
 
         if self.section_enabled:
             self._draw_section_plane_gizmo()
+
+        if self.live_collision_mode and self._live_collision_hits:
+            self._draw_live_collision_zones()
 
         if self.fastener_mode and self.fastener_joint is not None:
             self._draw_joint_and_preview()
@@ -1372,7 +1394,10 @@ class Viewport3D(QOpenGLWidget):
         glUseProgram(self._prog_solid)
         mvp_loc = glGetUniformLocation(self._prog_solid, "uMVP")
         glUniformMatrix4fv(mvp_loc, 1, GL_TRUE, self._mvp)
-        if is_selected:
+        is_colliding = self.live_collision_mode and (p in self._live_colliding_panels)
+        if is_colliding:
+            col = (0.98, 0.42, 0.42) if is_selected else (0.96, 0.54, 0.54)
+        elif is_selected:
             col = (0.95, 0.72, 0.68)
         else:
             col = tuple(p.color)
@@ -1569,6 +1594,107 @@ class Viewport3D(QOpenGLWidget):
             pts.append(corners[i])
             pts.append(corners[(i + 1) % 4])
         self._draw_lines(np.asarray(pts, dtype=np.float32), (0.96, 0.58, 0.08), 1.5)
+
+    def toggle_live_collision_mode(self, enabled: bool | None = None) -> bool:
+        """Включает/выключает живую подсветку 3D-коллизий деталей в реальном времени."""
+        if enabled is None:
+            self.live_collision_mode = not bool(self.live_collision_mode)
+        else:
+            self.live_collision_mode = bool(enabled)
+        self._live_collision_cache_key = None
+        if self.live_collision_mode:
+            hits = self._refresh_live_collisions()
+            if hits:
+                self.fastener_message.emit(
+                    f"⚡ Живые коллизии ВКЛ: обнаружено пересечений — {len(hits)}"
+                )
+            else:
+                self.fastener_message.emit("⚡ Живые коллизии ВКЛ: пересечений не обнаружено")
+        else:
+            self._live_collision_hits = []
+            self._live_colliding_panels = set()
+            self.fastener_message.emit("⚡ Живые коллизии ВЫКЛ")
+        self.update()
+        return self.live_collision_mode
+
+    def _refresh_live_collisions(self) -> list[tuple[Panel, Panel, tuple[float, float, float, float, float, float], float]]:
+        """Мгновенно обновляет список 3D-коллизий при изменении поз панелей (с кэшированием по pose_key)."""
+        panels = self.panels
+        key = tuple(
+            (id(p), p.pose_key() if hasattr(p, "pose_key") else (p.x, p.y, p.z, p.width, p.height, p.depth))
+            for p in panels
+            if getattr(p, "visible", True)
+        )
+        if self._live_collision_cache_key == key:
+            return self._live_collision_hits
+        self._live_collision_cache_key = key
+        hits = glmath.find_live_panel_collisions(panels)
+        self._live_collision_hits = hits
+        colliding: set[Panel] = set()
+        for pa, pb, _box, _vol in hits:
+            colliding.add(pa)
+            colliding.add(pb)
+        self._live_colliding_panels = colliding
+        return hits
+
+    def _draw_live_collision_zones(self) -> None:
+        """Рисует ярко-красные 3D-боксы зон физического врезания деталей с диагональной штриховкой."""
+        if not self._live_collision_hits:
+            return
+        glDisable(GL_DEPTH_TEST)
+        pts: list[tuple[float, float, float]] = []
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+            # Диагонали граней для визуальной штриховки объёма коллизии
+            (0, 2), (1, 3), (4, 6), (5, 7),
+            (0, 5), (1, 4), (2, 7), (3, 6),
+        ]
+        for _pa, _pb, box, _vol in self._live_collision_hits:
+            x, y, z, w, h, d = box
+            x2, y2, z2 = x + w, y + h, z + d
+            v = [
+                (x, y, z), (x2, y, z), (x2, y2, z), (x, y2, z),
+                (x, y, z2), (x2, y, z2), (x2, y2, z2), (x, y2, z2),
+            ]
+            for a, b in edges:
+                pts.append(v[a])
+                pts.append(v[b])
+        if pts:
+            self._draw_lines(np.asarray(pts, dtype=np.float32), (0.98, 0.12, 0.20), 2.0)
+        glEnable(GL_DEPTH_TEST)
+
+    def _draw_live_collisions_overlay(self, painter: QPainter) -> None:
+        """Отрисовывает 2D-бейджи зон врезания деталей и индикатор числа коллизий."""
+        if not self.live_collision_mode or not self._live_collision_hits:
+            return
+        self._sync_viewport_matrices()
+        red_border = QColor(239, 68, 68)
+        bg_dark = QColor(69, 10, 10, 225)
+        painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        fm = painter.fontMetrics()
+
+        for pa, pb, box, _vol in self._live_collision_hits[:8]:
+            ix, iy, iz, iw, ih, id_ = box
+            center = np.array([ix + iw * 0.5, iy + ih * 0.5, iz + id_ * 0.5], dtype=float)
+            scr = self._project_to_screen(center)
+            if scr is None:
+                continue
+            sx, sy = int(round(scr[0])), int(round(scr[1]))
+            dims_sorted = sorted([iw, ih, id_])
+            pen_depth = dims_sorted[0]
+            txt = f"⚡ Врезание {pen_depth:.1f} мм: {pa.name} × {pb.name}"
+            tw = fm.horizontalAdvance(txt) + 14
+            th = fm.height() + 6
+            rx = min(max(6, sx - tw // 2), max(6, self.width() - tw - 6))
+            ry = min(max(6, sy - th // 2), max(6, self.height() - th - 6))
+            rect = QRect(rx, ry, tw, th)
+            painter.setPen(QPen(red_border, 1.6))
+            painter.setBrush(bg_dark)
+            painter.drawRoundedRect(rect, 5, 5)
+            painter.setPen(QColor(254, 226, 226))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, txt)
 
     def _draw_panel_edges(self, p: Panel, color, include_features: bool = True):
         """Контур панели (с учётом поворота) + опционально пазы и отверстия."""
@@ -4470,13 +4596,17 @@ class Viewport3D(QOpenGLWidget):
         has_drag = self.drag_mode
         has_snap = bool(getattr(self, "ctrl_held", False) and getattr(self, "measure_snap_info", None) is not None)
         has_handles = bool(self.get_selected_panels()) and not self.drag_mode
+        has_collisions = bool(self.live_collision_mode and self._live_collision_hits)
 
-        if not has_rect and not has_dims and not has_drag and not has_snap and not has_handles:
+        if not has_rect and not has_dims and not has_drag and not has_snap and not has_handles and not has_collisions:
             return
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        if has_collisions:
+            self._draw_live_collisions_overlay(painter)
 
         if has_dims or has_snap:
             self._draw_dimensions_overlay(painter)
@@ -4722,6 +4852,9 @@ class Viewport3D(QOpenGLWidget):
             return
         if event.key() == Qt.Key.Key_S and (event.modifiers() & Qt.KeyboardModifier.AltModifier):
             self.toggle_section_mode()
+            return
+        if event.key() == Qt.Key.Key_C and (event.modifiers() & Qt.KeyboardModifier.AltModifier):
+            self.toggle_live_collision_mode()
             return
         if event.key() == Qt.Key.Key_G:
             self.start_drag_mode()

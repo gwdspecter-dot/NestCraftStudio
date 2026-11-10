@@ -11,7 +11,7 @@ from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QRunnable, pyqtSignal
 
 from models.panel import Panel, Block, ParametricCabinet
 from ui.viewport import CentralWorkspace
-from ui.dialogs import CreatePanelDialog, HoleDialog
+from ui.dialogs import CreatePanelDialog, HoleDialog, LinearArrayDialog, MirrorPanelDialog
 from ui.fastener_constructor_dialog import FastenerConstructorDialog
 from ui.panels.structure_panel import StructureDock
 from ui.panels.properties_panel import PropertiesDock
@@ -19,6 +19,7 @@ from ui.panels.browser_panel import BrowserDock
 from ui.panels.history_panel import AnalysisDock, HistoryDock
 from ui.panels.joints_panel import JointsDock
 from core.undo import (
+    AddMultiplePanelsCommand,
     AddPanelCommand,
     DeleteJointCommand,
     EditJointCommand,
@@ -173,6 +174,10 @@ class MainWindow(QMainWindow):
         vp.measurement_updated.connect(self._on_measurement_updated)
         if hasattr(self, "act_measure"):
             self.act_measure.setChecked(vp.measure_mode)
+        if hasattr(self, "act_live_collisions"):
+            self.act_live_collisions.blockSignals(True)
+            self.act_live_collisions.setChecked(bool(getattr(vp, "live_collision_mode", True)))
+            self.act_live_collisions.blockSignals(False)
         if hasattr(self, "act_grid"):
             self.act_grid.blockSignals(True)
             self.act_grid.setChecked(bool(getattr(vp, "grid_enabled", True)))
@@ -202,6 +207,10 @@ class MainWindow(QMainWindow):
                 self._update_coord_boxes(0.0, 0.0, 0.0)
             if hasattr(self, "act_measure"):
                 self.act_measure.setChecked(vp.measure_mode)
+            if hasattr(self, "act_live_collisions"):
+                self.act_live_collisions.blockSignals(True)
+                self.act_live_collisions.setChecked(bool(getattr(vp, "live_collision_mode", True)))
+                self.act_live_collisions.blockSignals(False)
 
     def _on_undo_stack_changed(self):
         self._refresh_history_dock()
@@ -486,6 +495,138 @@ class MainWindow(QMainWindow):
         self._refresh_structure()
         self.properties_dock.show_object_properties(clone)
         self._update_coord_boxes(clone.x, clone.y, clone.z)
+        vp.update()
+
+    def mirror_selected_panel(self):
+        """Создаёт зеркальную копию выбранной детали (Ctrl+M) с отражением кромок, пазов и сверловки."""
+        from core.array_mirror import build_mirror_panel, compute_mirror_plane_coord
+
+        vp = self.workspace.current_viewport()
+        if not vp:
+            return
+        sel = vp.get_selected_panel()
+        if not sel:
+            self.statusBar().showMessage("Зеркальная копия: сначала выберите деталь в 3D или дереве проекта", 4000)
+            return
+
+        target_block = None
+        for b in vp.blocks:
+            if sel in b.panels:
+                target_block = b
+                break
+        if target_block is None:
+            if not vp.blocks:
+                vp.blocks.append(Block("Изделие 1", "1", "01.00"))
+            target_block = vp.blocks[-1]
+
+        dlg = MirrorPanelDialog(sel, target_block, self)
+        if not dlg.exec():
+            return
+        params = dlg.get_mirror_params()
+
+        existing_names = {
+            str(getattr(p, "name", "") or "")
+            for b in vp.blocks
+            for p in getattr(b, "panels", [])
+        }
+        new_pos = self._next_pos_num(target_block, str(getattr(target_block, "pos_num", "") or "1"))
+        plane_c = compute_mirror_plane_coord(
+            sel,
+            axis=params["axis"],
+            mode=params["mode"],
+            custom_coord=params["custom_coord"],
+            block=target_block,
+        )
+
+        mirrored = build_mirror_panel(
+            sel,
+            axis=params["axis"],
+            mode=params["mode"],
+            custom_coord=params["custom_coord"],
+            mirror_features=params["mirror_features"],
+            existing_names=existing_names,
+            pos_num=new_pos,
+            block=target_block,
+        )
+
+        sel.selected = False
+        mirrored.selected = True
+        vp.undo_stack.push(AddPanelCommand(vp.blocks, target_block, mirrored, f"Зеркальная копия: {mirrored.name}"))
+        self._refresh_structure()
+        self.properties_dock.show_object_properties(mirrored)
+        self._update_coord_boxes(mirrored.x, mirrored.y, mirrored.z)
+        self.statusBar().showMessage(
+            f"Создана зеркальная копия «{mirrored.name}» по оси {params['axis']} (плоскость {plane_c:.1f} мм)",
+            5000,
+        )
+        vp.update()
+
+    def array_selected_panel(self):
+        """Создаёт линейный массив копий выбранной детали (Ctrl+Shift+A) с шагом, просветом или делением проёма."""
+        from core.array_mirror import build_linear_array_panels
+
+        vp = self.workspace.current_viewport()
+        if not vp:
+            return
+        sel = vp.get_selected_panel()
+        if not sel:
+            self.statusBar().showMessage("Линейный массив: сначала выберите деталь (полку, перегородку, стойку)", 4000)
+            return
+
+        target_block = None
+        for b in vp.blocks:
+            if sel in b.panels:
+                target_block = b
+                break
+        if target_block is None:
+            if not vp.blocks:
+                vp.blocks.append(Block("Изделие 1", "1", "01.00"))
+            target_block = vp.blocks[-1]
+
+        dlg = LinearArrayDialog(sel, self)
+        if not dlg.exec():
+            return
+        params = dlg.get_array_params()
+
+        existing_names = {
+            str(getattr(p, "name", "") or "")
+            for b in vp.blocks
+            for p in getattr(b, "panels", [])
+        }
+        prefix = str(getattr(target_block, "pos_num", "") or "1")
+        clones = build_linear_array_panels(
+            sel,
+            axis=params["axis"],
+            count=params["count"],
+            spacing_mode=params["spacing_mode"],
+            value_mm=params["value_mm"],
+            existing_names=existing_names,
+            pos_prefix=prefix,
+            start_pos_index=len(getattr(target_block, "panels", [])) + 1,
+        )
+        if not clones:
+            return
+
+        sel.selected = False
+        for c in clones:
+            c.selected = False
+        clones[-1].selected = True
+
+        vp.undo_stack.push(
+            AddMultiplePanelsCommand(
+                vp.blocks,
+                target_block,
+                clones,
+                f"Линейный массив ({len(clones)} шт.): {sel.name}",
+            )
+        )
+        self._refresh_structure()
+        self.properties_dock.show_object_properties(clones[-1])
+        self._update_coord_boxes(clones[-1].x, clones[-1].y, clones[-1].z)
+        self.statusBar().showMessage(
+            f"Линейный массив: добавлено {len(clones)} шт. вдоль оси {params['axis']}",
+            5000,
+        )
         vp.update()
 
     def clear_scene(self):
@@ -1367,6 +1508,18 @@ class MainWindow(QMainWindow):
         act_dup.triggered.connect(self.duplicate_selected_panel)
         edit_menu.addAction(act_dup)
 
+        self.act_mirror = QAction("🪞 Зеркальная копия… (Ctrl+M)", self)
+        self.act_mirror.setShortcut(QKeySequence("Ctrl+M"))
+        self.act_mirror.setToolTip("Создать зеркальную копию детали с отражением кромок, пазов и присадки (Ctrl+M)")
+        self.act_mirror.triggered.connect(self.mirror_selected_panel)
+        edit_menu.addAction(self.act_mirror)
+
+        self.act_array = QAction("▤ Линейный массив… (Ctrl+Shift+A)", self)
+        self.act_array.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.act_array.setToolTip("Размножить деталь с шагом, просветом или делением проёма на равные ниши (Ctrl+Shift+A)")
+        self.act_array.triggered.connect(self.array_selected_panel)
+        edit_menu.addAction(self.act_array)
+
         act_del = QAction("Удалить", self)
         act_del.setShortcut(QKeySequence.StandardKey.Delete)
         act_del.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
@@ -1410,6 +1563,16 @@ class MainWindow(QMainWindow):
         )
         self.act_section.triggered.connect(self._toggle_section_mode)
         view_menu.addAction(self.act_section)
+
+        self.act_live_collisions = QAction("⚡ Живые коллизии 3D", self)
+        self.act_live_collisions.setCheckable(True)
+        self.act_live_collisions.setChecked(True)
+        self.act_live_collisions.setShortcut(QKeySequence("Alt+C"))
+        self.act_live_collisions.setToolTip(
+            "Подсвечивать врезания деталей друг в друга прямо в 3D при перетаскивании и редактировании [Alt+C]"
+        )
+        self.act_live_collisions.triggered.connect(self._toggle_live_collisions)
+        view_menu.addAction(self.act_live_collisions)
 
         tools_menu = menubar.addMenu("Инструменты")
         self.act_measure = QAction(QIcon(str(_ICONS_DIR / "tool_measure.svg")), "Рулетка / Измерения", self)
@@ -1517,10 +1680,13 @@ class MainWindow(QMainWindow):
 
         top_tb1.addAction(self.act_ghost_others)
         top_tb1.addAction(self.act_section)
+        top_tb1.addAction(self.act_live_collisions)
 
         top_tb1.addSeparator()
         top_tb1.addAction(self.act_measure)
         top_tb1.addAction(self.act_drag)
+        top_tb1.addAction(self.act_mirror)
+        top_tb1.addAction(self.act_array)
 
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
 
@@ -1706,6 +1872,15 @@ class MainWindow(QMainWindow):
         self.act_section.blockSignals(True)
         self.act_section.setChecked(state)
         self.act_section.blockSignals(False)
+
+    def _toggle_live_collisions(self, checked: bool):
+        vp = self.workspace.current_viewport()
+        if not vp:
+            return
+        state = vp.toggle_live_collision_mode(bool(checked))
+        self.act_live_collisions.blockSignals(True)
+        self.act_live_collisions.setChecked(state)
+        self.act_live_collisions.blockSignals(False)
 
     def _on_section_axis_changed(self, _index: int):
         vp = self.workspace.current_viewport()
