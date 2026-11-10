@@ -283,34 +283,40 @@ class PropertiesDock(QDockWidget):
     _ANGLE_MAX = 360.0
 
     @staticmethod
-    def _parse_finite_float(text: str) -> float:
-        """float без nan/inf; иначе ValueError."""
-        import math
-        v = float(text)
-        if not math.isfinite(v):
-            raise ValueError("not finite")
-        return v
+    def _parse_finite_float(
+        text: str,
+        *,
+        current_value: float | None = None,
+        obj: object = None,
+    ) -> float:
+        """Вычисляет число или арифметическую формулу (`600 - 32`, `720 / 3`, `w - 32`, `+= 16`) без nan/inf."""
+        from core.formula import context_vars_from_object, eval_math_expression
+
+        env = context_vars_from_object(obj, current_value=current_value)
+        return eval_math_expression(text, current_value=current_value, variables=env)
 
     def _validate_numeric_attr(self, attr_name: str, raw: str):
         """Возвращает (ok, value_or_None). ok=False → откатить ячейку."""
+        cur_raw = getattr(self.current_obj, attr_name, None) if self.current_obj is not None else None
+        cur_float = float(cur_raw) if isinstance(cur_raw, (int, float)) and not isinstance(cur_raw, bool) else None
         try:
             if attr_name in self._SIZE_ATTRS:
-                v = self._parse_finite_float(raw)
+                v = self._parse_finite_float(raw, current_value=cur_float, obj=self.current_obj)
                 if v < self._SIZE_MIN or v > self._SIZE_MAX:
                     return False, None
                 return True, v
             if attr_name in self._COORD_ATTRS:
-                v = self._parse_finite_float(raw)
+                v = self._parse_finite_float(raw, current_value=cur_float, obj=self.current_obj)
                 if v < self._COORD_MIN or v > self._COORD_MAX:
                     return False, None
                 return True, v
             if attr_name in self._ANGLE_ATTRS:
-                v = self._parse_finite_float(raw)
+                v = self._parse_finite_float(raw, current_value=cur_float, obj=self.current_obj)
                 if v < self._ANGLE_MIN or v > self._ANGLE_MAX:
                     return False, None
                 return True, v
             if attr_name == "shelves_count":
-                v = self._parse_finite_float(raw)
+                v = self._parse_finite_float(raw, current_value=cur_float, obj=self.current_obj)
                 n = int(round(v))
                 if n < 0 or n > 50:
                     return False, None
@@ -344,7 +350,8 @@ class PropertiesDock(QDockWidget):
             return
 
         old_val = getattr(self.current_obj, attr_name, None)
-        new_val_str = item.text().strip().replace(",", ".")
+        raw_input = item.text().strip()
+        new_val_str = raw_input.replace(",", ".")
         if not new_val_str and attr_name in (
             self._SIZE_ATTRS | self._COORD_ATTRS | self._ANGLE_ATTRS | {"shelves_count"}
         ):
@@ -354,13 +361,25 @@ class PropertiesDock(QDockWidget):
         ok, new_val = self._validate_numeric_attr(attr_name, new_val_str)
         if not ok:
             self._revert_item(item, attr_name)
-            self.validation_failed.emit(f"Недопустимое значение «{new_val_str}» для «{attr_name}»")
+            self.validation_failed.emit(f"Недопустимое значение или формула «{raw_input}» для «{attr_name}»")
             return
 
-        if attr_name not in (
-            self._SIZE_ATTRS | self._COORD_ATTRS | self._ANGLE_ATTRS | {"shelves_count", "has_facade"}
-        ):
+        is_num_attr = attr_name in (
+            self._SIZE_ATTRS | self._COORD_ATTRS | self._ANGLE_ATTRS | {"shelves_count"}
+        )
+        if not is_num_attr and attr_name != "has_facade":
             new_val = item.text()  # имя и прочий текст — как ввели
+
+        if is_num_attr:
+            from core.formula import is_formula_text
+
+            if is_formula_text(raw_input):
+                self._updating = True
+                try:
+                    item.setText(f"{new_val:g}" if isinstance(new_val, float) else str(new_val))
+                finally:
+                    self._updating = False
+                self.validation_failed.emit(f"🧮 Формула [{attr_name}]: {raw_input} = {new_val:g}")
 
         if old_val == new_val:
             return
@@ -379,3 +398,4 @@ class PropertiesDock(QDockWidget):
 
         self.property_applied.emit(self.current_obj, attr_name, old_val, new_val)
         self.property_changed.emit()
+

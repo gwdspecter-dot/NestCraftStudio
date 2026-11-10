@@ -114,6 +114,71 @@ class TestRenderEngineV019(unittest.TestCase):
         self.assertIn("def toggle_section_mode", src)
         self.assertIn("def toggle_ghost_others_mode", src)
         self.assertIn("def _draw_section_plane_gizmo", src)
+        # Умные поля ввода с формулами + Тянуть грань в 3D (Direct Face Push-Pull)
+        self.assertIn("def _panel_face_handles", src)
+        self.assertIn("def _panel_face_corners_world", src)
+        self.assertIn("def _find_face_handle", src)
+        self.assertIn("def _cursor_on_face_axis", src)
+        self.assertIn("def _apply_face_push_pull", src)
+
+    def test_smart_formula_evaluator_v019(self):
+        """Проверяем безопасное вычисление арифметических формул и контекстных переменных детали (w, h, d, t, cur)."""
+        from core.formula import context_vars_from_object, eval_math_expression, is_formula_text
+        from models.panel import Panel
+
+        self.assertEqual(eval_math_expression("600 - 32"), 568.0)
+        self.assertEqual(eval_math_expression("720 / 3"), 240.0)
+        self.assertEqual(eval_math_expression("(800 - 3 * 16) / 2"), 376.0)
+        self.assertEqual(eval_math_expression("= 568,5 + 15,5"), 584.0)
+        self.assertEqual(eval_math_expression("+= 50", current_value=400.0), 450.0)
+        self.assertEqual(eval_math_expression("-= 32", current_value=600.0), 568.0)
+        self.assertEqual(eval_math_expression("*= 2", current_value=150.0), 300.0)
+        self.assertEqual(eval_math_expression("/= 2", current_value=500.0), 250.0)
+        self.assertTrue(is_formula_text("600 - 32"))
+        self.assertTrue(is_formula_text("+= 50"))
+        self.assertFalse(is_formula_text("568"))
+
+        Panel._controller_unbound = True
+        try:
+            p = Panel("Полка", 16.0, 350.0, 0.0, 568.0, 16.0, 540.0, rebuild=False)
+            p.thickness_axis = 1
+            ctx = context_vars_from_object(p, current_value=p.width)
+            self.assertEqual(ctx["w"], 568.0)
+            self.assertEqual(ctx["t"], 16.0)
+            self.assertEqual(eval_math_expression("w - 2 * t", variables=ctx), 536.0)
+            self.assertEqual(eval_math_expression("cur + t", variables=ctx, current_value=568.0), 584.0)
+        finally:
+            Panel._controller_unbound = False
+
+    def test_face_push_pull_handles_and_resize_v019(self):
+        """Проверяем расчёт центров граней compute_panel_face_handles и растяжение compute_face_push_pull_box."""
+        from models.panel import Panel
+
+        Panel._controller_unbound = True
+        try:
+            p = Panel("Полка", 16.0, 350.0, 0.0, 568.0, 16.0, 500.0, rebuild=False)
+            p.thickness_axis = 1
+
+            handles = glmath.compute_panel_face_handles(p)
+            # Ось толщины Y (1) пропускается -> остаётся 4 рабочих торца: (-X), (+X), (-Z), (+Z)
+            face_ids = [h[0] for h in handles]
+            self.assertEqual(face_ids, [(0, 0), (0, 1), (2, 0), (2, 1)])
+
+            orig_box = (p.x, p.y, p.z, p.width, p.height, p.depth)
+            # Вытягивание правого торца (+X, face_id=(0, 1)) до длины 600 мм (левый торец x=16.0 остаётся на месте)
+            nx, ny, nz, nw, nh, nd = glmath.compute_face_push_pull_box(orig_box, (0, 1), 600.0, panel=p)
+            self.assertAlmostEqual(nx, 16.0)
+            self.assertAlmostEqual(nw, 600.0)
+            self.assertAlmostEqual(ny, 350.0)
+            self.assertAlmostEqual(nh, 16.0)
+
+            # Вытягивание левого торца (-X, face_id=(0, 0)) наружу до длины 584 мм (правый торец x+w=584.0 неподвижен, x -> 0.0)
+            nx2, ny2, nz2, nw2, nh2, nd2 = glmath.compute_face_push_pull_box(orig_box, (0, 0), 584.0, panel=p)
+            self.assertAlmostEqual(nx2, 0.0)
+            self.assertAlmostEqual(nw2, 584.0)
+            self.assertAlmostEqual(nx2 + nw2, 584.0)
+        finally:
+            Panel._controller_unbound = False
 
     def test_section_clip_plane_and_axis_bounds_v019(self):
         """Проверяем расчёт плоскости сечения compute_section_clip_plane, фильтр point_passes_clip_plane и габариты compute_scene_axis_bounds."""

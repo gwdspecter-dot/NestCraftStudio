@@ -282,3 +282,113 @@ def compute_scene_axis_bounds(
     return (lo, hi)
 
 
+def compute_panel_face_handles(
+    p: Any,
+    allow_axes: tuple[bool, bool, bool] = (True, True, True),
+) -> list[tuple[tuple[int, int], Any, Any, str]]:
+    """Возвращает ручки вытягивания рабочих торцов детали («Тянуть грань в 3D» / Push-Pull).
+
+    Пропускает пласть вдоль `thickness_axis`, чтобы толщина плиты оставалась неизменной.
+    Возвращает список `((axis_idx, side), world_center, world_outward_normal, label)`.
+    """
+    w, h, d = float(p.width), float(p.height), float(p.depth)
+    wm, hm, dm = w * 0.5, h * 0.5, d * 0.5
+    raw_tax = getattr(p, "thickness_axis", -1)
+    if isinstance(raw_tax, str):
+        tax = {"X": 0, "Y": 1, "Z": 2}.get(raw_tax.upper(), -1)
+    else:
+        try:
+            tax = int(raw_tax)
+        except (TypeError, ValueError):
+            tax = -1
+    has_ltw = hasattr(p, "local_to_world")
+    has_rot = hasattr(p, "has_rotation") and p.has_rotation() and hasattr(p, "rotate_vector")
+
+    def _vec3(x: float, y: float, z: float):
+        if np is not None:
+            return np.array([x, y, z], dtype=float)
+        return (float(x), float(y), float(z))
+
+    def to_world(lx: float, ly: float, lz: float):
+        if has_ltw:
+            wx, wy, wz = p.local_to_world(lx, ly, lz)
+            return _vec3(wx, wy, wz)
+        return _vec3(float(p.x) + lx, float(p.y) + ly, float(p.z) + lz)
+
+    def to_world_dir(nx: float, ny: float, nz: float):
+        if has_rot:
+            rx, ry, rz = p.rotate_vector(nx, ny, nz)
+            ux, uy, uz = _norm3(rx, ry, rz)
+        else:
+            ux, uy, uz = _norm3(nx, ny, nz)
+        return _vec3(ux, uy, uz)
+
+    defs = [
+        ((0, 0), (0.0, hm, dm), (-1.0, 0.0, 0.0), "Левый торец (-X)"),
+        ((0, 1), (w, hm, dm), (1.0, 0.0, 0.0), "Правый торец (+X)"),
+        ((1, 0), (wm, 0.0, dm), (0.0, -1.0, 0.0), "Нижний торец (-Y)"),
+        ((1, 1), (wm, h, dm), (0.0, 1.0, 0.0), "Верхний торец (+Y)"),
+        ((2, 0), (wm, hm, 0.0), (0.0, 0.0, -1.0), "Задний торец (-Z)"),
+        ((2, 1), (wm, hm, d), (0.0, 0.0, 1.0), "Передний торец (+Z)"),
+    ]
+    out = []
+    for (ax_idx, side), lpt, lnrm, label in defs:
+        if ax_idx == tax or not allow_axes[ax_idx]:
+            continue
+        out.append(((ax_idx, side), to_world(*lpt), to_world_dir(*lnrm), label))
+    return out
+
+
+def compute_face_push_pull_box(
+    orig_box: tuple[float, float, float, float, float, float],
+    face_id: tuple[int, int],
+    new_len: float,
+    panel: Any = None,
+    min_size: float = 10.0,
+) -> tuple[float, float, float, float, float, float]:
+    """Вычисляет новые `(x, y, z, width, height, depth)` детали при вытягивании торца `face_id = (axis_idx, side)`
+    до длины `new_len` при неподвижной в мире противоположной грани."""
+    x0, y0, z0, w, h, d = [float(v) for v in orig_box]
+    ax_idx, side = int(face_id[0]), int(face_id[1])
+    clamped_len = max(float(min_size), float(new_len))
+    dims = [w, h, d]
+    new_dims = [w, h, d]
+    new_dims[ax_idx] = clamped_len
+
+    has_rot = (
+        panel is not None
+        and hasattr(panel, "has_rotation")
+        and panel.has_rotation()
+        and hasattr(panel, "rotate_vector")
+    )
+    if has_rot:
+        sign = 1.0 if side == 1 else -1.0
+        local_dir = [0.0, 0.0, 0.0]
+        local_dir[ax_idx] = sign
+        fixed_local = [w * 0.5, h * 0.5, d * 0.5]
+        fixed_local[ax_idx] = 0.0 if side == 1 else dims[ax_idx]
+        cx_orig, cy_orig, cz_orig = x0 + w * 0.5, y0 + h * 0.5, z0 + d * 0.5
+        rfx, rfy, rfz = panel.rotate_vector(
+            fixed_local[0] - w * 0.5,
+            fixed_local[1] - h * 0.5,
+            fixed_local[2] - d * 0.5,
+        )
+        fwx, fwy, fwz = cx_orig + rfx, cy_orig + rfy, cz_orig + rfz
+        rdx, rdy, rdz = panel.rotate_vector(*local_dir)
+        ax_x, ax_y, ax_z = _norm3(rdx, rdy, rdz)
+        half_len = clamped_len * 0.5
+        cx_new = fwx + ax_x * half_len
+        cy_new = fwy + ax_y * half_len
+        cz_new = fwz + ax_z * half_len
+        nx = cx_new - new_dims[0] * 0.5
+        ny = cy_new - new_dims[1] * 0.5
+        nz = cz_new - new_dims[2] * 0.5
+        return (nx, ny, nz, new_dims[0], new_dims[1], new_dims[2])
+
+    coords = [x0, y0, z0]
+    if side == 0:
+        coords[ax_idx] = (coords[ax_idx] + dims[ax_idx]) - clamped_len
+    return (coords[0], coords[1], coords[2], new_dims[0], new_dims[1], new_dims[2])
+
+
+

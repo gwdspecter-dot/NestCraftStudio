@@ -14,9 +14,46 @@ from PyQt6.QtWidgets import (
     QLabel,
 )
 
+from PyQt6.QtGui import QValidator
+from core.formula import context_vars_from_object, eval_math_expression
 from core.logging_setup import get_logger
 
 _log = get_logger("dialogs")
+
+
+class SmartDoubleSpinBox(QDoubleSpinBox):
+    """Числовое поле с поддержкой ввода арифметических формул (`600 - 32`, `720 / 3`, `+= 16`)."""
+
+    _ALLOWED_CHARS = frozenset("0123456789.,+-*/()= \t×÷abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+    def __init__(self, parent=None, context_obj=None):
+        super().__init__(parent)
+        self._context_obj = context_obj
+        self.setToolTip("Поддерживаются числа и формулы: например, 600 - 32, 720 / 3, (800 - 48) / 2")
+
+    def validate(self, text: str, pos: int):
+        s = (text or "").strip()
+        if not s:
+            return (QValidator.State.Intermediate, text, pos)
+        if any(ch not in self._ALLOWED_CHARS for ch in s):
+            return (QValidator.State.Invalid, text, pos)
+        try:
+            env = context_vars_from_object(self._context_obj, current_value=float(self.value()))
+            val = eval_math_expression(s, current_value=float(self.value()), variables=env)
+            if self.minimum() <= val <= self.maximum():
+                return (QValidator.State.Acceptable, text, pos)
+            return (QValidator.State.Intermediate, text, pos)
+        except ValueError:
+            return (QValidator.State.Intermediate, text, pos)
+
+    def valueFromText(self, text: str) -> float:
+        try:
+            env = context_vars_from_object(self._context_obj, current_value=float(self.value()))
+            val = eval_math_expression(text, current_value=float(self.value()), variables=env)
+            return min(max(val, float(self.minimum())), float(self.maximum()))
+        except ValueError:
+            return float(self.value())
+
 
 
 class CreatePanelDialog(QDialog):
@@ -95,7 +132,7 @@ class CreatePanelDialog(QDialog):
 
     @staticmethod
     def _make_spin(val: float, min_val=1.0, max_val=10000.0) -> QDoubleSpinBox:
-        sb = QDoubleSpinBox()
+        sb = SmartDoubleSpinBox()
         sb.setRange(min_val, max_val)
         sb.setDecimals(1)
         sb.setValue(val)
@@ -285,9 +322,8 @@ class HoleDialog(QDialog):
             f"{face_txt}\n{edge_txt}\nрекомендуемый шаг: {spacing:g} мм"
         )
 
-    @staticmethod
-    def _make_spin(val: float, min_val=1.0, max_val=10000.0) -> QDoubleSpinBox:
-        sb = QDoubleSpinBox()
+    def _make_spin(self, val: float, min_val=1.0, max_val=10000.0) -> QDoubleSpinBox:
+        sb = SmartDoubleSpinBox(context_obj=getattr(self, "panel", None))
         sb.setRange(min_val, max_val)
         sb.setDecimals(1)
         sb.setValue(val)

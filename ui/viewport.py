@@ -344,12 +344,15 @@ class Viewport3D(QOpenGLWidget):
         # Фиксация оси при Grab: None | "X" | "Y" | "Z"
         self.drag_axis_lock: str | None = None
 
-        # Растягивание за углы выделенной панели
+        # Растягивание за углы и вытягивание торцов в 3D (Direct Face Push-Pull)
         self.resize_mode = False
         self.resize_panel: Panel | None = None
         self.resize_corner: tuple[int, int, int] | None = None  # (sx,sy,sz) 0=min 1=max
+        self.resize_face: tuple[int, int] | None = None  # (axis_idx 0|1|2, side 0=min|1=max)
         self.resize_orig_box: tuple | None = None  # x,y,z,w,h,d
         self.resize_hover_corner: tuple[int, int, int] | None = None
+        self.resize_hover_face: tuple[int, int] | None = None
+        self.resize_face_snap_desc: str = ""
         self.resize_handle_px = 9.0
 
         # Core Profile ресурсы
@@ -3511,6 +3514,93 @@ class Viewport3D(QOpenGLWidget):
             return False, True, True
         return True, True, True
 
+    def _panel_face_handles(
+        self, p: Panel
+    ) -> list[tuple[tuple[int, int], np.ndarray, np.ndarray, str]]:
+        """Ручки вытягивания 4 рабочих торцов детали («Тянуть грань в 3D» / Push-Pull).
+
+        Пропускает пласть вдоль `thickness_axis`, чтобы толщина материала оставалась неизменной.
+        Возвращает список `((axis_idx, side), world_center, world_outward_normal, label)`.
+        """
+        w, h, d = float(p.width), float(p.height), float(p.depth)
+        wm, hm, dm = w * 0.5, h * 0.5, d * 0.5
+        tax = int(getattr(p, "thickness_axis", -1))
+        allow_axes = self._resize_active_axes()
+        has_ltw = hasattr(p, "local_to_world")
+        has_rot = hasattr(p, "has_rotation") and p.has_rotation() and hasattr(p, "rotate_vector")
+
+        def to_world(lx: float, ly: float, lz: float) -> np.ndarray:
+            if has_ltw:
+                wx, wy, wz = p.local_to_world(lx, ly, lz)
+                return np.array([wx, wy, wz], dtype=float)
+            return np.array([float(p.x) + lx, float(p.y) + ly, float(p.z) + lz], dtype=float)
+
+        def to_world_dir(nx: float, ny: float, nz: float) -> np.ndarray:
+            if has_rot:
+                rx, ry, rz = p.rotate_vector(nx, ny, nz)
+                v = np.array([rx, ry, rz], dtype=float)
+            else:
+                v = np.array([nx, ny, nz], dtype=float)
+            vn = float(np.linalg.norm(v))
+            return v / vn if vn > 1e-12 else np.array([nx, ny, nz], dtype=float)
+
+        defs = [
+            ((0, 0), (0.0, hm, dm), (-1.0, 0.0, 0.0), "Левый торец (-X)"),
+            ((0, 1), (w, hm, dm), (1.0, 0.0, 0.0), "Правый торец (+X)"),
+            ((1, 0), (wm, 0.0, dm), (0.0, -1.0, 0.0), "Нижний торец (-Y)"),
+            ((1, 1), (wm, h, dm), (0.0, 1.0, 0.0), "Верхний торец (+Y)"),
+            ((2, 0), (wm, hm, 0.0), (0.0, 0.0, -1.0), "Задний торец (-Z)"),
+            ((2, 1), (wm, hm, d), (0.0, 0.0, 1.0), "Передний торец (+Z)"),
+        ]
+        out = []
+        for (ax_idx, side), lpt, lnrm, label in defs:
+            if ax_idx == tax or not allow_axes[ax_idx]:
+                continue
+            out.append(((ax_idx, side), to_world(*lpt), to_world_dir(*lnrm), label))
+        return out
+
+    def _panel_face_corners_world(self, p: Panel, face_id: tuple[int, int]) -> list[np.ndarray]:
+        """Возвращает 4 мировых угла грани `face_id = (axis_idx, side)` в порядке обхода контура."""
+        w, h, d = float(p.width), float(p.height), float(p.depth)
+        ax_idx, side = face_id
+        if ax_idx == 0:
+            x = w if side == 1 else 0.0
+            local_pts = [(x, 0.0, 0.0), (x, h, 0.0), (x, h, d), (x, 0.0, d)]
+        elif ax_idx == 1:
+            y = h if side == 1 else 0.0
+            local_pts = [(0.0, y, 0.0), (w, y, 0.0), (w, y, d), (0.0, y, d)]
+        else:
+            z = d if side == 1 else 0.0
+            local_pts = [(0.0, 0.0, z), (w, 0.0, z), (w, h, z), (0.0, h, z)]
+        has_ltw = hasattr(p, "local_to_world")
+        out = []
+        for lx, ly, lz in local_pts:
+            if has_ltw:
+                wx, wy, wz = p.local_to_world(lx, ly, lz)
+            else:
+                wx, wy, wz = float(p.x) + lx, float(p.y) + ly, float(p.z) + lz
+            out.append(np.array([wx, wy, wz], dtype=float))
+        return out
+
+    def _find_face_handle(self, mx: int, my: int, panel: Panel | None = None):
+        """Ближайшая ручка торца («Тянуть грань в 3D») в радиусе курсора."""
+        panels = [panel] if panel is not None else self.get_selected_panels()
+        if not panels:
+            return None
+        self._sync_viewport_matrices()
+        best = None
+        best_d = self.resize_handle_px + 3.5
+        for p in panels:
+            for face_id, wpt, wnrm, label in self._panel_face_handles(p):
+                scr = self._project_to_screen(wpt)
+                if scr is None:
+                    continue
+                d = math.hypot(scr[0] - mx, scr[1] - my)
+                if d < best_d:
+                    best_d = d
+                    best = (p, face_id, wpt, wnrm, label)
+        return best
+
     def _find_resize_handle(self, mx: int, my: int, panel: Panel | None = None):
         """Ближайший угол выделенной панели в радиусе ручки. (corner, world_pt) | None."""
         panels = [panel] if panel is not None else self.get_selected_panels()
@@ -3674,8 +3764,205 @@ class Viewport3D(QOpenGLWidget):
         panel.geometry_generation = int(getattr(panel, "geometry_generation", 0)) + 1
         panel.geometry_pending = True
 
+    def _cursor_on_face_axis(
+        self,
+        mx: int,
+        my: int,
+        fixed_pt: np.ndarray,
+        axis_dir: np.ndarray,
+        panel: Panel,
+    ) -> tuple[float, str]:
+        """Вычисляет длину детали вдоль `axis_dir` от неподвижного торца `fixed_pt` по положению мыши.
+
+        Поддерживает:
+        - Точную проекцию луча камеры на 3D-ось нормали грани (ближайшая точка скрещивающихся прямых);
+        - Магнитную привязку к точкам/граням соседних деталей при наведении (или с зажатым `[Ctrl]`).
+        """
+        u = np.asarray(axis_dir, dtype=float)
+        un = float(np.linalg.norm(u))
+        if un > 1e-12:
+            u = u / un
+
+        # Магнитная привязка к точкам других панелей сцены
+        dpr = float(self.devicePixelRatioF())
+        vp = self._vp_size
+        mvp = self._mvp
+        is_ctrl = bool(getattr(self, "ctrl_held", False))
+        snap_radius = 52.0 if is_ctrl else 18.0
+        plane = self.current_section_plane()
+
+        best_snap_pt = None
+        best_snap_desc = ""
+        min_d = snap_radius
+        for block in self.blocks:
+            for other in block.panels:
+                if other is panel:
+                    continue
+                if not self._panel_within_screen_radius(other, mx, my, snap_radius, mvp, vp, dpr):
+                    continue
+                for item in self._collect_panel_snap_points(other, label_prefix=other.name):
+                    pt, desc = item[0], item[1]
+                    if plane is not None and not glmath.point_passes_clip_plane(
+                        float(pt[0]), float(pt[1]), float(pt[2]), plane
+                    ):
+                        continue
+                    try:
+                        wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
+                        if wz < 0.0 or wz > 1.0:
+                            continue
+                        sx = wx / dpr
+                        sy = (vp[3] - wy) / dpr
+                        dist = math.hypot(sx - mx, sy - my)
+                        if dist < min_d:
+                            min_d = dist
+                            best_snap_pt = pt
+                            best_snap_desc = desc
+                    except Exception as exc:
+                        _log.debug("Ошибка проекции точки магнита при вытягивании грани: %s", exc)
+
+        if best_snap_pt is not None:
+            proj_len = float(np.dot(np.asarray(best_snap_pt, dtype=float) - fixed_pt, u))
+            if proj_len >= 10.0:
+                return proj_len, f"🧲 {best_snap_desc}"
+
+        # Ближайшая точка на прямой F(s) = fixed_pt + s * u к лучу R(t) = origin + t * ray_dir
+        origin, ray_dir = self._mouse_ray(mx, my)
+        v = np.asarray(ray_dir, dtype=float)
+        vn = float(np.linalg.norm(v))
+        if vn > 1e-12:
+            v = v / vn
+        w0 = np.asarray(fixed_pt, dtype=float) - np.asarray(origin, dtype=float)
+        b = float(np.dot(u, v))
+        d_dot = float(np.dot(u, w0))
+        e_dot = float(np.dot(v, w0))
+        denom = 1.0 - b * b
+        if denom > 1e-5:
+            s = (b * e_dot - d_dot) / denom
+            return float(s), ""
+
+        # Fallback, если луч почти параллелен оси грани
+        pt_plane = self._cursor_on_resize_plane(mx, my, fixed_pt)
+        return float(np.dot(pt_plane - fixed_pt, u)), ""
+
+    def _apply_face_push_pull(
+        self,
+        panel: Panel,
+        face_id: tuple[int, int],
+        mx: int,
+        my: int,
+    ) -> str:
+        """Вытягивает грань `face_id = (axis_idx, side)` строго вдоль её нормали в 3D (Push-Pull)."""
+        ax_idx, side = face_id
+        tax = int(getattr(panel, "thickness_axis", -1))
+        if ax_idx == tax:
+            return ""
+
+        box = self.resize_orig_box
+        if box is None:
+            box = (panel.x, panel.y, panel.z, panel.width, panel.height, panel.depth)
+        x0, y0, z0, w, h, d = [float(v) for v in box]
+        dims = [w, h, d]
+        min_size = 10.0
+
+        # Локальный вектор от фиксированной грани к тянущейся грани
+        sign = 1.0 if side == 1 else -1.0
+        local_dir = [0.0, 0.0, 0.0]
+        local_dir[ax_idx] = sign
+
+        # Центр фиксированной (противоположной) грани в локальных координатах исходного бокса
+        fixed_local = [w * 0.5, h * 0.5, d * 0.5]
+        fixed_local[ax_idx] = 0.0 if side == 1 else dims[ax_idx]
+
+        has_rot = (
+            hasattr(panel, "has_rotation")
+            and panel.has_rotation()
+            and hasattr(panel, "rotate_vector")
+        )
+        cx_orig = x0 + w * 0.5
+        cy_orig = y0 + h * 0.5
+        cz_orig = z0 + d * 0.5
+
+        if has_rot:
+            rfx, rfy, rfz = panel.rotate_vector(
+                fixed_local[0] - w * 0.5,
+                fixed_local[1] - h * 0.5,
+                fixed_local[2] - d * 0.5,
+            )
+            fixed_world = np.array([cx_orig + rfx, cy_orig + rfy, cz_orig + rfz], dtype=float)
+            rdx, rdy, rdz = panel.rotate_vector(*local_dir)
+            axis_world = np.array([rdx, rdy, rdz], dtype=float)
+        else:
+            fixed_world = np.array(
+                [x0 + fixed_local[0], y0 + fixed_local[1], z0 + fixed_local[2]], dtype=float
+            )
+            axis_world = np.array(local_dir, dtype=float)
+
+        norm_a = float(np.linalg.norm(axis_world))
+        if norm_a > 1e-12:
+            axis_world = axis_world / norm_a
+
+        raw_len, snap_desc = self._cursor_on_face_axis(mx, my, fixed_world, axis_world, panel)
+        new_len = max(min_size, float(raw_len))
+
+        if not snap_desc and self.grid_enabled and self.is_ortho:
+            step = max(0.1, float(self.grid_step))
+            # Привязываем положение движущегося торца к шагу сетки
+            moving_coord = (
+                ([x0, y0, z0][ax_idx] + new_len)
+                if side == 1
+                else ([x0 + w, y0 + h, z0 + d][ax_idx] - new_len)
+            )
+            snapped_coord = round(moving_coord / step) * step
+            cand_len = (
+                (snapped_coord - [x0, y0, z0][ax_idx])
+                if side == 1
+                else ([x0 + w, y0 + h, z0 + d][ax_idx] - snapped_coord)
+            )
+            if cand_len >= min_size:
+                new_len = cand_len
+
+        new_dims = [w, h, d]
+        new_dims[ax_idx] = new_len
+
+        if has_rot:
+            # Центр новой детали отстоит от фиксированной грани на new_len * 0.5 вдоль axis_world
+            center_new = fixed_world + axis_world * (new_len * 0.5)
+            panel.width, panel.height, panel.depth = new_dims[0], new_dims[1], new_dims[2]
+            panel.x = float(center_new[0]) - panel.width * 0.5
+            panel.y = float(center_new[1]) - panel.height * 0.5
+            panel.z = float(center_new[2]) - panel.depth * 0.5
+        else:
+            coords = [x0, y0, z0]
+            if side == 0:
+                coords[ax_idx] = (coords[ax_idx] + dims[ax_idx]) - new_len
+            panel.x, panel.y, panel.z = coords[0], coords[1], coords[2]
+            panel.width, panel.height, panel.depth = new_dims[0], new_dims[1], new_dims[2]
+
+        if hasattr(panel, "lock_thickness_to_material"):
+            panel.lock_thickness_to_material()
+
+        panel.mesh_data = CADKernel.make_aabb_mesh(
+            panel.x,
+            panel.y,
+            panel.z,
+            panel.width,
+            panel.height,
+            panel.depth,
+            getattr(panel, "rx", 0.0),
+            getattr(panel, "ry", 0.0),
+            getattr(panel, "rz", 0.0),
+        )
+        panel._gl_arrays = None
+        panel.geometry_generation = int(getattr(panel, "geometry_generation", 0)) + 1
+        panel.geometry_pending = True
+        self.resize_face_snap_desc = snap_desc
+        return snap_desc
+
     def _draw_resize_handles(self, painter: QPainter):
-        """Угловые ручки — оранжевые ромбы, как магнитные точки [Ctrl]."""
+        """Отрисовывает:
+        - Изумрудно-бирюзовые ручки центров торцов («Тянуть грань в 3D» / Push-Pull) со стрелками направления и подсветкой контура грани;
+        - Оранжевые ромбы углов панели.
+        """
         if self.drag_mode or self.fastener_mode or self.measure_mode:
             return
         panels = self.get_selected_panels()
@@ -3683,7 +3970,67 @@ class Viewport3D(QOpenGLWidget):
             return
         self._sync_viewport_matrices()
         orange = QColor(249, 115, 22)
+        cyan = QColor(6, 182, 212)
+        emerald = QColor(16, 185, 129)
+
         for p in panels:
+            # 1. Торцевые ручки «Тянуть грань в 3D» (Push-Pull)
+            for face_id, wpt, wnrm, label in self._panel_face_handles(p):
+                scr = self._project_to_screen(wpt)
+                if scr is None:
+                    continue
+                sx, sy = int(round(scr[0])), int(round(scr[1]))
+                hover = self.resize_hover_face == face_id and self.resize_panel is p
+                active = self.resize_mode and self.resize_face == face_id and self.resize_panel is p
+
+                # При наведении или вытягивании подсвечиваем 4 ребра самой грани и рисуем вектор оси
+                if hover or active:
+                    fcorners = self._panel_face_corners_world(p, face_id)
+                    scr_pts = []
+                    for fc in fcorners:
+                        sp = self._project_to_screen(fc)
+                        if sp is not None:
+                            scr_pts.append(QPoint(int(round(sp[0])), int(round(sp[1]))))
+                    if len(scr_pts) == 4:
+                        painter.setPen(QPen(emerald if active else cyan, 2.4, Qt.PenStyle.SolidLine))
+                        painter.setBrush(QColor(6, 182, 212, 32 if hover else 52))
+                        painter.drawPolygon(scr_pts)
+
+                    # Стрелка вдоль мировой нормали грани
+                    tip_world = wpt + wnrm * 42.0
+                    scr_tip = self._project_to_screen(tip_world)
+                    if scr_tip is not None:
+                        tx, ty = int(round(scr_tip[0])), int(round(scr_tip[1]))
+                        painter.setPen(QPen(emerald if active else cyan, 2.2))
+                        painter.drawLine(sx, sy, tx, ty)
+                        painter.setBrush(emerald if active else cyan)
+                        painter.drawEllipse(QPoint(tx, ty), 4, 4)
+
+                r = 9 if active else (8 if hover else 6)
+                painter.setPen(QPen(emerald if active else cyan, 2.2))
+                if active:
+                    painter.setBrush(QColor(16, 185, 129, 190))
+                elif hover:
+                    painter.setBrush(QColor(6, 182, 212, 160))
+                else:
+                    painter.setBrush(QColor(15, 23, 42, 180))
+                painter.drawEllipse(QPoint(sx, sy), r, r)
+                painter.setBrush(QColor(255, 255, 255))
+                painter.drawEllipse(QPoint(sx, sy), 2, 2)
+
+                if hover and not self.resize_mode:
+                    badge_txt = f"↔ Тянуть: {label}"
+                    painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                    tw = painter.fontMetrics().horizontalAdvance(badge_txt) + 14
+                    th = painter.fontMetrics().height() + 6
+                    brect = QRect(sx + 12, sy - th - 4, tw, th)
+                    painter.setPen(QPen(cyan, 1.5))
+                    painter.setBrush(QColor(15, 23, 42, 230))
+                    painter.drawRoundedRect(brect, 5, 5)
+                    painter.setPen(QColor(255, 255, 255))
+                    painter.drawText(brect, Qt.AlignmentFlag.AlignCenter, badge_txt)
+
+            # 2. Угловые ручки — оранжевые ромбы
             for corner, wpt in self._panel_corners(p):
                 scr = self._project_to_screen(wpt)
                 if scr is None:
@@ -3744,14 +4091,34 @@ class Viewport3D(QOpenGLWidget):
                     self._place_clipboard_at(pt)
                 return
 
-            # Растягивание за угол выделенной панели
+            # Вытягивание торца в 3D (Push-Pull) или растягивание за угол выделенной панели
             if not self.drag_mode and not self.fastener_mode and not self.measure_mode and not self.paste_mode:
+                face_hit = self._find_face_handle(event.pos().x(), event.pos().y())
+                if face_hit is not None:
+                    panel, face_id, _wpt, _wnrm, label = face_hit
+                    self.resize_mode = True
+                    self.resize_panel = panel
+                    self.resize_face = face_id
+                    self.resize_corner = None
+                    self.resize_face_snap_desc = ""
+                    self.resize_orig_box = (
+                        float(panel.x), float(panel.y), float(panel.z),
+                        float(panel.width), float(panel.height), float(panel.depth),
+                    )
+                    self.selecting_rect = None
+                    self.fastener_message.emit(
+                        f"↔ Вытягивание [{panel.name}] — {label} | Наведите на деталь для магнита | Esc — отмена"
+                    )
+                    self.update()
+                    return
+
                 hit = self._find_resize_handle(event.pos().x(), event.pos().y())
                 if hit is not None:
                     panel, corner, _wpt = hit
                     self.resize_mode = True
                     self.resize_panel = panel
                     self.resize_corner = corner
+                    self.resize_face = None
                     self.resize_orig_box = (
                         float(panel.x), float(panel.y), float(panel.z),
                         float(panel.width), float(panel.height), float(panel.depth),
@@ -3769,40 +4136,62 @@ class Viewport3D(QOpenGLWidget):
         dx = event.pos().x() - self.last_mouse_pos.x()
         dy = event.pos().y() - self.last_mouse_pos.y()
 
-        if self.resize_mode and self.resize_panel is not None and self.resize_corner is not None:
+        if self.resize_mode and self.resize_panel is not None:
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self.is_dragging = True
-                box = self.resize_orig_box
-                x0, y0, z0, w, h, d = box
-                sx, sy, sz = self.resize_corner
+                self.ctrl_held = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
                 p = self.resize_panel
-                flx = w if sx == 0 else 0.0
-                fly = h if sy == 0 else 0.0
-                flz = d if sz == 0 else 0.0
-                if hasattr(p, "has_rotation") and p.has_rotation() and hasattr(p, "rotate_vector"):
-                    rfx, rfy, rfz = p.rotate_vector(flx - w * 0.5, fly - h * 0.5, flz - d * 0.5)
-                    fixed = np.array([x0 + w * 0.5 + rfx, y0 + h * 0.5 + rfy, z0 + d * 0.5 + rfz], dtype=float)
-                else:
-                    fixed = np.array([x0 + flx, y0 + fly, z0 + flz], dtype=float)
-                new_pt = self._cursor_on_resize_plane(event.pos().x(), event.pos().y(), fixed)
-                self._apply_corner_resize(self.resize_panel, self.resize_corner, new_pt, live=True)
-                self.coordinates_changed.emit(p.x, p.y, p.z)
-                self.fastener_message.emit(
-                    f"↔ {p.name}: {p.width:.1f} × {p.height:.1f} × {p.depth:.1f} мм"
-                )
-                self.update()
+                if self.resize_face is not None:
+                    snap_desc = self._apply_face_push_pull(
+                        p, self.resize_face, event.pos().x(), event.pos().y()
+                    )
+                    self.coordinates_changed.emit(p.x, p.y, p.z)
+                    snap_suffix = f" | {snap_desc}" if snap_desc else ""
+                    self.fastener_message.emit(
+                        f"↔ Грань [{p.name}]: {p.width:.1f} × {p.height:.1f} × {p.depth:.1f} мм{snap_suffix}"
+                    )
+                    self.update()
+                elif self.resize_corner is not None:
+                    box = self.resize_orig_box
+                    x0, y0, z0, w, h, d = box
+                    sx, sy, sz = self.resize_corner
+                    flx = w if sx == 0 else 0.0
+                    fly = h if sy == 0 else 0.0
+                    flz = d if sz == 0 else 0.0
+                    if hasattr(p, "has_rotation") and p.has_rotation() and hasattr(p, "rotate_vector"):
+                        rfx, rfy, rfz = p.rotate_vector(flx - w * 0.5, fly - h * 0.5, flz - d * 0.5)
+                        fixed = np.array([x0 + w * 0.5 + rfx, y0 + h * 0.5 + rfy, z0 + d * 0.5 + rfz], dtype=float)
+                    else:
+                        fixed = np.array([x0 + flx, y0 + fly, z0 + flz], dtype=float)
+                    new_pt = self._cursor_on_resize_plane(event.pos().x(), event.pos().y(), fixed)
+                    self._apply_corner_resize(self.resize_panel, self.resize_corner, new_pt, live=True)
+                    self.coordinates_changed.emit(p.x, p.y, p.z)
+                    self.fastener_message.emit(
+                        f"↔ {p.name}: {p.width:.1f} × {p.height:.1f} × {p.depth:.1f} мм"
+                    )
+                    self.update()
             self.last_mouse_pos = event.pos()
             return
 
-        # Hover ручек размера
+        # Hover ручек торцов (Push-Pull) и углов размера
         if not self.drag_mode and not self.fastener_mode and not self.measure_mode:
-            hit = self._find_resize_handle(event.pos().x(), event.pos().y())
-            new_hover = hit[1] if hit is not None else None
-            new_panel = hit[0] if hit is not None else None
-            if new_hover != self.resize_hover_corner or (
-                new_panel is not self.resize_panel and not self.resize_mode
+            face_hit = self._find_face_handle(event.pos().x(), event.pos().y())
+            if face_hit is not None:
+                new_panel, new_face = face_hit[0], face_hit[1]
+                new_corner = None
+            else:
+                new_face = None
+                hit = self._find_resize_handle(event.pos().x(), event.pos().y())
+                new_corner = hit[1] if hit is not None else None
+                new_panel = hit[0] if hit is not None else None
+
+            if (
+                new_face != self.resize_hover_face
+                or new_corner != self.resize_hover_corner
+                or (new_panel is not self.resize_panel and not self.resize_mode)
             ):
-                self.resize_hover_corner = new_hover
+                self.resize_hover_face = new_face
+                self.resize_hover_corner = new_corner
                 if not self.resize_mode:
                     self.resize_panel = new_panel
                 self.update()
@@ -3922,6 +4311,8 @@ class Viewport3D(QOpenGLWidget):
                 )
                 self.resize_mode = False
                 self.resize_corner = None
+                self.resize_face = None
+                self.resize_face_snap_desc = ""
                 self.resize_orig_box = None
                 if old_box is not None and any(abs(a - b) > 1e-6 for a, b in zip(old_box, new_box)):
                     # уже применено live — только записать в undo
@@ -4269,6 +4660,8 @@ class Viewport3D(QOpenGLWidget):
                 p.rebuild_geometry()
                 self.resize_mode = False
                 self.resize_corner = None
+                self.resize_face = None
+                self.resize_face_snap_desc = ""
                 self.resize_orig_box = None
                 self.fastener_message.emit("Размер: отменено")
                 self.update()

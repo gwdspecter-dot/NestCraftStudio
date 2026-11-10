@@ -231,7 +231,7 @@ class MainWindow(QMainWindow):
         self.coord_edits["Z"].setText(f"{z:.1f}")
 
     def _apply_coord_boxes(self):
-        """Позволяет вбить X, Y, Z прямо в верхнюю панель и нажать Enter"""
+        """Позволяет вбить X, Y, Z (или формулу: 600 - 16, += 50) прямо в верхнюю панель и нажать Enter"""
         vp = self.workspace.current_viewport()
         if not vp:
             return
@@ -240,18 +240,23 @@ class MainWindow(QMainWindow):
             return
         import math
         try:
+            from core.formula import context_vars_from_object, eval_math_expression
             from core.undo import MovePanelCommand
-            def _coord(s: str) -> float:
-                v = float(s.strip().replace(",", "."))
+
+            def _coord(s: str, cur_val: float) -> float:
+                env = context_vars_from_object(sel, current_value=cur_val)
+                v = eval_math_expression(s, current_value=cur_val, variables=env)
                 if not math.isfinite(v) or v < -50000.0 or v > 50000.0:
                     raise ValueError("coord out of range")
                 return v
-            nx = _coord(self.coord_edits["X"].text())
-            ny = _coord(self.coord_edits["Y"].text())
-            nz = _coord(self.coord_edits["Z"].text())
+
+            nx = _coord(self.coord_edits["X"].text(), float(sel.x))
+            ny = _coord(self.coord_edits["Y"].text(), float(sel.y))
+            nz = _coord(self.coord_edits["Z"].text(), float(sel.z))
             old_xyz = (sel.x, sel.y, sel.z)
             if (nx, ny, nz) != old_xyz:
                 vp.undo_stack.push(MovePanelCommand(sel, old_xyz, (nx, ny, nz)), execute=True)
+            self._update_coord_boxes(sel.x, sel.y, sel.z)
             self.properties_dock.show_object_properties(sel)
             vp.update()
         except (ValueError, TypeError, OverflowError):
