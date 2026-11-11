@@ -293,7 +293,7 @@ def _clone_block_dict(bd: dict, dx: float, dy: float, dz: float) -> Block:
     if new_joints:
         try:
             apply_joints(block)
-        except Exception:
+        except Exception:  # noqa: BLE001 — граница apply_joints
             _log.exception("apply_joints after clone failed")
     return block
 
@@ -361,7 +361,7 @@ def materialize(
         if joints:
             try:
                 apply_joints(block)
-            except Exception:
+            except Exception:  # noqa: BLE001 — граница apply_joints
                 _log.exception("apply_joints free panels failed")
         result.append(block)
 

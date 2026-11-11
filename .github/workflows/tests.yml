@@ -12,6 +12,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install Qt system libraries (headless / offscreen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xfixes0 libx11-xcb1
       - run: pip install -r requirements-dev.txt
       - run: ruff check core models ui tests
       - name: mypy (non-blocking until cleaned up)
@@ -34,10 +41,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install base deps (без pinned build123d из requirements)
+      - name: Install Qt system libraries (headless / offscreen)
         run: |
-          pip install -r requirements-dev.txt
-          # Переустановим версию build123d из матрицы поверх requirements
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xfixes0 libx11-xcb1
+      - name: Install base deps + matrix build123d
+        run: |
+          set -e
+          # Runtime без build123d — версию ставим из матрицы (иначе 0.13 + OCP8
+          # конфликтует с build123d==0.9.0 / cadquery-ocp 7.8 → OCP.OCP.collections).
+          grep -v -E '^[[:space:]]*build123d' requirements.txt > /tmp/req-no-b123d.txt
+          pip install -r /tmp/req-no-b123d.txt
+          pip install "pytest>=7.4.0"
+
+          # Чистый стек OCP под выбранную версию
+          pip uninstall -y \
+            build123d cadquery-ocp cadquery-ocp-novtk cadquery-ocp-proxy \
+            ocpsvg ocp_gordon vtk 2>/dev/null || true
+
           if [ "${{ matrix.b123d }}" = "latest" ]; then
             pip install -U "build123d"
           else
@@ -52,7 +76,7 @@ jobs:
           print("Extrinsic.XYZ OK")
           PY
       - name: Run slow B-Rep tests
-        run: pytest -m slow -v
+        run: pytest -m slow -v --ignore=tests/test_theme.py
         env:
           QT_QPA_PLATFORM: offscreen
 
@@ -73,4 +97,3 @@ jobs:
         run: pytest tests/test_pid_alive_1_1.py tests/test_pid_start_1_3.py -v
         env:
           PYTHONPATH: .
-

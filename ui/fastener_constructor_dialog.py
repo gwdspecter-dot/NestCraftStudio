@@ -488,10 +488,7 @@ class ConfirmatPreview3D(QWidget):
         # Общая длина H; часть в A = t, остальное в B
         x_head = -t - head_len * 0.15  # головка чуть выступает из пласти
         # Стержень идёт от головки через A и в B
-        shaft_start = x_head + head_len
-        shaft_end = min(edge_depth - tip_len * 0.3, length - head_len - tip_len)
-        shaft_len = max(shaft_end - (shaft_start - x_head) + head_len * 0.0, t + 4.0)
-        # Пересчёт: длина стержня = H - head - tip, позиция от конца головки
+        # Длина стержня = H - head - tip, позиция от конца головки
         total_body = max(length - head_len - tip_len, t + 6.0)
         add_cylinder(x_head, 0.0, 0.0, head_len, d1 * 0.55, self._screw, self._screw_edge)
         add_cylinder(x_head + head_len, 0.0, 0.0, total_body, d2 * 0.5, self._screw, self._screw_edge)

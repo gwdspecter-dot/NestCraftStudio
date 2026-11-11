@@ -30,14 +30,14 @@ def changelog_path() -> Path | None:
         # core/changelog.py → parents[1] = project root
         root = Path(__file__).resolve().parents[1]
         candidates.append(root / "CHANGELOG.md")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — граница путей / frozen
         _log.debug("Не удалось определить корень проекта для CHANGELOG.md: %s", exc)
     try:
         import sys
         if getattr(sys, "frozen", False):
             candidates.append(Path(sys.executable).resolve().parent / "CHANGELOG.md")
         candidates.append(Path(sys.argv[0]).resolve().parent / "CHANGELOG.md")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — граница путей / frozen
         _log.debug("Не удалось определить путь запуска для CHANGELOG.md: %s", exc)
     candidates.append(Path.cwd() / "CHANGELOG.md")
     for p in candidates:

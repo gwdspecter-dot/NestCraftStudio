@@ -86,7 +86,7 @@ def context_vars_from_object(obj: Any, current_value: float | None = None) -> di
             t_val = float(obj.material_thickness_mm())
             if math.isfinite(t_val) and t_val > 0.0:
                 env["t"] = t_val
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — граница material_thickness_mm
             _log.debug("Не удалось получить толщину материала для контекста формулы: %s", exc)
     if "t" not in env and hasattr(obj, "thickness"):
         t_val = getattr(obj, "thickness", None)

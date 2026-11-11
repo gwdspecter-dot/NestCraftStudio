@@ -114,7 +114,7 @@ def load_confirmat_rows(
                         _SESSION_ROWS = [r.clone() for r in rows]
                         _SESSION_SELECTED_INDEX = sel
                     return rows, sel
-        except Exception:
+        except Exception:  # noqa: BLE001 — граница JSON I/O
             _log.debug("Could not load fastener_constructor_rows.json", exc_info=True)
 
     if custom_path is None and _SESSION_ROWS:
@@ -149,7 +149,7 @@ def save_confirmat_rows(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — граница JSON I/O
         _log.debug("Could not save fastener_constructor_rows.json", exc_info=True)
 
 
