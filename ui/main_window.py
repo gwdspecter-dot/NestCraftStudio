@@ -1546,30 +1546,39 @@ class MainWindow(QMainWindow):
             view_menu.addAction(a)
 
         view_menu.addSeparator()
-        self.act_ghost_others = QAction("👁 Призраки окружения (Isolate)", self)
+        self.act_ghost_others = QAction(
+            QIcon(str(_ICONS_DIR / "view_isolate.svg")), "Призраки окружения (Isolate)", self
+        )
         self.act_ghost_others.setCheckable(True)
         self.act_ghost_others.setShortcut(QKeySequence("I"))
         self.act_ghost_others.setToolTip(
-            "Приглушить невыделенные детали (alpha=0.18, клик сквозь внешние стенки к внутренним полкам и стыкам) [I]"
+            "Призраки окружения (Isolate) [I]\n"
+            "Приглушить невыделенные детали — клик сквозь внешние стенки к полкам и стыкам"
         )
         self.act_ghost_others.triggered.connect(self._toggle_ghost_others)
         view_menu.addAction(self.act_ghost_others)
 
-        self.act_section = QAction("🔪 Сечение 3D-вида (GL Clip)", self)
+        self.act_section = QAction(
+            QIcon(str(_ICONS_DIR / "view_section.svg")), "Сечение 3D-вида (GL Clip)", self
+        )
         self.act_section.setCheckable(True)
         self.act_section.setShortcut(QKeySequence("Alt+S"))
         self.act_section.setToolTip(
-            "Аппаратное 3D-сечение сцены (GL_CLIP_DISTANCE0) для рентгеновского контроля узлов и сверловки [Alt+S]"
+            "Сечение 3D-вида (GL Clip) [Alt+S]\n"
+            "Аппаратная плоскость сечения для контроля узлов и сверловки"
         )
         self.act_section.triggered.connect(self._toggle_section_mode)
         view_menu.addAction(self.act_section)
 
-        self.act_live_collisions = QAction("⚡ Живые коллизии 3D", self)
+        self.act_live_collisions = QAction(
+            QIcon(str(_ICONS_DIR / "view_collisions.svg")), "Живые коллизии 3D", self
+        )
         self.act_live_collisions.setCheckable(True)
         self.act_live_collisions.setChecked(True)
         self.act_live_collisions.setShortcut(QKeySequence("Alt+C"))
         self.act_live_collisions.setToolTip(
-            "Подсвечивать врезания деталей друг в друга прямо в 3D при перетаскивании и редактировании [Alt+C]"
+            "Живые коллизии 3D [Alt+C]\n"
+            "Подсвечивать врезания деталей при перетаскивании и редактировании"
         )
         self.act_live_collisions.triggered.connect(self._toggle_live_collisions)
         view_menu.addAction(self.act_live_collisions)
@@ -1664,16 +1673,21 @@ class MainWindow(QMainWindow):
         self.act_face_snap.triggered.connect(self._toggle_face_snap)
         top_tb1.addAction(self.act_face_snap)
 
-        # Режимы отображения: заливка / каркас / X-Ray (скрытые рёбра серые)
-        self.act_wireframe = QAction("🔲 Каркас", self)
+        # Режимы отображения: каркас / X-Ray / призраки / сечение / коллизии — только иконки
+        self.act_wireframe = QAction(
+            QIcon(str(_ICONS_DIR / "view_wireframe.svg")), "Каркас", self
+        )
         self.act_wireframe.setCheckable(True)
+        self.act_wireframe.setToolTip("Каркас\nТолько рёбра деталей, без заливки")
         self.act_wireframe.triggered.connect(self._toggle_wireframe)
         top_tb1.addAction(self.act_wireframe)
 
-        self.act_xray = QAction("👻 X-Ray (скрытые серые)", self)
+        self.act_xray = QAction(
+            QIcon(str(_ICONS_DIR / "view_xray.svg")), "X-Ray (скрытые серые)", self
+        )
         self.act_xray.setCheckable(True)
         self.act_xray.setToolTip(
-            "Прозрачный вид: видимые рёбра тёмные, скрытые — светло-серые"
+            "X-Ray (скрытые серые)\nВидимые рёбра тёмные, скрытые — светло-серые"
         )
         self.act_xray.triggered.connect(self._toggle_xray)
         top_tb1.addAction(self.act_xray)
@@ -1681,6 +1695,19 @@ class MainWindow(QMainWindow):
         top_tb1.addAction(self.act_ghost_others)
         top_tb1.addAction(self.act_section)
         top_tb1.addAction(self.act_live_collisions)
+
+        # На панели — только иконки; подпись остаётся в меню «Вид» и в tooltip
+        for _act in (
+            self.act_wireframe,
+            self.act_xray,
+            self.act_ghost_others,
+            self.act_section,
+            self.act_live_collisions,
+        ):
+            _btn = top_tb1.widgetForAction(_act)
+            if _btn is not None:
+                _btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+                _btn.setToolTip(_act.toolTip())
 
         top_tb1.addSeparator()
         top_tb1.addAction(self.act_measure)

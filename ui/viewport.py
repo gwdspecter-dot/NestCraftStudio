@@ -4086,7 +4086,8 @@ class Viewport3D(QOpenGLWidget):
 
     def _draw_resize_handles(self, painter: QPainter):
         """Отрисовывает:
-        - Изумрудно-бирюзовые ручки центров торцов («Тянуть грань в 3D» / Push-Pull) со стрелками направления и подсветкой контура грани;
+        - Оранжевые ромбики без заливки в центрах торцов («Тянуть грань в 3D» / Push-Pull)
+          — тот же стиль, что у угловых точек и Ctrl-магнита;
         - Оранжевые ромбы углов панели.
         """
         if self.drag_mode or self.fastener_mode or self.measure_mode:
@@ -4096,11 +4097,9 @@ class Viewport3D(QOpenGLWidget):
             return
         self._sync_viewport_matrices()
         orange = QColor(249, 115, 22)
-        cyan = QColor(6, 182, 212)
-        emerald = QColor(16, 185, 129)
 
         for p in panels:
-            # 1. Торцевые ручки «Тянуть грань в 3D» (Push-Pull)
+            # 1. Торцевые ручки «Тянуть грань в 3D» (Push-Pull) — оранжевые ромбики без заливки
             for face_id, wpt, wnrm, label in self._panel_face_handles(p):
                 scr = self._project_to_screen(wpt)
                 if scr is None:
@@ -4109,7 +4108,7 @@ class Viewport3D(QOpenGLWidget):
                 hover = self.resize_hover_face == face_id and self.resize_panel is p
                 active = self.resize_mode and self.resize_face == face_id and self.resize_panel is p
 
-                # При наведении или вытягивании подсвечиваем 4 ребра самой грани и рисуем вектор оси
+                # При наведении или вытягивании — контур грани и ось (тонкий оранжевый акцент)
                 if hover or active:
                     fcorners = self._panel_face_corners_world(p, face_id)
                     scr_pts = []
@@ -4118,43 +4117,43 @@ class Viewport3D(QOpenGLWidget):
                         if sp is not None:
                             scr_pts.append(QPoint(int(round(sp[0])), int(round(sp[1]))))
                     if len(scr_pts) == 4:
-                        painter.setPen(QPen(emerald if active else cyan, 2.4, Qt.PenStyle.SolidLine))
-                        painter.setBrush(QColor(6, 182, 212, 32 if hover else 52))
+                        painter.setPen(QPen(orange, 2.0 if active else 1.6, Qt.PenStyle.SolidLine))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
                         painter.drawPolygon(scr_pts)
 
-                    # Стрелка вдоль мировой нормали грани
                     tip_world = wpt + wnrm * 42.0
                     scr_tip = self._project_to_screen(tip_world)
                     if scr_tip is not None:
                         tx, ty = int(round(scr_tip[0])), int(round(scr_tip[1]))
-                        painter.setPen(QPen(emerald if active else cyan, 2.2))
+                        painter.setPen(QPen(orange, 1.8))
                         painter.drawLine(sx, sy, tx, ty)
-                        painter.setBrush(emerald if active else cyan)
-                        painter.drawEllipse(QPoint(tx, ty), 4, 4)
+                        # Кончик оси — маленький ромб без заливки
+                        tip_r = 4
+                        tip_poly = [
+                            QPoint(tx, ty - tip_r),
+                            QPoint(tx + tip_r, ty),
+                            QPoint(tx, ty + tip_r),
+                            QPoint(tx - tip_r, ty),
+                        ]
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawPolygon(tip_poly)
 
-                r = 9 if active else (8 if hover else 6)
-                painter.setPen(QPen(emerald if active else cyan, 2.2))
+                # Точка захвата — оранжевый ромбик без заливки (как у углов)
+                r = 10 if active else (9 if hover else 8)
+                poly = [
+                    QPoint(sx, sy - r),
+                    QPoint(sx + r, sy),
+                    QPoint(sx, sy + r),
+                    QPoint(sx - r, sy),
+                ]
                 if active:
-                    painter.setBrush(QColor(16, 185, 129, 190))
+                    painter.setPen(QPen(orange, 2.4))
                 elif hover:
-                    painter.setBrush(QColor(6, 182, 212, 160))
+                    painter.setPen(QPen(orange, 2.2))
                 else:
-                    painter.setBrush(QColor(15, 23, 42, 180))
-                painter.drawEllipse(QPoint(sx, sy), r, r)
-                painter.setBrush(QColor(255, 255, 255))
-                painter.drawEllipse(QPoint(sx, sy), 2, 2)
-
-                if hover and not self.resize_mode:
-                    badge_txt = f"↔ Тянуть: {label}"
-                    painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-                    tw = painter.fontMetrics().horizontalAdvance(badge_txt) + 14
-                    th = painter.fontMetrics().height() + 6
-                    brect = QRect(sx + 12, sy - th - 4, tw, th)
-                    painter.setPen(QPen(cyan, 1.5))
-                    painter.setBrush(QColor(15, 23, 42, 230))
-                    painter.drawRoundedRect(brect, 5, 5)
-                    painter.setPen(QColor(255, 255, 255))
-                    painter.drawText(brect, Qt.AlignmentFlag.AlignCenter, badge_txt)
+                    painter.setPen(QPen(orange, 2.0))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPolygon(poly)
 
             # 2. Угловые ручки — оранжевые ромбы
             for corner, wpt in self._panel_corners(p):
@@ -4171,16 +4170,14 @@ class Viewport3D(QOpenGLWidget):
                     QPoint(sx, sy + r),
                     QPoint(sx - r, sy),
                 ]
+                # Единый стиль: контур без заливки (как Ctrl-магнит и торцы)
                 if active:
                     painter.setPen(QPen(orange, 2.4))
-                    painter.setBrush(QColor(249, 115, 22, 70))
                 elif hover:
                     painter.setPen(QPen(orange, 2.2))
-                    painter.setBrush(QColor(249, 115, 22, 40))
                 else:
-                    # как Ctrl-магнит: контур без заливки
                     painter.setPen(QPen(orange, 2.0))
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPolygon(poly)
 
     def mousePressEvent(self, event):
