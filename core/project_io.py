@@ -219,6 +219,39 @@ def _migrate_to_0_0_8(data: dict) -> dict:
     return data
 
 
+def _migrate_to_0_0_10(data: dict) -> dict:
+    """v0.0.9 -> v0.0.10: персистентные формулы `drivers` на панелях."""
+    for bd in data.get("blocks") or []:
+        if not isinstance(bd, dict):
+            continue
+        for pd in bd.get("panels") or []:
+            if isinstance(pd, dict) and not isinstance(pd.get("drivers"), dict):
+                pd["drivers"] = {}
+    return data
+
+
+def _migrate_to_0_0_9(data: dict) -> dict:
+    """v0.0.8 -> v0.0.9: ассоциативные ссылки `assoc_refs` на блоках."""
+    for bd in data.get("blocks", []) or []:
+        if not isinstance(bd, dict):
+            continue
+        raw = bd.get("assoc_refs")
+        if not isinstance(raw, list):
+            bd["assoc_refs"] = []
+        else:
+            from core.assoc import AssocRef
+
+            norm = []
+            for item in raw:
+                if isinstance(item, dict):
+                    norm.append(AssocRef.from_dict(item).to_dict())
+            bd["assoc_refs"] = norm
+        for pd in bd.get("panels", []) or []:
+            if isinstance(pd, dict) and not isinstance(pd.get("assoc_hole_map"), dict):
+                pd["assoc_hole_map"] = {}
+    return data
+
+
 MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.1", "0.0.2", _migrate_to_0_0_2),
     ("0.0.2", "0.0.3", _migrate_to_0_0_3),
@@ -227,6 +260,8 @@ MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.5", "0.0.6", _migrate_to_0_0_6),
     ("0.0.6", "0.0.7", _migrate_to_0_0_7),
     ("0.0.7", "0.0.8", _migrate_to_0_0_8),
+    ("0.0.8", "0.0.9", _migrate_to_0_0_9),
+    ("0.0.9", "0.0.10", _migrate_to_0_0_10),
 ]
 
 
@@ -293,6 +328,20 @@ def _panel_to_dict(p: Panel) -> dict:
             for k, v in jmap.items()
             if k and v
         }
+    amap = getattr(p, "assoc_hole_map", None) or {}
+    if isinstance(amap, dict) and amap:
+        out["assoc_hole_map"] = {
+            str(k): [list(h) for h in (v or [])]
+            for k, v in amap.items()
+            if k and v
+        }
+    drivers = getattr(p, "drivers", None) or {}
+    if isinstance(drivers, dict) and drivers:
+        out["drivers"] = {
+            str(k): str(v)
+            for k, v in drivers.items()
+            if k and v is not None and str(v).strip()
+        }
     return out
 
 
@@ -316,6 +365,10 @@ def _block_to_dict(b: Block) -> dict:
             jr.to_dict() if hasattr(jr, "to_dict") else dict(jr)
             for jr in (getattr(b, "joints", None) or [])
         ],
+        "assoc_refs": [
+            ar.to_dict() if hasattr(ar, "to_dict") else dict(ar)
+            for ar in (getattr(b, "assoc_refs", None) or [])
+        ],
     }
     if isinstance(b, ParametricCabinet):
         data["params"] = {
@@ -335,6 +388,7 @@ def _block_to_dict(b: Block) -> dict:
 
 
 def _block_from_dict(d: dict) -> Block:
+    from core.assoc import AssocRef, apply_assoc_refs
     from core.joint import JointRecord, apply_joints
 
     btype = d.get("type", "block")
@@ -344,6 +398,12 @@ def _block_from_dict(d: dict) -> Block:
         jr if isinstance(jr, JointRecord) else JointRecord.from_dict(jr)
         for jr in raw_joints
         if isinstance(jr, (dict, JointRecord))
+    ]
+    raw_assoc = d.get("assoc_refs") or []
+    assoc_refs = [
+        ar if isinstance(ar, AssocRef) else AssocRef.from_dict(ar)
+        for ar in raw_assoc
+        if isinstance(ar, (dict, AssocRef))
     ]
 
     if btype == "cabinet" and "params" in d:
@@ -367,6 +427,7 @@ def _block_from_dict(d: dict) -> Block:
             joints=joints,
             rebuild_on_init=not bool(panels_data),
         )
+        cab.assoc_refs = assoc_refs
         # Восстанавливаем сохраненные панели из файла (с пазами/присадкой), если они есть
         if panels_data:
             cab.panels = [_panel_from_dict(pd) for pd in panels_data]
@@ -374,6 +435,8 @@ def _block_from_dict(d: dict) -> Block:
                 p._block = cab
             if cab.joints:
                 apply_joints(cab)
+            if cab.assoc_refs:
+                apply_assoc_refs(cab)
         return cab
 
     block = Block(
@@ -382,12 +445,15 @@ def _block_from_dict(d: dict) -> Block:
         code=d.get("code", ""),
         uid=str(d.get("uid") or ""),
         joints=joints,
+        assoc_refs=assoc_refs,
     )
     block.panels = [_panel_from_dict(pd) for pd in panels_data]
     for p in block.panels:
         p._block = block
     if block.joints:
         apply_joints(block)
+    if block.assoc_refs:
+        apply_assoc_refs(block)
     return block
 
 

@@ -60,46 +60,71 @@ def is_formula_text(raw: str) -> bool:
     return any(ch in body for ch in ("+", "-", "*", "/", "(", ")", "w", "h", "d", "t", "x", "y", "z"))
 
 
-def context_vars_from_object(obj: Any, current_value: float | None = None) -> dict[str, float]:
-    """Собирает словарь переменных (`w`, `h`, `d`, `t`, `x`, `y`, `z`, `cur`) из `Panel` или `ParametricCabinet`."""
+def context_vars_from_object(
+    obj: Any,
+    current_value: float | None = None,
+    parent: Any | None = None,
+) -> dict[str, float]:
+    """Собирает словарь переменных из `Panel` / `ParametricCabinet`.
+
+    Собственные: ``w/h/d/t/x/y/z/cur``.
+    Родитель (корпус): ``cw/ch/cd/ct`` и длинные ``cabinet_w`` …
+    """
     env: dict[str, float] = {"pi": math.pi}
     if current_value is not None and math.isfinite(float(current_value)):
         env["cur"] = float(current_value)
-    if obj is None:
+    if obj is None and parent is None:
         return env
-    for key, attr in (
-        ("w", "width"),
-        ("width", "width"),
-        ("h", "height"),
-        ("height", "height"),
-        ("d", "depth"),
-        ("depth", "depth"),
-        ("x", "x"),
-        ("y", "y"),
-        ("z", "z"),
-    ):
-        val = getattr(obj, attr, None)
-        if isinstance(val, (int, float)) and math.isfinite(float(val)):
-            env[key] = float(val)
-    if hasattr(obj, "material_thickness_mm") and callable(obj.material_thickness_mm):
-        try:
-            t_val = float(obj.material_thickness_mm())
-            if math.isfinite(t_val) and t_val > 0.0:
-                env["t"] = t_val
-        except Exception as exc:  # noqa: BLE001 — граница material_thickness_mm
-            _log.debug("Не удалось получить толщину материала для контекста формулы: %s", exc)
-    if "t" not in env and hasattr(obj, "thickness"):
-        t_val = getattr(obj, "thickness", None)
-        if isinstance(t_val, (int, float)) and math.isfinite(float(t_val)) and float(t_val) > 0.0:
-            env["t"] = float(t_val)
-    if "t" not in env and all(k in env for k in ("w", "h", "d")):
-        tax = getattr(obj, "thickness_axis", None)
-        if isinstance(tax, str) and tax.upper() in ("X", "Y", "Z"):
-            env["t"] = env[{"X": "w", "Y": "h", "Z": "d"}[tax.upper()]]
-        elif isinstance(tax, int) and tax in (0, 1, 2):
-            env["t"] = env[("w", "h", "d")[tax]]
-        else:
-            env["t"] = min(env["w"], env["h"], env["d"])
+    if obj is not None:
+        for key, attr in (
+            ("w", "width"),
+            ("width", "width"),
+            ("h", "height"),
+            ("height", "height"),
+            ("d", "depth"),
+            ("depth", "depth"),
+            ("x", "x"),
+            ("y", "y"),
+            ("z", "z"),
+        ):
+            val = getattr(obj, attr, None)
+            if isinstance(val, (int, float)) and math.isfinite(float(val)):
+                env[key] = float(val)
+        if hasattr(obj, "material_thickness_mm") and callable(obj.material_thickness_mm):
+            try:
+                t_val = float(obj.material_thickness_mm())
+                if math.isfinite(t_val) and t_val > 0.0:
+                    env["t"] = t_val
+            except Exception as exc:  # noqa: BLE001 — граница material_thickness_mm
+                _log.debug("Не удалось получить толщину материала для контекста формулы: %s", exc)
+        if "t" not in env and hasattr(obj, "thickness"):
+            t_val = getattr(obj, "thickness", None)
+            if isinstance(t_val, (int, float)) and math.isfinite(float(t_val)) and float(t_val) > 0.0:
+                env["t"] = float(t_val)
+        if "t" not in env and all(k in env for k in ("w", "h", "d")):
+            tax = getattr(obj, "thickness_axis", None)
+            if isinstance(tax, str) and tax.upper() in ("X", "Y", "Z"):
+                env["t"] = env[{"X": "w", "Y": "h", "Z": "d"}[tax.upper()]]
+            elif isinstance(tax, int) and tax in (0, 1, 2):
+                env["t"] = env[("w", "h", "d")[tax]]
+            else:
+                env["t"] = min(env["w"], env["h"], env["d"])
+    if parent is not None:
+        for key, attr in (
+            ("cw", "width"),
+            ("cabinet_w", "width"),
+            ("ch", "height"),
+            ("cabinet_h", "height"),
+            ("cd", "depth"),
+            ("cabinet_d", "depth"),
+        ):
+            val = getattr(parent, attr, None)
+            if isinstance(val, (int, float)) and math.isfinite(float(val)):
+                env[key] = float(val)
+        ct = getattr(parent, "thickness", None)
+        if isinstance(ct, (int, float)) and math.isfinite(float(ct)) and float(ct) > 0.0:
+            env["ct"] = float(ct)
+            env["cabinet_t"] = float(ct)
     return env
 
 

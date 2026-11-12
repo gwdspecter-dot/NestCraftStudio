@@ -53,6 +53,9 @@ class Panel:
     holes: list[tuple] = field(default_factory=list)
     fastener_issues: list = field(default_factory=list)
     joint_hole_map: dict[str, list[tuple]] = field(default_factory=dict, repr=False)
+    assoc_hole_map: dict[str, list[tuple]] = field(default_factory=dict, repr=False)
+    # Персистентные формулы: attr -> expression (например width: "cw - 2*ct")
+    drivers: dict[str, str] = field(default_factory=dict)
     _block: Any = field(default=None, repr=False)
     solid: object = field(default=None, repr=False)
     mesh_data: object = field(default=None, repr=False)
@@ -609,6 +612,20 @@ class Panel:
                 for k, v in raw_jmap.items()
                 if k
             }
+        raw_amap = d.get("assoc_hole_map")
+        if isinstance(raw_amap, dict):
+            p.assoc_hole_map = {
+                str(k): [tuple(h) for h in (v or [])]
+                for k, v in raw_amap.items()
+                if k
+            }
+        raw_drivers = d.get("drivers")
+        if isinstance(raw_drivers, dict):
+            p.drivers = {
+                str(k): str(v)
+                for k, v in raw_drivers.items()
+                if k and v is not None and str(v).strip()
+            }
         if rebuild:
             p.rebuild_geometry()
         return p
@@ -623,6 +640,7 @@ class Block:
         code: str = "",
         uid: str = "",
         joints: list | None = None,
+        assoc_refs: list | None = None,
     ):
         self.uid = str(uid).strip() if uid else new_uid()
         self.name = name
@@ -630,6 +648,7 @@ class Block:
         self.code = code
         self.panels: list[Panel] = []
         self.joints: list = list(joints) if joints else []
+        self.assoc_refs: list = list(assoc_refs) if assoc_refs else []
         self.selected = False
 
     def add_panel(self, panel: Panel):
@@ -679,6 +698,45 @@ class Block:
         removed = len(self.joints) < before
         if removed and apply:
             apply_joints(self)
+        return removed
+
+    def get_assoc_by_uid(self, uid: str):
+        target = str(uid or "").strip()
+        if not target:
+            return None
+        for ref in getattr(self, "assoc_refs", []) or []:
+            if str(getattr(ref, "uid", "")) == target:
+                return ref
+        return None
+
+    def add_assoc_ref(self, record, *, apply: bool = True):
+        from core.assoc import AssocRef, apply_assoc_refs
+
+        rec = record if isinstance(record, AssocRef) else AssocRef.from_dict(record)
+        refs = list(getattr(self, "assoc_refs", []) or [])
+        for i, existing in enumerate(refs):
+            if str(getattr(existing, "uid", "")) == rec.uid:
+                refs[i] = rec
+                break
+        else:
+            refs.append(rec)
+        self.assoc_refs = refs
+        if apply:
+            apply_assoc_refs(self)
+        return rec
+
+    def remove_assoc_ref(self, uid: str, *, apply: bool = True) -> bool:
+        from core.assoc import apply_assoc_refs
+
+        target = str(uid or "").strip()
+        if not target:
+            return False
+        refs = list(getattr(self, "assoc_refs", []) or [])
+        before = len(refs)
+        self.assoc_refs = [r for r in refs if str(getattr(r, "uid", "")) != target]
+        removed = len(self.assoc_refs) < before
+        if removed and apply:
+            apply_assoc_refs(self)
         return removed
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "nestcraft-studio"
-version = "0.0.18"
+version = "0.0.21"
 description = "NestCraft Studio — мебельный 3D CAD с поддержкой B-Rep (build123d)"
 requires-python = ">=3.11"
 

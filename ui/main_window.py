@@ -18,10 +18,14 @@ from ui.panels.properties_panel import PropertiesDock
 from ui.panels.browser_panel import BrowserDock
 from ui.panels.history_panel import AnalysisDock, HistoryDock
 from ui.panels.joints_panel import JointsDock
+from ui.panels.assoc_panel import AssocDock
 from core.undo import (
+    AddAssocRefCommand,
     AddMultiplePanelsCommand,
     AddPanelCommand,
+    DeleteAssocRefCommand,
     DeleteJointCommand,
+    EditAssocRefCommand,
     EditJointCommand,
     EditPropertyCommand,
     ReplaceBlocksCommand,
@@ -144,6 +148,11 @@ class MainWindow(QMainWindow):
         self.joints_dock.joint_modified.connect(self._on_joint_modified)
         self.joints_dock.joint_deleted.connect(self._on_joint_deleted)
         self.joints_dock.add_joint_requested.connect(self.add_hole_to_selected)
+        self.assoc_dock.assoc_selected.connect(self._on_assoc_selected)
+        self.assoc_dock.assoc_modified.connect(self._on_assoc_modified)
+        self.assoc_dock.assoc_deleted.connect(self._on_assoc_deleted)
+        self.assoc_dock.add_assoc_requested.connect(self.add_assoc_ref_dialog)
+        self.assoc_dock.edit_assoc_requested.connect(self._on_assoc_edit_dialog)
 
         # Сигналы вкладок: при смене/создании переподключаем viewport
         self.workspace.currentChanged.connect(self._on_tab_changed)
@@ -280,6 +289,8 @@ class MainWindow(QMainWindow):
             self.structure_dock.load_structure(vp.title, vp.blocks)
             if hasattr(self, "joints_dock") and self.joints_dock is not None:
                 self.joints_dock.load_joints(vp.blocks)
+            if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
+                self.assoc_dock.load_assocs(vp.blocks)
             self._refresh_issues_only()
 
     def _on_joint_selected(self, block, joint_uid: str) -> None:
@@ -321,6 +332,123 @@ class MainWindow(QMainWindow):
             self.properties_dock.show_object_properties(sel)
         vp.update()
 
+    def _on_assoc_selected(self, block, assoc_uid: str) -> None:
+        vp = self.workspace.current_viewport()
+        if not vp or block is None:
+            return
+        from core.assoc import AssocRef, face_point_world, panel_face_frame
+
+        ref = None
+        for raw in getattr(block, "assoc_refs", None) or []:
+            cand = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
+            if str(getattr(cand, "uid", "")) == str(assoc_uid):
+                ref = cand
+                break
+        if ref is None:
+            if hasattr(vp, "set_assoc_preview_point"):
+                vp.set_assoc_preview_point(None)
+            return
+        t_uid = str(ref.target_uid or "")
+        s_uid = str(ref.source_uid or "")
+        for b in vp.blocks:
+            b.selected = False
+            for p in getattr(b, "panels", []):
+                p.selected = str(getattr(p, "uid", "")) in {t_uid, s_uid}
+        # Превью точки на грани source
+        source = block.get_panel_by_uid(s_uid) if hasattr(block, "get_panel_by_uid") else None
+        if source is not None and hasattr(vp, "set_assoc_preview_point"):
+            try:
+                u = float(ref.params.get("u") or 0.0)
+                v = float(ref.params.get("v") or 0.0)
+                inset = float(ref.params.get("inset") or 0.0)
+                _o, normal, _ua, _va = panel_face_frame(source, ref.source_face)
+                pt = face_point_world(source, ref.source_face, u, v)
+                if abs(inset) > 1e-9:
+                    pt = pt + (-inset) * normal
+                vp.set_assoc_preview_point((float(pt[0]), float(pt[1]), float(pt[2])))
+            except Exception:
+                vp.set_assoc_preview_point(None)
+        vp.update()
+
+    def _on_assoc_modified(self, block, assoc_uid: str, old_state: dict, new_state: dict) -> None:
+        vp = self.workspace.current_viewport()
+        if not vp or block is None or not assoc_uid:
+            return
+        cmd = EditAssocRefCommand(block, assoc_uid, old_state, new_state, "Параметры ассоциации")
+        vp.undo_stack.push(cmd, execute=True, merge=True)
+        self._refresh_structure()
+        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
+            self.assoc_dock.load_assocs(vp.blocks)
+        sel = vp.get_selected_panel()
+        if sel is not None:
+            self.properties_dock.show_object_properties(sel)
+        vp.update()
+
+    def _on_assoc_deleted(self, block, assoc_uid: str) -> None:
+        vp = self.workspace.current_viewport()
+        if not vp or block is None or not assoc_uid:
+            return
+        cmd = DeleteAssocRefCommand(block, assoc_uid, "Удаление ассоциации")
+        vp.undo_stack.push(cmd, execute=True)
+        self._refresh_structure()
+        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
+            self.assoc_dock.load_assocs(vp.blocks)
+        if hasattr(vp, "set_assoc_preview_point"):
+            vp.set_assoc_preview_point(None)
+        sel = vp.get_selected_panel()
+        if sel is not None:
+            self.properties_dock.show_object_properties(sel)
+        vp.update()
+
+    def _on_assoc_edit_dialog(self, block, assoc_uid: str) -> None:
+        """Полный диалог правки выбранной ассоциации."""
+        from core.assoc import AssocRef
+        from ui.assoc_dialog import AssocRefDialog
+
+        vp = self.workspace.current_viewport()
+        if not vp or block is None or not assoc_uid:
+            return
+        ref = None
+        for raw in getattr(block, "assoc_refs", None) or []:
+            cand = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
+            if str(getattr(cand, "uid", "")) == str(assoc_uid):
+                ref = cand
+                break
+        if ref is None:
+            return
+
+        def _preview(pt):
+            if hasattr(vp, "set_assoc_preview_point"):
+                vp.set_assoc_preview_point(pt)
+
+        dlg = AssocRefDialog(
+            block,
+            target_panel=block.get_panel_by_uid(ref.target_uid) if hasattr(block, "get_panel_by_uid") else None,
+            parent=self,
+            existing_ref=ref,
+            preview_callback=_preview,
+        )
+        if not dlg.exec():
+            return
+        try:
+            updated = dlg.build_ref()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Ассоциативное отверстие", str(exc))
+            return
+        old_state = ref.to_dict()
+        new_state = updated.to_dict()
+        if old_state == new_state:
+            return
+        vp.undo_stack.push(
+            EditAssocRefCommand(block, assoc_uid, old_state, new_state, "Правка ассоциации"),
+            execute=True,
+        )
+        self.mark_modified()
+        self._refresh_structure()
+        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
+            self.assoc_dock.load_assocs(vp.blocks)
+        vp.update()
+
     def _on_object_selected(self, obj):
         self.properties_dock.show_object_properties(obj)
         if isinstance(obj, Panel):
@@ -352,7 +480,11 @@ class MainWindow(QMainWindow):
             return
         from core.validation import ValidationError
 
-        cmd = EditPropertyCommand(obj, attr_name, old_val, new_val)
+        formula_expr = getattr(self.properties_dock, "_pending_driver_expr", None)
+        self.properties_dock._pending_driver_expr = None
+        cmd = EditPropertyCommand(
+            obj, attr_name, old_val, new_val, formula_expr=formula_expr
+        )
         try:
             vp.undo_stack.push(cmd, execute=True)
         except ValidationError as exc:
@@ -360,6 +492,7 @@ class MainWindow(QMainWindow):
             self.properties_dock.show_object_properties(obj)
             return
         self._refresh_structure()
+        self.properties_dock.show_object_properties(obj)
         vp.update()
         if isinstance(obj, Panel):
             self._update_coord_boxes(obj.x, obj.y, obj.z)
@@ -1344,6 +1477,61 @@ class MainWindow(QMainWindow):
         self.properties_dock.show_object_properties(sel)
         vp.update()
 
+    def add_assoc_ref_dialog(self):
+        """Диалог: отверстие на панели, привязанное к грани соседней панели в том же блоке."""
+        from ui.assoc_dialog import AssocRefDialog
+
+        vp = self.workspace.current_viewport()
+        if not vp:
+            return
+        sel = vp.get_selected_panel()
+        if not sel:
+            QMessageBox.information(
+                self,
+                "Ассоциативное отверстие",
+                "Сначала выберите панель, на которой нужно отверстие (target).",
+            )
+            return
+        block = getattr(sel, "_block", None)
+        panels = list(getattr(block, "panels", []) or []) if block is not None else []
+        if block is None or len(panels) < 2:
+            QMessageBox.warning(
+                self,
+                "Ассоциативное отверстие",
+                "Нужны минимум две панели в одном блоке или корпусе.\n"
+                "Выберите панель внутри корпуса / блока и повторите.",
+            )
+            return
+
+        def _preview(pt):
+            if hasattr(vp, "set_assoc_preview_point"):
+                vp.set_assoc_preview_point(pt)
+
+        dlg = AssocRefDialog(
+            block, target_panel=sel, parent=self, preview_callback=_preview
+        )
+        if not dlg.exec():
+            return
+        try:
+            ref = dlg.build_ref()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Ассоциативное отверстие", str(exc))
+            return
+
+        vp.undo_stack.push(
+            AddAssocRefCommand(block, ref, f"Ассоциация → {getattr(sel, 'name', 'панель')}"),
+            execute=True,
+        )
+        self.mark_modified()
+        self.properties_dock.show_object_properties(sel)
+        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
+            self.assoc_dock.load_assocs(vp.blocks)
+        vp.update()
+        self.statusBar().showMessage(
+            f"Ассоциативное отверстие: {ref.source_face} → {getattr(sel, 'name', '')}",
+            4000,
+        )
+
     def open_catalog_browser(self):
         """Открывает окно библиотеки материалов и крепежа."""
         from ui.catalog_browser import CatalogBrowserDialog
@@ -1606,6 +1794,14 @@ class MainWindow(QMainWindow):
         act_hole_manual = QAction("Присадка по координатам…", self)
         act_hole_manual.triggered.connect(self.add_hole_manual)
         tools_menu.addAction(act_hole_manual)
+
+        act_assoc = QAction("Ассоциативное отверстие…", self)
+        act_assoc.setShortcut(QKeySequence("Ctrl+Shift+H"))
+        act_assoc.setToolTip(
+            "Отверстие на панели, привязанное к грани соседней панели (Ctrl+Shift+H)"
+        )
+        act_assoc.triggered.connect(self.add_assoc_ref_dialog)
+        tools_menu.addAction(act_assoc)
 
         tools_menu.addSeparator()
         act_catalog = QAction("📚 Библиотека материалов и крепежа…", self)
@@ -2017,14 +2213,17 @@ class MainWindow(QMainWindow):
 
         self.browser_dock = BrowserDock(self)
         self.joints_dock = JointsDock(self)
+        self.assoc_dock = AssocDock(self)
         self.analysis_dock = AnalysisDock(self)
         self.history_dock = HistoryDock(self)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.browser_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.joints_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.assoc_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.analysis_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.history_dock)
         self.splitDockWidget(self.browser_dock, self.joints_dock, Qt.Orientation.Vertical)
-        self.splitDockWidget(self.joints_dock, self.analysis_dock, Qt.Orientation.Vertical)
+        self.splitDockWidget(self.joints_dock, self.assoc_dock, Qt.Orientation.Vertical)
+        self.splitDockWidget(self.assoc_dock, self.analysis_dock, Qt.Orientation.Vertical)
         self.splitDockWidget(self.analysis_dock, self.history_dock, Qt.Orientation.Vertical)
 
 

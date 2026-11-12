@@ -1101,10 +1101,16 @@ def hole_geometry(hole) -> tuple:
 
 
 def hole_joint_uid(hole) -> str:
-    """Метка стыка (7-й элемент), если есть; иначе пустая строка."""
+    """Метка стыка (7-й элемент), если есть; иначе пустая строка.
+
+    Метки ассоциативных ссылок (`a:<uid>`) не считаются joint-метками.
+    """
     if hole is None or len(hole) < 7:
         return ""
-    return str(hole[6] or "").strip()
+    raw = str(hole[6] or "").strip()
+    if not raw or raw.startswith("a:"):
+        return ""
+    return raw
 
 
 def tag_joint_hole(hole, joint_uid: str) -> tuple:
@@ -1113,13 +1119,16 @@ def tag_joint_hole(hole, joint_uid: str) -> tuple:
     uid = str(joint_uid or "").strip()
     if not uid:
         return g
+    # Не допускаем путаницу с assoc-префиксом
+    if uid.startswith("a:"):
+        uid = uid[2:]
     return g + (uid,)
 
 
 def extract_manual_holes(panel) -> list[tuple]:
-    """Возвращает отверстия, поставленные вручную (не принадлежащие JointRecord).
+    """Возвращает отверстия, поставленные вручную (не JointRecord и не AssocRef).
 
-    Приоритет: 7-й элемент ``joint_uid`` (формат ≥0.0.8).
+    Приоритет: 7-й элемент owner-метки (формат ≥0.0.8).
     Fallback: совпадение координат с ``panel.joint_hole_map`` (legacy ≤0.0.7).
     """
     raw_holes = list(getattr(panel, "holes", []) or [])
@@ -1137,6 +1146,10 @@ def extract_manual_holes(panel) -> list[tuple]:
             continue
         # Явная метка стыка — не ручное
         if hole_joint_uid(h):
+            continue
+        # Метка ассоциативной ссылки (a:<uid>) — не ручное
+        raw_tag = str(h[6] or "").strip() if len(h) >= 7 else ""
+        if raw_tag.startswith("a:"):
             continue
         h6 = hole_geometry(h)
         matched_idx = None
@@ -1217,7 +1230,12 @@ def apply_joints(block, *, rebuild_geometry: bool = True) -> list:
             _log.debug("Could not bind _block on panel: %s", exc)
         old_holes_by_id[id(p)] = [hole_geometry(h) for h in (getattr(p, "holes", []) or []) if len(h) >= 6]
         manual = extract_manual_holes(p)
-        p.holes = list(manual)
+        # Сохраняем ассоциативные отверстия (a:<uid>) — ими управляет apply_assoc_refs
+        assoc_kept: list[tuple] = []
+        for h in list(getattr(p, "holes", []) or []):
+            if len(h) >= 7 and str(h[6] or "").startswith("a:"):
+                assoc_kept.append(tuple(h))
+        p.holes = list(manual) + assoc_kept
         p.joint_hole_map = {}
         if hasattr(p, "fastener_issues"):
             p.fastener_issues = []
@@ -1298,6 +1316,15 @@ def apply_joints(block, *, rebuild_geometry: bool = True) -> list:
                 p._gl_arrays = None
                 if hasattr(p, "rebuild_geometry"):
                     p.rebuild_geometry()
+
+    # Ассоциативные отверстия пересчитываются после стыков (общая точка входа после rebuild).
+    if getattr(block, "assoc_refs", None):
+        try:
+            from core.assoc import apply_assoc_refs
+
+            apply_assoc_refs(block, rebuild_geometry=rebuild_geometry)
+        except Exception as exc:  # noqa: BLE001 — не ломаем стыки из‑за assoc
+            _log.exception("apply_assoc_refs after joints failed: %s", exc)
 
     return all_issues
 

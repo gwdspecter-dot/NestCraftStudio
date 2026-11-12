@@ -370,8 +370,17 @@ class PropertiesDock(QDockWidget):
         if not is_num_attr and attr_name != "has_facade":
             new_val = item.text()  # имя и прочий текст — как ввели
 
+        # Персистентный driver: формула с переменными; «+=» — разово, голое число снимает driver
+        self._pending_driver_expr = None
         if is_num_attr:
+            from core.drivers import should_persist_formula
             from core.formula import is_formula_text
+
+            if should_persist_formula(raw_input):
+                self._pending_driver_expr = raw_input
+            elif attr_name in ("width", "height", "depth", "x", "y", "z"):
+                # явное число / разовое += → снять driver
+                self._pending_driver_expr = ""
 
             if is_formula_text(raw_input):
                 self._updating = True
@@ -379,9 +388,10 @@ class PropertiesDock(QDockWidget):
                     item.setText(f"{new_val:g}" if isinstance(new_val, float) else str(new_val))
                 finally:
                     self._updating = False
-                self.validation_failed.emit(f"🧮 Формула [{attr_name}]: {raw_input} = {new_val:g}")
+                mark = "📌" if self._pending_driver_expr else "🧮"
+                self.validation_failed.emit(f"{mark} Формула [{attr_name}]: {raw_input} = {new_val:g}")
 
-        if old_val == new_val:
+        if old_val == new_val and self._pending_driver_expr is None:
             return
 
         # Корпус: геометрические/технологические минимумы (план §1.3)

@@ -307,6 +307,7 @@ class Viewport3D(QOpenGLWidget):
         self.fastener_preset_id = "confirmat_3"
         self.fastener_preview_points: list | None = None
         self._last_fastener_params: dict | None = None
+        self.assoc_preview_point: tuple[float, float, float] | None = None
         # Грань-к-грани при Grab
         self.face_snap_enabled = True
         self.drag_face_snap_gap = 25.0  # мм: порог притяжения
@@ -1059,6 +1060,9 @@ class Viewport3D(QOpenGLWidget):
 
         if self.fastener_mode and self.fastener_joint is not None:
             self._draw_joint_and_preview()
+
+        if self.assoc_preview_point is not None:
+            self._draw_assoc_preview()
 
         self._draw_dimensions()
 
@@ -2050,6 +2054,41 @@ class Viewport3D(QOpenGLWidget):
         self.fastener_preview = None
         self.fastener_preview_points = None
         self.update()
+
+    def set_assoc_preview_point(self, point: tuple[float, float, float] | None) -> None:
+        """Показать/скрыть мировую точку превью ассоциации."""
+        if point is None:
+            self.assoc_preview_point = None
+        else:
+            self.assoc_preview_point = (float(point[0]), float(point[1]), float(point[2]))
+        self.update()
+
+    def _draw_assoc_preview(self) -> None:
+        pt = self.assoc_preview_point
+        if pt is None:
+            return
+        try:
+            glDisable(GL_DEPTH_TEST)
+            x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+            r = 4.0
+            # Крест в трёх осях
+            lines = np.asarray(
+                [
+                    [x - r, y, z],
+                    [x + r, y, z],
+                    [x, y - r, z],
+                    [x, y + r, z],
+                    [x, y, z - r],
+                    [x, y, z + r],
+                ],
+                dtype=np.float32,
+            )
+            self._draw_lines(lines[0:2], (0.15, 0.55, 1.0), 2.5)
+            self._draw_lines(lines[2:4], (0.15, 0.55, 1.0), 2.5)
+            self._draw_lines(lines[4:6], (0.15, 0.55, 1.0), 2.5)
+            glEnable(GL_DEPTH_TEST)
+        except Exception as exc:
+            _log.debug("Превью ассоциативной точки не отрисовано: %s", exc)
 
     def _draw_joint_and_preview(self):
         j = self.fastener_joint

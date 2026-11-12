@@ -11,12 +11,25 @@ _log = get_logger("undo")
 
 
 def _reapply_panel_block_joints(panel) -> None:
-    """Если панель принадлежит блоку с параметрическими стыками (п. 3.1), пересчитывает стыки."""
+    """Пересчитывает зависимые features блока после сдвига/resize панели.
+
+    - при наличии joints вызывает apply_joints (он же тянет assoc_refs);
+    - иначе, если есть только assoc_refs — apply_assoc_refs.
+    """
     block = getattr(panel, "_block", None)
-    if block is not None and getattr(block, "joints", None):
+    if block is None:
+        return
+    has_joints = bool(getattr(block, "joints", None))
+    has_assoc = bool(getattr(block, "assoc_refs", None))
+    if has_joints:
         from core.joint import apply_joints
 
         apply_joints(block)
+        return
+    if has_assoc:
+        from core.assoc import apply_assoc_refs
+
+        apply_assoc_refs(block)
 
 
 class Command:
@@ -360,13 +373,28 @@ class EditPropertyCommand(Command):
         "rx", "ry", "rz", "material",
     })
 
-    def __init__(self, obj, attr_name: str, old_val, new_val, description: str | None = None):
+    def __init__(
+        self,
+        obj,
+        attr_name: str,
+        old_val,
+        new_val,
+        description: str | None = None,
+        *,
+        formula_expr: str | None = None,
+    ):
         label = getattr(obj, "name", "Объект")
         super().__init__(description or f"Свойство {attr_name}: {label}")
         self.obj = obj
         self.attr_name = attr_name
         self.old_val = old_val
         self.new_val = new_val
+        # formula_expr: None = не трогать driver; "" = снять; иначе установить
+        self.formula_expr = formula_expr
+        self._old_driver: str | None = None
+        if formula_expr is not None and hasattr(obj, "drivers"):
+            drv = getattr(obj, "drivers", None) or {}
+            self._old_driver = str(drv.get(attr_name)) if attr_name in (drv or {}) else None
         # Для смены материала сохраняем связку id + color + missing_material_id
         self._old_material_id = getattr(obj, "material_id", None) if attr_name == "material" else None
         self._old_color = getattr(obj, "color", None) if attr_name == "material" else None
@@ -405,6 +433,8 @@ class EditPropertyCommand(Command):
     def merge_with(self, next_cmd: Command) -> None:
         if isinstance(next_cmd, EditPropertyCommand):
             self.new_val = next_cmd.new_val
+            if next_cmd.formula_expr is not None:
+                self.formula_expr = next_cmd.formula_expr
             if self.attr_name == "material":
                 self._new_material_id = next_cmd._new_material_id
                 self._new_color = next_cmd._new_color
@@ -592,6 +622,13 @@ class EditPropertyCommand(Command):
                 for role, pdict in before_by_role.items():
                     if role not in remaining_roles:
                         self._removed_panels_by_role[role] = pdict
+                # Пересчёт персистентных формул на панелях (cw/ch/cd)
+                try:
+                    from core.drivers import apply_block_drivers
+
+                    apply_block_drivers(self.obj)
+                except Exception:
+                    _log.exception("apply_block_drivers after cabinet rebuild failed")
                 return
 
             # Неизвестное свойство корпуса — на всякий случай не трогаем геометрию
@@ -616,15 +653,50 @@ class EditPropertyCommand(Command):
 
         # Всё остальное (неизвестные attrs) — без rebuild
 
+    def _apply_driver_side_effect(self, *, is_redo: bool) -> None:
+        """Устанавливает/снимает driver для атрибута панели (если formula_expr задан)."""
+        if self.formula_expr is None:
+            return
+        if not hasattr(self.obj, "drivers"):
+            return
+        from core.drivers import DRIVABLE_ATTRS, clear_driver, set_driver
+
+        if self.attr_name not in DRIVABLE_ATTRS:
+            return
+        if is_redo:
+            if self.formula_expr == "":
+                clear_driver(self.obj, self.attr_name)
+            else:
+                set_driver(self.obj, self.attr_name, self.formula_expr)
+                try:
+                    from core.drivers import apply_panel_drivers
+
+                    apply_panel_drivers(self.obj, attrs={self.attr_name})
+                except Exception:
+                    _log.exception("apply_panel_drivers after set_driver failed")
+        else:
+            if self._old_driver:
+                set_driver(self.obj, self.attr_name, self._old_driver)
+                try:
+                    from core.drivers import apply_panel_drivers
+
+                    apply_panel_drivers(self.obj, attrs={self.attr_name})
+                except Exception:
+                    _log.exception("apply_panel_drivers after restore driver failed")
+            else:
+                clear_driver(self.obj, self.attr_name)
+
     def redo(self) -> None:
         self._apply_value(self.new_val)
         # material extras применяются внутри _after_change, чтобы не дублировать
         if self.attr_name == "material" and self._new_material_id is not None:
             pass  # handled in _after_change
+        self._apply_driver_side_effect(is_redo=True)
         self._after_change(is_redo=True)
 
     def undo(self) -> None:
         self._apply_value(self.old_val)
+        self._apply_driver_side_effect(is_redo=False)
         self._after_change(is_redo=False)
 
 
@@ -871,6 +943,151 @@ class DeleteJointCommand(Command):
             )
             self.block.joints.insert(ins_idx, rec_copy)
         apply_joints(self.block)
+
+
+class AddAssocRefCommand(Command):
+    """Добавление ассоциативной ссылки AssocRef в блок с Undo/Redo."""
+
+    def __init__(self, block, assoc_ref, description: str = "Ассоциативная ссылка"):
+        super().__init__(description)
+        self.block = block
+        self.assoc_ref = assoc_ref
+
+    def redo(self) -> None:
+        from core.assoc import apply_assoc_refs
+
+        if not hasattr(self.block, "assoc_refs") or self.block.assoc_refs is None:
+            self.block.assoc_refs = []
+        rec_uid = str(getattr(self.assoc_ref, "uid", ""))
+        for idx, existing in enumerate(self.block.assoc_refs):
+            if str(getattr(existing, "uid", "")) == rec_uid:
+                self.block.assoc_refs[idx] = self.assoc_ref
+                break
+        else:
+            self.block.assoc_refs.append(self.assoc_ref)
+        apply_assoc_refs(self.block)
+
+    def undo(self) -> None:
+        from core.assoc import apply_assoc_refs
+
+        if hasattr(self.block, "assoc_refs") and self.block.assoc_refs is not None:
+            rec_uid = str(getattr(self.assoc_ref, "uid", ""))
+            self.block.assoc_refs = [
+                r for r in self.block.assoc_refs if str(getattr(r, "uid", "")) != rec_uid
+            ]
+        apply_assoc_refs(self.block)
+
+
+class EditAssocRefCommand(Command):
+    """Изменение параметров AssocRef (грань, u/v, диаметр…) с Undo/Redo."""
+
+    def __init__(
+        self,
+        block,
+        assoc_uid: str,
+        old_state: dict,
+        new_state: dict,
+        description: str = "Параметры ассоциации",
+    ):
+        super().__init__(description)
+        self.block = block
+        self.assoc_uid = str(assoc_uid or "").strip()
+        self.old_state = copy.deepcopy(old_state)
+        self.new_state = copy.deepcopy(new_state)
+
+    def can_merge_with(self, next_cmd: Command) -> bool:
+        return (
+            isinstance(next_cmd, EditAssocRefCommand)
+            and next_cmd.block is self.block
+            and next_cmd.assoc_uid == self.assoc_uid
+        )
+
+    def merge_with(self, next_cmd: Command) -> None:
+        if isinstance(next_cmd, EditAssocRefCommand):
+            self.new_state = copy.deepcopy(next_cmd.new_state)
+
+    def _apply_state(self, state: dict) -> None:
+        from core.assoc import AssocRef, apply_assoc_refs
+
+        refs = getattr(self.block, "assoc_refs", None) or []
+        for idx, ref in enumerate(refs):
+            if str(getattr(ref, "uid", "")) == self.assoc_uid:
+                updated = AssocRef.from_dict(state)
+                updated.uid = self.assoc_uid
+                refs[idx] = updated
+                break
+        apply_assoc_refs(self.block)
+
+    def redo(self) -> None:
+        self._apply_state(self.new_state)
+
+    def undo(self) -> None:
+        self._apply_state(self.old_state)
+
+
+class DeleteAssocRefCommand(Command):
+    """Удаление ассоциативной ссылки и её отверстий с Undo/Redo."""
+
+    def __init__(self, block, assoc_uid: str, description: str = "Удаление ассоциации"):
+        super().__init__(description)
+        self.block = block
+        self.assoc_uid = str(assoc_uid or "").strip()
+        self._removed_index: int = -1
+        self._removed_record = None
+        for idx, ref in enumerate(getattr(block, "assoc_refs", None) or []):
+            if str(getattr(ref, "uid", "")) == self.assoc_uid:
+                self._removed_index = idx
+                # Снимок через to_dict, чтобы не делить мутабельный params
+                from core.assoc import AssocRef
+
+                if isinstance(ref, AssocRef):
+                    self._removed_record = AssocRef.from_dict(ref.to_dict())
+                elif isinstance(ref, dict):
+                    self._removed_record = AssocRef.from_dict(ref)
+                else:
+                    self._removed_record = copy.deepcopy(ref)
+                break
+
+    def redo(self) -> None:
+        from core.assoc import AssocRef, apply_assoc_refs
+
+        if hasattr(self.block, "assoc_refs") and self.block.assoc_refs is not None:
+            for idx, ref in enumerate(self.block.assoc_refs):
+                if str(getattr(ref, "uid", "")) == self.assoc_uid:
+                    self._removed_index = idx
+                    if isinstance(ref, AssocRef):
+                        self._removed_record = AssocRef.from_dict(ref.to_dict())
+                    elif isinstance(ref, dict):
+                        self._removed_record = AssocRef.from_dict(ref)
+                    else:
+                        self._removed_record = copy.deepcopy(ref)
+                    break
+            self.block.assoc_refs = [
+                r for r in self.block.assoc_refs if str(getattr(r, "uid", "")) != self.assoc_uid
+            ]
+        apply_assoc_refs(self.block)
+
+    def undo(self) -> None:
+        from core.assoc import AssocRef, apply_assoc_refs
+
+        if self._removed_record is None:
+            return
+        if not hasattr(self.block, "assoc_refs") or self.block.assoc_refs is None:
+            self.block.assoc_refs = []
+        if isinstance(self._removed_record, AssocRef):
+            rec_copy = AssocRef.from_dict(self._removed_record.to_dict())
+        elif isinstance(self._removed_record, dict):
+            rec_copy = AssocRef.from_dict(self._removed_record)
+        else:
+            rec_copy = copy.deepcopy(self._removed_record)
+        if not any(str(getattr(r, "uid", "")) == self.assoc_uid for r in self.block.assoc_refs):
+            ins_idx = (
+                min(max(0, self._removed_index), len(self.block.assoc_refs))
+                if self._removed_index >= 0
+                else len(self.block.assoc_refs)
+            )
+            self.block.assoc_refs.insert(ins_idx, rec_copy)
+        apply_assoc_refs(self.block)
 
 
 class PasteBlocksCommand(Command):

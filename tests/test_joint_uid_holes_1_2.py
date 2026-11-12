@@ -14,8 +14,8 @@ from core.project_io import migrate_project_dict, _migrate_to_0_0_8
 from core.version import FORMAT_VERSION
 
 
-def test_format_version_is_008():
-    assert FORMAT_VERSION == "0.0.8"
+def test_format_version_is_current():
+    assert FORMAT_VERSION == "0.0.10"
 
 
 def test_tag_and_extract_by_uid():
@@ -78,8 +78,10 @@ def test_migrate_0_0_8_tags_from_map():
     assert len(plain) == 1
 
 
-def test_migrate_chain_to_008():
+def test_migrate_chain_to_current():
     data = {"version": "0.0.7", "name": "t", "blocks": []}
     migrated, steps = migrate_project_dict(data, in_place=False)
     assert any("0.0.8" in s for s in steps)
-    assert migrated["version"] == "0.0.8"
+    assert any("0.0.9" in s for s in steps)
+    assert any("0.0.10" in s for s in steps)
+    assert migrated["version"] == FORMAT_VERSION

@@ -169,9 +169,11 @@ def test_version_and_back_groove_without_modulo_hack(make_panel):
     from core.version import APP_VERSION, FORMAT_VERSION
     from core.project_io import FORMAT_VERSION as IO_FMT
 
-    assert APP_VERSION == "0.0.19"
+    assert APP_VERSION == "0.0.21"
     assert FORMAT_VERSION == IO_FMT
-    assert FORMAT_VERSION >= "0.0.8"
+    from core.project_io import version_cmp
+
+    assert version_cmp(FORMAT_VERSION, "0.0.8") >= 0
 
     # Вертикальная панель на x=550 (раньше из-за 550 % 600 >= 300 паз прыгал на gx=0)
     p_vert = make_panel(x=550, y=0, z=0, width=16, height=720, depth=560)

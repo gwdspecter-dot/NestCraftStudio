@@ -4,6 +4,49 @@
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [0.0.21] - 2026-11-12
+
+### Added
+- **Персистентные формулы (drivers)** (`core/drivers.py`, `core/formula.py`):
+  выражение вроде `cw - 2*ct` или `w - 32` сохраняется на панели в `drivers[attr]` и
+  пересчитывается при смене размеров панели или родительского корпуса.
+  Переменные корпуса: `cw/ch/cd/ct` (и `cabinet_w` …). Относительные `+=`/`-=` не сохраняются.
+- **Формат проекта 0.0.10**: поле `drivers` у панелей, миграция `0.0.9 → 0.0.10`.
+- **Свойства / Undo** (`ui/panels/properties_panel.py`, `core/undo.py`): ввод формулы в таблице
+  свойств записывает driver; голое число снимает; `EditPropertyCommand` откатывает driver;
+  после изменения габаритов корпуса вызывается `apply_block_drivers`.
+- Тесты: `tests/test_drivers.py`.
+
+### Changed
+- `APP_VERSION` → **0.0.21**; `FORMAT_VERSION` → **0.0.10**.
+
+## [0.0.20] - 2026-11-12
+
+### Added
+- **Ассоциативные отверстия (`AssocRef`, kind=`face_hole`)** (`core/assoc.py`):
+  отверстие на панели-target считается от грани панели-source (`X+`…`Z-`) + смещения `u`/`v`/`inset`,
+  диаметр и глубина. При сдвиге/resize source или rebuild блока позиция пересчитывается (`apply_assoc_refs`).
+- **Хранение на блоке** (`models/panel.py`): `block.assoc_refs`, `panel.assoc_hole_map`; отверстия
+  помечаются тегом `a:<uid>` (7-е поле), ручные и стыковые отверстия не затрагиваются.
+- **Формат проекта 0.0.9** (`core/project_io.py`, `core/version.py`):
+  сериализация `assoc_refs` / `assoc_hole_map`, миграция `0.0.8 → 0.0.9`.
+- **Совместимость со стыками** (`core/joint.py`): `apply_joints` сохраняет assoc-отверстия и
+  в конце вызывает `apply_assoc_refs`.
+- **Undo/Redo** (`core/undo.py`): `AddAssocRefCommand`, `EditAssocRefCommand`, `DeleteAssocRefCommand`;
+  `MovePanelCommand` / `ResizePanelCommand` пересчитывают assoc при отсутствии joints.
+- **Диалог создания и правки** (`ui/assoc_dialog.py`): target/source, грань, u/v, inset, Ø, глубина, ось;
+  live-превью точки в 3D; режим правки по существующей ссылке.
+- **Док «Ассоциации»** (`ui/panels/assoc_panel.py`): список ссылок, добавить / правка / удалить,
+  быстрые поля параметров с merge в undo-стеке.
+- **Интеграция в главное окно** (`ui/main_window.py`): меню «Инструменты → Ассоциативное отверстие…»
+  (`Ctrl+Shift+H`), док справа под «Стыки», выделение target/source и превью при выборе в списке.
+- **Превью в viewport** (`ui/viewport.py`): синий крест в мировой точке ассоциации
+  (`set_assoc_preview_point` / `_draw_assoc_preview`).
+- Тесты: `tests/test_assoc_refs.py`, `tests/test_assoc_undo.py` (smoke, миграция, undo/redo, сдвиг source).
+
+### Changed
+- `APP_VERSION` → **0.0.20**; `FORMAT_VERSION` остаётся **0.0.9** (введён в этой линии для assoc).
+
 ## [0.0.19] - 2026-11-08
 
 ### Added

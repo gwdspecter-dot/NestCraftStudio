@@ -51,8 +51,7 @@ jobs:
       - name: Install base deps + matrix build123d
         run: |
           set -e
-          # Runtime без build123d — версию ставим из матрицы (иначе 0.13 + OCP8
-          # конфликтует с build123d==0.9.0 / cadquery-ocp 7.8 → OCP.OCP.collections).
+          # Runtime без build123d — версию ставим из матрицы.
           grep -v -E '^[[:space:]]*build123d' requirements.txt > /tmp/req-no-b123d.txt
           pip install -r /tmp/req-no-b123d.txt
           pip install "pytest>=7.4.0"
@@ -65,9 +64,16 @@ jobs:
           if [ "${{ matrix.b123d }}" = "latest" ]; then
             pip install -U "build123d"
           else
-            pip install "build123d==${{ matrix.b123d }}"
+            # build123d 0.9.0 → cadquery-ocp 7.8 (TColgp_Array1OfPnt).
+            # Современный ocpsvg>=0.5 тянет OCP.collections (OCP 8) и ломает импорт:
+            #   ModuleNotFoundError: No module named 'OCP.collections'
+            # Поэтому для min-версии фиксируем ocpsvg 0.4.x (API OCP 7.x).
+            pip install \
+              "build123d==${{ matrix.b123d }}" \
+              "ocpsvg>=0.4,<0.5"
           fi
           python -c "import build123d; print('build123d', getattr(build123d, '__version__', '?'))"
+          python -c "import ocpsvg; print('ocpsvg OK')"
       - name: Verify Extrinsic API (минимальная версия)
         run: |
           python - <<'PY'
