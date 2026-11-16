@@ -1,8 +1,10 @@
-"""Парсер CHANGELOG.md → список версий для окна «Что нового»."""
+"""Парсер RELEASE_NOTES.md и CHANGELOG.md → список версий для окна «Что нового»."""
 
 from __future__ import annotations
 
+import html as html_mod
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,23 +25,22 @@ class ChangelogEntry:
     body: str = ""
 
 
-def changelog_path() -> Path | None:
-    """Ищет CHANGELOG.md рядом с приложением / в корне проекта."""
+def _find_doc_file(filename: str) -> Path | None:
+    """Ищет markdown-файл рядом с приложением / в корне проекта."""
     candidates: list[Path] = []
     try:
         # core/changelog.py → parents[1] = project root
         root = Path(__file__).resolve().parents[1]
-        candidates.append(root / "CHANGELOG.md")
+        candidates.append(root / filename)
     except Exception as exc:  # noqa: BLE001 — граница путей / frozen
-        _log.debug("Не удалось определить корень проекта для CHANGELOG.md: %s", exc)
+        _log.debug("Не удалось определить корень проекта для %s: %s", filename, exc)
     try:
-        import sys
         if getattr(sys, "frozen", False):
-            candidates.append(Path(sys.executable).resolve().parent / "CHANGELOG.md")
-        candidates.append(Path(sys.argv[0]).resolve().parent / "CHANGELOG.md")
+            candidates.append(Path(sys.executable).resolve().parent / filename)
+        candidates.append(Path(sys.argv[0]).resolve().parent / filename)
     except Exception as exc:  # noqa: BLE001 — граница путей / frozen
-        _log.debug("Не удалось определить путь запуска для CHANGELOG.md: %s", exc)
-    candidates.append(Path.cwd() / "CHANGELOG.md")
+        _log.debug("Не удалось определить путь запуска для %s: %s", filename, exc)
+    candidates.append(Path.cwd() / filename)
     for p in candidates:
         try:
             if p.is_file():
@@ -47,6 +48,16 @@ def changelog_path() -> Path | None:
         except OSError:
             continue
     return None
+
+
+def changelog_path() -> Path | None:
+    """Ищет CHANGELOG.md рядом с приложением / в корне проекта."""
+    return _find_doc_file("CHANGELOG.md")
+
+
+def release_notes_path() -> Path | None:
+    """Ищет RELEASE_NOTES.md рядом с приложением / в корне проекта."""
+    return _find_doc_file("RELEASE_NOTES.md")
 
 
 def parse_changelog(text: str) -> list[ChangelogEntry]:
@@ -80,68 +91,104 @@ def parse_changelog(text: str) -> list[ChangelogEntry]:
     return entries
 
 
-def load_changelog(path: Path | None = None) -> list[ChangelogEntry]:
-    p = path or changelog_path()
-    if p is None:
-        _log.warning("CHANGELOG.md not found")
+def _load_entries_from(path: Path | None, label: str) -> list[ChangelogEntry]:
+    if path is None:
+        _log.warning("%s not found", label)
         return []
     try:
-        text = p.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except OSError:
-        _log.exception("Failed to read CHANGELOG %s", p)
+        _log.exception("Failed to read %s %s", label, path)
         return []
     return parse_changelog(text)
 
 
+def load_changelog(path: Path | None = None) -> list[ChangelogEntry]:
+    return _load_entries_from(path or changelog_path(), "CHANGELOG.md")
+
+
+def load_release_notes(path: Path | None = None) -> list[ChangelogEntry]:
+    return _load_entries_from(path or release_notes_path(), "RELEASE_NOTES.md")
+
+
+def load_whats_new(
+    release_path: Path | None = None,
+    changelog_file: Path | None = None,
+) -> tuple[list[ChangelogEntry], list[ChangelogEntry]]:
+    """Возвращает (пользовательский список, полный технический CHANGELOG).
+
+    Для версий, описанных в RELEASE_NOTES.md, используется понятный пользователю текст;
+    остальные версии автоматически подтягиваются из CHANGELOG.md.
+    """
+    release_entries = load_release_notes(release_path)
+    tech_entries = load_changelog(changelog_file)
+    if not release_entries:
+        return list(tech_entries), tech_entries
+    if not tech_entries:
+        return release_entries, []
+
+    release_by_ver = {e.version: e for e in release_entries}
+    tech_versions = {e.version for e in tech_entries}
+
+    merged: list[ChangelogEntry] = [
+        e for e in release_entries if e.version not in tech_versions
+    ]
+    for tech in tech_entries:
+        merged.append(release_by_ver.get(tech.version, tech))
+    return merged, tech_entries
+
+
 def markdown_to_html(body: str) -> str:
-    """Простой markdown → HTML для QTextBrowser (заголовки, списки, code)."""
+    """Простой markdown → HTML для QTextBrowser (заголовки, списки, **bold**, *italic*, `code`)."""
     if not body.strip():
         return "<p><i>Нет описания для этой версии.</i></p>"
 
     out: list[str] = []
-    in_ul = False
+    ul_depth = 0
 
-    def close_ul() -> None:
-        nonlocal in_ul
-        if in_ul:
+    def set_ul_depth(target: int) -> None:
+        nonlocal ul_depth
+        while ul_depth < target:
+            out.append("<ul>")
+            ul_depth += 1
+        while ul_depth > target:
             out.append("</ul>")
-            in_ul = False
+            ul_depth -= 1
 
     for raw in body.split("\n"):
         line = raw.rstrip()
         s = line.strip()
         if not s:
-            close_ul()
+            set_ul_depth(0)
             continue
         if s.startswith("### "):
-            close_ul()
+            set_ul_depth(0)
             out.append(f"<h3>{_inline(s[4:])}</h3>")
             continue
         if s.startswith("## "):
-            close_ul()
+            set_ul_depth(0)
             out.append(f"<h2>{_inline(s[3:])}</h2>")
             continue
         if s.startswith("# "):
-            close_ul()
+            set_ul_depth(0)
             out.append(f"<h2>{_inline(s[2:])}</h2>")
             continue
         if s.startswith("- ") or s.startswith("* "):
-            if not in_ul:
-                out.append("<ul>")
-                in_ul = True
+            indent = len(line) - len(line.lstrip(" \t"))
+            target_depth = 2 if (indent >= 2 and ul_depth >= 1) else 1
+            set_ul_depth(target_depth)
             out.append(f"<li>{_inline(s[2:])}</li>")
             continue
-        close_ul()
+        set_ul_depth(0)
         out.append(f"<p>{_inline(s)}</p>")
-    close_ul()
+    set_ul_depth(0)
     return "\n".join(out)
 
 
 def _inline(text: str) -> str:
-    """Экранирование + **bold** + `code`."""
-    import html as html_mod
-
+    """Экранирование + **bold** + *italic* + `code`."""
     t = html_mod.escape(text)
     t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", t)
     t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
     return t

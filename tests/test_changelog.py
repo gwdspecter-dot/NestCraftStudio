@@ -28,14 +28,32 @@ def test_parse_escaped_brackets():
     assert entries and entries[0].version == "0.0.18"
 
 def test_markdown_to_html():
-    html = markdown_to_html("### Title\n- item `code`\n- **bold**")
+    html = markdown_to_html("### Title\n- item `code`\n  - nested *italic*\n- **bold**")
     assert "<h3>" in html
     assert "<li>" in html
     assert "<code>code</code>" in html
+    assert "<i>italic</i>" in html
     assert "<b>bold</b>" in html
+    assert html.count("<ul>") == 2
+    assert html.count("</ul>") == 2
+
 
 def test_load_real_changelog():
     from core.changelog import load_changelog
     entries = load_changelog()
     assert entries
-    assert entries[0].version == "0.0.21"
+    assert entries[0].version == "0.0.22"
+
+
+def test_load_real_release_notes_and_merge():
+    from core.changelog import load_release_notes, load_whats_new
+
+    rel = load_release_notes()
+    merged, tech = load_whats_new()
+    assert rel and merged and tech
+    assert [e.version for e in rel] == [e.version for e in tech]
+    assert [e.version for e in merged] == [e.version for e in tech]
+    for entry, rel_entry in zip(merged, rel):
+        assert entry.body == rel_entry.body
+        assert ".py" not in rel_entry.body
+        assert "tests/" not in rel_entry.body

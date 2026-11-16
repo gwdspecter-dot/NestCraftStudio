@@ -198,7 +198,9 @@ def test_edit_and_delete_joint_commands_with_undo_redo():
 
 def test_b3d_format_0_0_7_migration_and_roundtrip(tmp_path: Path):
     """П. 3.1: хранение JointRecord в block.joints и в .b3d (миграция 0.0.6 → FORMAT_VERSION + roundtrip)."""
-    assert FORMAT_VERSION >= "0.0.7"
+    from core.project_io import version_cmp
+
+    assert version_cmp(FORMAT_VERSION, "0.0.7") >= 0
 
     raw_006 = {
         "format": "NestCraft",

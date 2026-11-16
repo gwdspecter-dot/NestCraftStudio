@@ -120,6 +120,9 @@ class TestRenderEngineV019(unittest.TestCase):
         self.assertIn("def _find_face_handle", src)
         self.assertIn("def _cursor_on_face_axis", src)
         self.assertIn("def _apply_face_push_pull", src)
+        self.assertIn("def _corner_active_axes_and_dirs", src)
+        self.assertIn("def _apply_corner_push_pull", src)
+        self.assertIn("def _pick_closest_resize_or_face_handle", src)
 
     def test_smart_formula_evaluator_v019(self):
         """Проверяем безопасное вычисление арифметических формул и контекстных переменных детали (w, h, d, t, cur)."""
@@ -151,7 +154,7 @@ class TestRenderEngineV019(unittest.TestCase):
             Panel._controller_unbound = False
 
     def test_face_push_pull_handles_and_resize_v019(self):
-        """Проверяем расчёт центров граней compute_panel_face_handles и растяжение compute_face_push_pull_box."""
+        """Проверяем расчёт центров граней compute_panel_face_handles и растяжение compute_face_push_pull_box / compute_corner_push_pull_box."""
         from models.panel import Panel
 
         Panel._controller_unbound = True
@@ -177,6 +180,33 @@ class TestRenderEngineV019(unittest.TestCase):
             self.assertAlmostEqual(nx2, 0.0)
             self.assertAlmostEqual(nw2, 584.0)
             self.assertAlmostEqual(nx2 + nw2, 584.0)
+
+            # Вытягивание за угол (0, 1, 1) — левый передний угол полки (-X, +Z):
+            # правый торец x+w=584.0 и задний торец z=0.0 остаются неподвижными, толщина Y=16.0 не меняется
+            cx1, cy1, cz1, cw1, ch1, cd1 = glmath.compute_corner_push_pull_box(
+                orig_box, (0, 1, 1), {0: 584.0, 1: 999.0, 2: 560.0}, panel=p
+            )
+            self.assertAlmostEqual(cx1, 0.0)
+            self.assertAlmostEqual(cw1, 584.0)
+            self.assertAlmostEqual(cx1 + cw1, 584.0)
+            self.assertAlmostEqual(cy1, 350.0)
+            self.assertAlmostEqual(ch1, 16.0)
+            self.assertAlmostEqual(cz1, 0.0)
+            self.assertAlmostEqual(cd1, 560.0)
+
+            # Вытягивание за угол повёрнутой детали (rz = 45°): противоположный угол в мире остаётся строго на месте
+            p_rot = Panel("Полка 45", 100.0, 200.0, 30.0, 400.0, 300.0, 16.0, rebuild=False)
+            p_rot.thickness_axis = 2
+            p_rot.rz = 45.0
+            rot_orig = (p_rot.x, p_rot.y, p_rot.z, p_rot.width, p_rot.height, p_rot.depth)
+            fixed_before = p_rot.local_to_world(400.0, 0.0, 16.0)  # противоположный углу (0, 1, 1) по X и Y
+            rx, ry, rz, rw, rh, rd = glmath.compute_corner_push_pull_box(
+                rot_orig, (0, 1, 1), {0: 520.0, 1: 380.0}, panel=p_rot
+            )
+            p_rot.x, p_rot.y, p_rot.z, p_rot.width, p_rot.height, p_rot.depth = rx, ry, rz, rw, rh, rd
+            fixed_after = p_rot.local_to_world(520.0, 0.0, 16.0)
+            for a, b in zip(fixed_before, fixed_after):
+                self.assertAlmostEqual(a, b, places=5)
         finally:
             Panel._controller_unbound = False
 

@@ -101,6 +101,17 @@ def _install_bare_numpy_stub():
         def __neg__(self):
             return _Vec([-a for a in self])
 
+        def __matmul__(self, other):
+            if self and isinstance(self[0], (list, tuple)) and other and isinstance(other[0], (list, tuple)):
+                rows, inner, cols = len(self), len(self[0]), len(other[0])
+                return _Vec([
+                    _Vec([sum(float(self[i][k]) * float(other[k][j]) for k in range(inner)) for j in range(cols)])
+                    for i in range(rows)
+                ])
+            if self and isinstance(self[0], (list, tuple)):
+                return _Vec([sum(float(self[i][k]) * float(other[k]) for k in range(len(other))) for i in range(len(self))])
+            return sum(float(a) * float(b) for a, b in zip(self, other))
+
     def _array(seq, dtype=float, copy: bool = True):
         if isinstance(seq, _Vec):
             return seq.copy() if copy else seq

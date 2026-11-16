@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import QTabWidget
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtGui import QSurfaceFormat, QPainter, QColor, QPen, QFont
-from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QRect, QTimer, pyqtSignal
 from OpenGL.GL import (
     GL_ALIASED_LINE_WIDTH_RANGE,
     GL_ARRAY_BUFFER,
@@ -259,7 +259,22 @@ class Viewport3D(QOpenGLWidget):
         self.pan_y = -350.0
 
         self.is_ortho = False
+        self._ortho_blend: float = 0.0
+        self._focus_pivot: tuple[float, float, float] | None = None
         self.view_name = "iso"
+        # ViewCube (правый верхний угол) + плавная анимация камеры и вращение перетаскиванием куба
+        self._viewcube_drawable = None
+        self._viewcube_hover: tuple[str, str] | None = None
+        self._vc_press_pos: QPoint | None = None
+        self._vc_press_hit: tuple[str, str] | None = None
+        self._vc_dragging: bool = False
+        self._vc_pivot: tuple[float, float, float] | None = None
+        self._view_anim: dict | None = None
+        self._view_anim_timer = QTimer(self)
+        self._view_anim_timer.setInterval(16)
+        self._view_anim_timer.timeout.connect(self._on_view_anim_tick)
+        self._middle_press_pos: QPoint | None = None
+        self._middle_did_drag = False
         self.wireframe_only = False
         # solid | wireframe | xray (прозрачный + серые скрытые рёбра)
         self.display_mode = "solid"
@@ -665,6 +680,8 @@ class Viewport3D(QOpenGLWidget):
         return hits
 
     def _init_default_scene(self):
+        from ui.viewcube import pan_for_pivot
+
         b1 = ParametricCabinet(
             name="Блок1 (Тумба 600)", x=0, y=100, z=0,
             width=600, height=720, depth=560,
@@ -673,8 +690,35 @@ class Viewport3D(QOpenGLWidget):
         )
         custom_block = Block("Пользовательские панели", "2", "02.00")
         self.blocks.extend([b1, custom_block])
+        cx, cy, cz, _r = self._scene_center_and_radius()
+        self._focus_pivot = (cx, cy, cz)
+        self.pan_x, self.pan_y = pan_for_pivot(self.rot_x, self.rot_y, self._focus_pivot)
 
-    def set_Standard_view(self, view_name: str):
+    def _focus_reference_point(self) -> tuple[float, float, float]:
+        """Опорная 3D-точка для вращения камеры: центр выделенных деталей или центр всей сцены."""
+        sel = self.get_selected_panels()
+        if sel:
+            min_x = min(float(p.x) for p in sel)
+            min_y = min(float(p.y) for p in sel)
+            min_z = min(float(p.z) for p in sel)
+            max_x = max(float(p.x) + float(p.width) for p in sel)
+            max_y = max(float(p.y) + float(p.height) for p in sel)
+            max_z = max(float(p.z) + float(p.depth) for p in sel)
+            return (0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.5 * (min_z + max_z))
+        if self._focus_pivot is not None:
+            scx, scy, scz, srad = self._scene_center_and_radius()
+            dist = math.hypot(
+                math.hypot(self._focus_pivot[0] - scx, self._focus_pivot[1] - scy),
+                self._focus_pivot[2] - scz,
+            )
+            if dist <= srad * 1.35:
+                return self._focus_pivot
+        cx, cy, cz, _r = self._scene_center_and_radius()
+        return (cx, cy, cz)
+
+    def set_Standard_view(self, view_name: str, *, animate: bool = True):
+        from ui.viewcube import pan_for_pivot, pivot_from_pan
+
         views = {
             "iso":    (25.0, -35.0, False),
             "front":  (0.0, 0.0, True),
@@ -682,11 +726,184 @@ class Viewport3D(QOpenGLWidget):
             "left":   (0.0, 90.0, True),
             "right":  (0.0, -90.0, True),
             "top":    (90.0, 0.0, True),
+            "bottom": (-90.0, 0.0, True),
         }
-        if view_name in views:
-            self.view_name = view_name
-            self.rot_x, self.rot_y, self.is_ortho = views[view_name]
+        if view_name not in views:
+            return
+        self.view_name = view_name
+        rx, ry, ortho = views[view_name]
+        if animate:
+            self.animate_camera_to(rx, ry, is_ortho=ortho)
+        else:
+            ref_pt = self._focus_reference_point()
+            cur_piv = pivot_from_pan(self.rot_x, self.rot_y, self.pan_x, self.pan_y, ref_pt)
+            scx, scy, scz, srad = self._scene_center_and_radius()
+            dist = math.hypot(math.hypot(cur_piv[0] - scx, cur_piv[1] - scy), cur_piv[2] - scz)
+            piv = cur_piv if dist <= srad * 1.35 else ref_pt
+            self._focus_pivot = piv
+            self.rot_x, self.rot_y, self.is_ortho = rx, ry, ortho
+            self._ortho_blend = 1.0 if ortho else 0.0
+            self.pan_x, self.pan_y = pan_for_pivot(rx, ry, piv)
             self.update()
+
+    def animate_camera_to(
+        self,
+        rot_x: float,
+        rot_y: float,
+        *,
+        is_ortho: bool | None = None,
+        pan_x: float | None = None,
+        pan_y: float | None = None,
+        zoom: float | None = None,
+        target_pivot: tuple[float, float, float] | None = None,
+        duration_ms: int = 150,
+    ) -> None:
+        """Плавный перелёт камеры (~150 мс) с удержанием 3D-точки вращения (pivot) и гладким переходом Ortho <-> Perspective."""
+        import time as _time
+
+        from ui.viewcube import ANIM_MS, pan_for_pivot, pivot_from_pan
+
+        dur = max(1, int(duration_ms if duration_ms is not None else ANIM_MS))
+        rx0, ry0 = float(self.rot_x), float(self.rot_y)
+        rx1, ry1 = float(rot_x), float(rot_y)
+        ortho1 = bool(self.is_ortho if is_ortho is None else is_ortho)
+        ortho_b0 = float(getattr(self, "_ortho_blend", 1.0 if self.is_ortho else 0.0))
+        ortho_b1 = 1.0 if ortho1 else 0.0
+
+        ref_pt = self._focus_reference_point()
+        # Точка pivot0 даёт точное совпадение с текущими (pan_x, pan_y) при t=0 (без рывка на старте)
+        pivot0 = pivot_from_pan(rx0, ry0, float(self.pan_x), float(self.pan_y), ref_pt)
+
+        if target_pivot is not None:
+            pivot1 = (float(target_pivot[0]), float(target_pivot[1]), float(target_pivot[2]))
+            px1, py1 = pan_for_pivot(rx1, ry1, pivot1)
+        elif pan_x is not None or pan_y is not None:
+            px1 = float(self.pan_x if pan_x is None else pan_x)
+            py1 = float(self.pan_y if pan_y is None else pan_y)
+            pivot1 = pivot_from_pan(rx1, ry1, px1, py1, ref_pt)
+        else:
+            # Смена ракурса без явного pan: вращаемся вокруг текущей 3D-точки взгляда (или центра сцены, если улетели далеко)
+            scx, scy, scz, srad = self._scene_center_and_radius()
+            dist = math.hypot(math.hypot(pivot0[0] - scx, pivot0[1] - scy), pivot0[2] - scz)
+            pivot1 = pivot0 if dist <= srad * 1.35 else ref_pt
+            px1, py1 = pan_for_pivot(rx1, ry1, pivot1)
+
+        self._focus_pivot = pivot1
+        self._view_anim = {
+            "t0": _time.perf_counter(),
+            "dur": dur / 1000.0,
+            "rx0": rx0,
+            "ry0": ry0,
+            "rx1": rx1,
+            "ry1": ry1,
+            "ortho1": ortho1,
+            "ob0": ortho_b0,
+            "ob1": ortho_b1,
+            "piv0": pivot0,
+            "piv1": pivot1,
+            "px0": float(self.pan_x),
+            "py0": float(self.pan_y),
+            "pz0": float(self.zoom),
+            "px1": px1,
+            "py1": py1,
+            "pz1": float(self.zoom if zoom is None else zoom),
+        }
+        if not self._view_anim_timer.isActive():
+            self._view_anim_timer.start()
+
+    def _on_view_anim_tick(self) -> None:
+        import time as _time
+
+        from ui.viewcube import pan_for_pivot
+
+        anim = self._view_anim
+        if not anim:
+            self._view_anim_timer.stop()
+            return
+        t = (_time.perf_counter() - anim["t0"]) / max(anim["dur"], 1e-6)
+        if t >= 1.0:
+            self.rot_x = anim["rx1"]
+            self.rot_y = anim["ry1"]
+            self.is_ortho = anim["ortho1"]
+            self._ortho_blend = anim["ob1"]
+            self.pan_x = anim["px1"]
+            self.pan_y = anim["py1"]
+            self.zoom = anim["pz1"]
+            self._view_anim = None
+            self._view_anim_timer.stop()
+            self.update()
+            return
+        # smoothstep
+        u = t * t * (3.0 - 2.0 * t)
+        self.rot_x = anim["rx0"] + (anim["rx1"] - anim["rx0"]) * u
+        # кратчайший путь по yaw
+        d_ry = anim["ry1"] - anim["ry0"]
+        while d_ry > 180.0:
+            d_ry -= 360.0
+        while d_ry < -180.0:
+            d_ry += 360.0
+        self.rot_y = anim["ry0"] + d_ry * u
+
+        # Удерживаем 3D-точку вращения (piv_u) в центре экрана на каждом шаге дуги поворота
+        p0 = anim["piv0"]
+        p1 = anim["piv1"]
+        piv_u = (
+            p0[0] + (p1[0] - p0[0]) * u,
+            p0[1] + (p1[1] - p0[1]) * u,
+            p0[2] + (p1[2] - p0[2]) * u,
+        )
+        self.pan_x, self.pan_y = pan_for_pivot(self.rot_x, self.rot_y, piv_u)
+        self.zoom = anim["pz0"] + (anim["pz1"] - anim["pz0"]) * u
+        self._ortho_blend = anim["ob0"] + (anim["ob1"] - anim["ob0"]) * u
+        self.is_ortho = self._ortho_blend >= 0.5
+        self.update()
+
+    def go_home_view(self, *, animate: bool = True) -> None:
+        """Изометрия + точный автофокус по 3D-центру и габариту сцены."""
+        from ui.viewcube import pan_for_pivot
+
+        cx, cy, cz, radius = self._scene_center_and_radius()
+        piv = (float(cx), float(cy), float(cz))
+        self._focus_pivot = piv
+        zoom = -max(800.0, float(radius) * 2.35)
+        if animate:
+            self.view_name = "iso"
+            self.animate_camera_to(25.0, -35.0, is_ortho=False, target_pivot=piv, zoom=zoom)
+        else:
+            self.view_name = "iso"
+            self.rot_x, self.rot_y, self.is_ortho = 25.0, -35.0, False
+            self._ortho_blend = 0.0
+            self.pan_x, self.pan_y = pan_for_pivot(25.0, -35.0, piv)
+            self.zoom = zoom
+            self.update()
+
+    def _scene_center_and_radius(self) -> tuple[float, float, float, float]:
+        """Точный 3D-центр и радиус охватывающей сферы по габаритным боксам всех видимых панелей."""
+        min_x = min_y = min_z = float("inf")
+        max_x = max_y = max_z = float("-inf")
+        found = False
+        for b in getattr(self, "blocks", ()) or []:
+            for p in getattr(b, "panels", ()) or []:
+                if not getattr(p, "visible", True):
+                    continue
+                found = True
+                x0, y0, z0 = float(p.x), float(p.y), float(p.z)
+                x1 = x0 + float(p.width)
+                y1 = y0 + float(p.height)
+                z1 = z0 + float(p.depth)
+                min_x = min(min_x, x0, x1)
+                min_y = min(min_y, y0, y1)
+                min_z = min(min_z, z0, z1)
+                max_x = max(max_x, x0, x1)
+                max_y = max(max_y, y0, y1)
+                max_z = max(max_z, z0, z1)
+        if not found:
+            return 300.0, 350.0, 280.0, 800.0
+        cx = 0.5 * (min_x + max_x)
+        cy = 0.5 * (min_y + max_y)
+        cz = 0.5 * (min_z + max_z)
+        radius = 0.5 * math.hypot(math.hypot(max_x - min_x, max_y - min_y), max_z - min_z)
+        return cx, cy, cz, max(radius, 350.0)
 
     @staticmethod
     def _panel_gpu_key(panel) -> int:
@@ -891,18 +1108,30 @@ class Viewport3D(QOpenGLWidget):
         return max(1000.0, max_r2 ** 0.5) if max_r2 > 0.0 else 2000.0
 
     def _rebuild_matrices(self, w: int, h: int):
+        from ui.viewcube import ORTHO_HALF_TAN, blend_projection_matrices
+
         aspect = w / max(1, h)
         scene_radius = self._scene_bounding_radius()
         z_near, z_far = glmath.compute_adaptive_clip_planes(
             self.zoom, self.is_ortho, scene_radius
         )
-        if self.is_ortho:
-            scale = abs(self.zoom) * 0.45
+        # Если is_ortho переключён напрямую (например, из тулбара/тестов без анимации), синхронизируем _ortho_blend
+        if self._view_anim is None:
+            self._ortho_blend = 1.0 if self.is_ortho else 0.0
+
+        scale = abs(self.zoom) * ORTHO_HALF_TAN
+        if self._ortho_blend <= 1e-4:
+            self._proj = glmath.perspective(45.0, aspect, z_near, z_far)
+        elif self._ortho_blend >= 1.0 - 1e-4:
             self._proj = glmath.ortho(
                 -scale * aspect, scale * aspect, -scale, scale, z_near, z_far
             )
         else:
-            self._proj = glmath.perspective(45.0, aspect, z_near, z_far)
+            proj_p = glmath.perspective(45.0, aspect, z_near, z_far)
+            proj_o = glmath.ortho(
+                -scale * aspect, scale * aspect, -scale, scale, z_near, z_far
+            )
+            self._proj = blend_projection_matrices(proj_p, proj_o, self._ortho_blend, self.zoom)
 
         # Камера: T * Rx * Ry  (как раньше glTranslate + glRotate)
         self._view = glmath.mul(
@@ -922,23 +1151,54 @@ class Viewport3D(QOpenGLWidget):
 
     def _pan_speed_per_pixel(self) -> float:
         """Скорость панорамы: 1 px мыши ≈ 1 px сцены на текущем зуме."""
+        from ui.viewcube import ORTHO_HALF_TAN
+
         h = max(1, self.height())
-        if self.is_ortho:
-            view_h = abs(self.zoom) * 0.9  # ortho: ±scale, scale=|z|*0.45
-        else:
-            view_h = abs(self.zoom) * 2.0 * math.tan(math.radians(22.5))  # FOV 45°
+        view_h = abs(self.zoom) * 2.0 * ORTHO_HALF_TAN
         return view_h / h
 
     def _cursor_focus_point(self, mx: int, my: int) -> np.ndarray:
-        """Точка под курсором на плоскости, обращённой к камере (через начало сцены)."""
+        """Точная 3D-точка под курсором для фокуса по СКМ: сначала проверяем пересечение луча
+        с видимыми деталями сцены, а при клике в пустой фон — плоскость через опорный центр сцены.
+        """
         origin, direction = self._mouse_ray(mx, my)
+        plane = self.current_section_plane()
+        focus_set = self._get_focus_panels_set() if self.ghost_others_mode else set()
+        has_ghosts = bool(self.ghost_others_mode and focus_set)
+
+        min_t_opaque = float("inf")
+        min_t_ghost = float("inf")
+        for block in getattr(self, "blocks", ()) or []:
+            for p in getattr(block, "panels", ()) or []:
+                if not getattr(p, "visible", True):
+                    continue
+                t_hit = self._intersect_ray_panel(origin, direction, p)
+                if t_hit is None:
+                    continue
+                hit_pt = origin + t_hit * direction
+                if plane is not None and not glmath.point_passes_clip_plane(
+                    float(hit_pt[0]), float(hit_pt[1]), float(hit_pt[2]), plane
+                ):
+                    continue
+                if has_ghosts and p not in focus_set:
+                    if t_hit < min_t_ghost:
+                        min_t_ghost = t_hit
+                else:
+                    if t_hit < min_t_opaque:
+                        min_t_opaque = t_hit
+
+        best_t = min_t_opaque if math.isfinite(min_t_opaque) else min_t_ghost
+        if math.isfinite(best_t):
+            return origin + best_t * direction
+
         R = self._rotation_matrix()
         # В view space камера смотрит −Z; в world: Rᵀ * (0,0,−1)
         forward = R[:3, :3].T @ np.array([0.0, 0.0, -1.0], dtype=float)
         fn = float(np.linalg.norm(forward))
         if fn > 1e-12:
             forward = forward / fn
-        focus = np.array([0.0, 0.0, 0.0], dtype=float)
+        rx, ry, rz = self._focus_reference_point()
+        focus = np.array([rx, ry, rz], dtype=float)
         denom = float(np.dot(direction, forward))
         if abs(denom) < 1e-8:
             return origin + direction * max(abs(self.zoom), 100.0)
@@ -3767,13 +4027,13 @@ class Viewport3D(QOpenGLWidget):
         return best
 
     def _find_resize_handle(self, mx: int, my: int, panel: Panel | None = None):
-        """Ближайший угол выделенной панели в радиусе ручки. (corner, world_pt) | None."""
+        """Ближайший угол выделенной панели в радиусе ручки. (panel, corner, world_pt) | None."""
         panels = [panel] if panel is not None else self.get_selected_panels()
         if not panels:
             return None
         self._sync_viewport_matrices()
         best = None
-        best_d = self.resize_handle_px + 1.0
+        best_d = self.resize_handle_px + 3.5
         for p in panels:
             for corner, wpt in self._panel_corners(p):
                 scr = self._project_to_screen(wpt)
@@ -3785,149 +4045,357 @@ class Viewport3D(QOpenGLWidget):
                     best = (p, corner, wpt)
         return best
 
-    def _cursor_on_resize_plane(self, mx: int, my: int, fixed_pt: np.ndarray) -> np.ndarray:
-        """Точка под курсором на плоскости через fixed_pt, параллельной экрану."""
+    def _cursor_on_resize_plane(
+        self,
+        mx: int,
+        my: int,
+        fixed_pt: np.ndarray,
+        plane_normal: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Точка под курсором на рабочей плоскости детали (или плоскости, параллельной экрану) через fixed_pt.
+
+        Если задана `plane_normal` (нормаль рабочей плоскости плиты), луч пересекается с плоскостью детали,
+        а при скользящих углах обзора (< 20°) нормаль плавно стабилизируется к направлению взгляда камеры,
+        чтобы исключить скачки и уход точки на бесконечность.
+        """
         origin, direction = self._mouse_ray(mx, my)
+        v = np.asarray(direction, dtype=float)
+        vn = float(np.linalg.norm(v))
+        if vn > 1e-12:
+            v = v / vn
         R = self._rotation_matrix()
         forward = R[:3, :3].T @ np.array([0.0, 0.0, -1.0], dtype=float)
         fn = float(np.linalg.norm(forward))
         if fn > 1e-12:
             forward = forward / fn
-        denom = float(np.dot(direction, forward))
+
+        n_cam = -v
+        if plane_normal is not None:
+            n_s = np.asarray(plane_normal, dtype=float)
+            ns_norm = float(np.linalg.norm(n_s))
+            if ns_norm > 1e-12:
+                n_s = n_s / ns_norm
+                if float(np.dot(n_s, n_cam)) < 0.0:
+                    n_s = -n_s
+                c = float(np.dot(n_s, n_cam))
+                min_cos = 0.35
+                if c >= min_cos:
+                    normal = n_s
+                else:
+                    t_perp = n_s - c * n_cam
+                    tn = float(np.linalg.norm(t_perp))
+                    if tn > 1e-9:
+                        t_unit = t_perp / tn
+                        normal = min_cos * n_cam + math.sqrt(max(0.0, 1.0 - min_cos * min_cos)) * t_unit
+                    else:
+                        normal = n_cam
+            else:
+                normal = forward
+        else:
+            normal = forward
+
+        denom = float(np.dot(v, normal))
         if abs(denom) < 1e-10:
             return np.asarray(fixed_pt, dtype=float)
-        t = float(np.dot(np.asarray(fixed_pt, dtype=float) - origin, forward)) / denom
-        return origin + direction * t
+        t = float(np.dot(np.asarray(fixed_pt, dtype=float) - origin, normal)) / denom
+        return origin + v * t
+
+    def _corner_active_axes_and_dirs(
+        self,
+        panel: Panel,
+        corner: tuple[int, int, int],
+        orig_box: tuple[float, float, float, float, float, float],
+    ) -> tuple[list[int], dict[int, np.ndarray], dict[int, np.ndarray], np.ndarray, np.ndarray]:
+        """Возвращает для угла `corner = (sx, sy, sz)`:
+        - `active_axes`: список рабочих осей детали (без `thickness_axis` и заблокированных осей 2D-вида);
+        - `axis_worlds`: единичные мировые векторы вытягивания от неподвижной грани к тянущемуся углу;
+        - `fixed_face_pts`: опорные мировые точки неподвижных противоположных граней для каждой рабочей оси;
+        - `grab_world`: исходная мировая точка захваченного угла;
+        - `sheet_normal`: мировая нормаль плоскости плиты.
+        """
+        x0, y0, z0, w, h, d = [float(v) for v in orig_box]
+        dims = [w, h, d]
+        sx, sy, sz = int(corner[0]), int(corner[1]), int(corner[2])
+        sides = (sx, sy, sz)
+
+        allow_axes = self._resize_active_axes()
+        raw_tax = getattr(panel, "thickness_axis", -1)
+        if isinstance(raw_tax, str):
+            tax = {"X": 0, "Y": 1, "Z": 2}.get(raw_tax.upper(), -1)
+        else:
+            try:
+                tax = int(raw_tax)
+            except (TypeError, ValueError):
+                tax = -1
+
+        active_axes = [ax for ax in (0, 1, 2) if ax != tax and allow_axes[ax]]
+
+        has_rot = (
+            hasattr(panel, "has_rotation")
+            and panel.has_rotation()
+            and hasattr(panel, "rotate_vector")
+        )
+        cx_orig = x0 + w * 0.5
+        cy_orig = y0 + h * 0.5
+        cz_orig = z0 + d * 0.5
+
+        def local_to_world_orig(lx: float, ly: float, lz: float) -> np.ndarray:
+            if has_rot:
+                rx, ry, rz = panel.rotate_vector(lx - w * 0.5, ly - h * 0.5, lz - d * 0.5)
+                return np.array([cx_orig + rx, cy_orig + ry, cz_orig + rz], dtype=float)
+            return np.array([x0 + lx, y0 + ly, z0 + lz], dtype=float)
+
+        def dir_to_world(dx: float, dy: float, dz: float) -> np.ndarray:
+            if has_rot:
+                rx, ry, rz = panel.rotate_vector(dx, dy, dz)
+                v = np.array([rx, ry, rz], dtype=float)
+            else:
+                v = np.array([dx, dy, dz], dtype=float)
+            vn = float(np.linalg.norm(v))
+            return v / vn if vn > 1e-12 else v
+
+        grab_local = [
+            w if sx == 1 else 0.0,
+            h if sy == 1 else 0.0,
+            d if sz == 1 else 0.0,
+        ]
+        grab_world = local_to_world_orig(grab_local[0], grab_local[1], grab_local[2])
+
+        axis_worlds: dict[int, np.ndarray] = {}
+        fixed_face_pts: dict[int, np.ndarray] = {}
+        for ax in active_axes:
+            sign = 1.0 if sides[ax] == 1 else -1.0
+            ldir = [0.0, 0.0, 0.0]
+            ldir[ax] = sign
+            u_ax = dir_to_world(ldir[0], ldir[1], ldir[2])
+            axis_worlds[ax] = u_ax
+            # Точка на противоположной (неподвижной) грани на линии ребра, идущего в grab_world
+            fixed_face_pts[ax] = grab_world - dims[ax] * u_ax
+
+        if tax in (0, 1, 2):
+            tn = [0.0, 0.0, 0.0]
+            tn[tax] = 1.0
+            sheet_normal = dir_to_world(tn[0], tn[1], tn[2])
+        elif len(active_axes) >= 2:
+            c_vec = np.cross(axis_worlds[active_axes[0]], axis_worlds[active_axes[1]])
+            cn = float(np.linalg.norm(c_vec))
+            sheet_normal = c_vec / cn if cn > 1e-12 else np.array([0.0, 1.0, 0.0], dtype=float)
+        else:
+            sheet_normal = np.array([0.0, 1.0, 0.0], dtype=float)
+
+        return active_axes, axis_worlds, fixed_face_pts, grab_world, sheet_normal
 
     def _apply_corner_resize(self, panel: Panel, corner: tuple[int, int, int], new_pt: np.ndarray, live: bool = True) -> None:
-        """Растягивает панель: угол corner едет в new_pt, противоположный угол в мире фиксирован."""
-        sx, sy, sz = corner
-        ax_x, ax_y, ax_z = self._resize_active_axes()
-        # Толщину плиты менять нельзя — только через материал
-        tax = int(getattr(panel, "thickness_axis", -1))
-        if tax == 0:
-            ax_x = False
-        elif tax == 1:
-            ax_y = False
-        elif tax == 2:
-            ax_z = False
+        """Растягивает панель за угол `corner = (sx, sy, sz)` по принципу Push-Pull:
+        противоположные грани и противоположный угол остаются строго неподвижными в мире."""
         box = self.resize_orig_box
         if box is None:
             box = (panel.x, panel.y, panel.z, panel.width, panel.height, panel.depth)
         x0, y0, z0, w, h, d = [float(v) for v in box]
-
-        nx, ny, nz = float(new_pt[0]), float(new_pt[1]), float(new_pt[2])
-        if self.grid_enabled and self.is_ortho:
-            snapped = self._snap_point_to_grid(np.array([nx, ny, nz], dtype=float))
-            nx, ny, nz = float(snapped[0]), float(snapped[1]), float(snapped[2])
-
         min_size = 10.0
 
-        # Если панель повернута — растягиваем вдоль локальных осей OBB вокруг фиксированного мирового угла
-        if hasattr(panel, "has_rotation") and panel.has_rotation() and hasattr(panel, "rotate_vector") and hasattr(panel, "unrotate_vector"):
-            cx_orig = x0 + w * 0.5
-            cy_orig = y0 + h * 0.5
-            cz_orig = z0 + d * 0.5
-
-            flx = w if sx == 0 else 0.0
-            fly = h if sy == 0 else 0.0
-            flz = d if sz == 0 else 0.0
-            rfx, rfy, rfz = panel.rotate_vector(flx - w * 0.5, fly - h * 0.5, flz - d * 0.5)
-            fwx, fwy, fwz = cx_orig + rfx, cy_orig + rfy, cz_orig + rfz
-
-            dlx, dly, dlz = panel.unrotate_vector(nx - fwx, ny - fwy, nz - fwz)
-            nlx, nly, nlz = flx + dlx, fly + dly, flz + dlz
-
-            def local_bounds(fixed_l, new_l, orig_len, allow):
-                if not allow:
-                    return 0.0, orig_len
-                lo = min(fixed_l, new_l)
-                hi = max(fixed_l, new_l)
-                if hi - lo < min_size:
-                    if new_l >= fixed_l:
-                        hi = fixed_l + min_size
-                    else:
-                        lo = fixed_l - min_size
-                return lo, hi - lo
-
-            lx0, new_w = local_bounds(flx, nlx, w, ax_x)
-            ly0, new_h = local_bounds(fly, nly, h, ax_y)
-            lz0, new_d = local_bounds(flz, nlz, d, ax_z)
-
-            # Новый локальный центр относительно старого центра (w/2, h/2, d/2)
-            dcx_l = (lx0 + new_w * 0.5) - w * 0.5
-            dcy_l = (ly0 + new_h * 0.5) - h * 0.5
-            dcz_l = (lz0 + new_d * 0.5) - d * 0.5
-            rcx, rcy, rcz = panel.rotate_vector(dcx_l, dcy_l, dcz_l)
-            cx_new = cx_orig + rcx
-            cy_new = cy_orig + rcy
-            cz_new = cz_orig + rcz
-
-            panel.width, panel.height, panel.depth = new_w, new_h, new_d
-            panel.x = cx_new - new_w * 0.5
-            panel.y = cy_new - new_h * 0.5
-            panel.z = cz_new - new_d * 0.5
-            if hasattr(panel, "lock_thickness_to_material"):
-                panel.lock_thickness_to_material()
-            from core.cad_kernel import CADKernel
-            panel.mesh_data = CADKernel.make_aabb_mesh(
-                panel.x, panel.y, panel.z,
-                panel.width, panel.height, panel.depth,
-                getattr(panel, "rx", 0.0), getattr(panel, "ry", 0.0), getattr(panel, "rz", 0.0),
-            )
-            panel._gl_arrays = None
-            panel.geometry_generation = int(getattr(panel, "geometry_generation", 0)) + 1
-            panel.geometry_pending = True
+        active_axes, axis_worlds, fixed_face_pts, _grab_world, _sheet_normal = (
+            self._corner_active_axes_and_dirs(panel, corner, (x0, y0, z0, w, h, d))
+        )
+        if not active_axes:
             return
 
-        x1, y1, z1 = x0 + w, y0 + h, z0 + d
-        # фиксированный противоположный угол
-        fx = x1 if sx == 0 else x0
-        fy = y1 if sy == 0 else y0
-        fz = z1 if sz == 0 else z0
+        pt = np.asarray(new_pt, dtype=float)
+        new_lens: dict[int, float] = {}
+        for ax in active_axes:
+            raw_len = float(np.dot(pt - fixed_face_pts[ax], axis_worlds[ax]))
+            clamped_len = max(min_size, raw_len)
+            if self.grid_enabled and self.is_ortho:
+                step = max(0.1, float(self.grid_step))
+                side = int(corner[ax])
+                moving_coord = (
+                    ([x0, y0, z0][ax] + clamped_len)
+                    if side == 1
+                    else ([x0 + w, y0 + h, z0 + d][ax] - clamped_len)
+                )
+                snapped_coord = round(moving_coord / step) * step
+                cand_len = (
+                    (snapped_coord - [x0, y0, z0][ax])
+                    if side == 1
+                    else ([x0 + w, y0 + h, z0 + d][ax] - snapped_coord)
+                )
+                if cand_len >= min_size:
+                    clamped_len = cand_len
+            new_lens[ax] = clamped_len
 
-        def axis_bounds(fixed, new_c, allow):
-            if not allow:
-                # ось заблокирована видом — берём исходные
-                return None
-            lo = min(fixed, new_c)
-            hi = max(fixed, new_c)
-            if hi - lo < min_size:
-                if new_c >= fixed:
-                    hi = fixed + min_size
-                else:
-                    lo = fixed - min_size
-            return lo, hi - lo
-
-        # X
-        if ax_x:
-            bx = axis_bounds(fx, nx, True)
-            if bx:
-                x0, w = bx
-        # Y
-        if ax_y:
-            by = axis_bounds(fy, ny, True)
-            if by:
-                y0, h = by
-        # Z
-        if ax_z:
-            bz = axis_bounds(fz, nz, True)
-            if bz:
-                z0, d = bz
-
-        panel.x, panel.y, panel.z = x0, y0, z0
-        panel.width, panel.height, panel.depth = w, h, d
-        # толщина всегда из материала
+        nx, ny, nz, nw, nh, nd = glmath.compute_corner_push_pull_box(
+            (x0, y0, z0, w, h, d),
+            corner,
+            new_lens,
+            panel=panel,
+            min_size=min_size,
+        )
+        panel.x, panel.y, panel.z = nx, ny, nz
+        panel.width, panel.height, panel.depth = nw, nh, nd
         if hasattr(panel, "lock_thickness_to_material"):
             panel.lock_thickness_to_material()
-            w, h, d = float(panel.width), float(panel.height), float(panel.depth)
-            x0, y0, z0 = float(panel.x), float(panel.y), float(panel.z)
-        # быстрый AABB без OCC на время жеста
-        from core.cad_kernel import CADKernel
-        panel.mesh_data = CADKernel.make_aabb_mesh(x0, y0, z0, w, h, d, getattr(panel, "rx", 0.0), getattr(panel, "ry", 0.0), getattr(panel, "rz", 0.0))
+
+        panel.mesh_data = CADKernel.make_aabb_mesh(
+            panel.x,
+            panel.y,
+            panel.z,
+            panel.width,
+            panel.height,
+            panel.depth,
+            getattr(panel, "rx", 0.0),
+            getattr(panel, "ry", 0.0),
+            getattr(panel, "rz", 0.0),
+        )
         panel._gl_arrays = None
         panel.geometry_generation = int(getattr(panel, "geometry_generation", 0)) + 1
         panel.geometry_pending = True
+
+    def _apply_corner_push_pull(
+        self,
+        panel: Panel,
+        corner: tuple[int, int, int],
+        mx: int,
+        my: int,
+    ) -> str:
+        """Вытягивает угол `corner = (sx, sy, sz)` одновременно вдоль его рабочих торцов в 3D (Push-Pull),
+        идентично вытягиванию грани (`_apply_face_push_pull`):
+        - Если активна только 1 рабочая ось (например, в 2D-виде с торца) — делегирует `_apply_face_push_pull`;
+        - Поддерживает магнитную привязку `🧲` к углам, рёбрам и точкам соседних деталей (или с `[Ctrl]`);
+        - Проецирует луч курсора на 3D-плоскость самой плиты через захваченный угол (без начального скачка и без переворота бокса);
+        - При скользящем ракурсе камеры проецирует луч на 3D-оси рёбер угла (ближайшая точка скрещивающихся прямых).
+        """
+        box = self.resize_orig_box
+        if box is None:
+            box = (panel.x, panel.y, panel.z, panel.width, panel.height, panel.depth)
+        x0, y0, z0, w, h, d = [float(v) for v in box]
+        min_size = 10.0
+
+        active_axes, axis_worlds, fixed_face_pts, grab_world, sheet_normal = (
+            self._corner_active_axes_and_dirs(panel, corner, (x0, y0, z0, w, h, d))
+        )
+        if not active_axes:
+            return ""
+
+        if len(active_axes) == 1:
+            ax_only = active_axes[0]
+            return self._apply_face_push_pull(panel, (ax_only, int(corner[ax_only])), mx, my)
+
+        # 1. Магнитная привязка к точкам других панелей сцены (как в _cursor_on_face_axis)
+        dpr = float(self.devicePixelRatioF())
+        vp = self._vp_size
+        mvp = self._mvp
+        is_ctrl = bool(getattr(self, "ctrl_held", False))
+        snap_radius = 52.0 if is_ctrl else 18.0
+        plane = self.current_section_plane()
+
+        best_snap_pt = None
+        best_snap_desc = ""
+        min_d = snap_radius
+        for block in self.blocks:
+            for other in block.panels:
+                if other is panel:
+                    continue
+                if not self._panel_within_screen_radius(other, mx, my, snap_radius, mvp, vp, dpr):
+                    continue
+                for item in self._collect_panel_snap_points(other, label_prefix=other.name):
+                    pt, desc = item[0], item[1]
+                    if plane is not None and not glmath.point_passes_clip_plane(
+                        float(pt[0]), float(pt[1]), float(pt[2]), plane
+                    ):
+                        continue
+                    try:
+                        wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
+                        if wz < 0.0 or wz > 1.0:
+                            continue
+                        sx_scr = wx / dpr
+                        sy_scr = (vp[3] - wy) / dpr
+                        dist = math.hypot(sx_scr - mx, sy_scr - my)
+                        if dist < min_d:
+                            min_d = dist
+                            best_snap_pt = pt
+                            best_snap_desc = desc
+                    except Exception as exc:
+                        _log.debug("Ошибка проекции точки магнита при вытягивании угла: %s", exc)
+
+        snapped_axes: set[int] = set()
+        new_lens: dict[int, float] = {}
+        snap_desc = ""
+
+        if best_snap_pt is not None:
+            snap_vec = np.asarray(best_snap_pt, dtype=float)
+            for ax in active_axes:
+                proj_len = float(np.dot(snap_vec - fixed_face_pts[ax], axis_worlds[ax]))
+                if proj_len >= min_size:
+                    new_lens[ax] = proj_len
+                    snapped_axes.add(ax)
+            if snapped_axes:
+                snap_desc = f"🧲 {best_snap_desc}"
+
+        # 2. Точная проекция луча мыши на рабочую плоскость плиты через grab_world
+        origin, ray_dir = self._mouse_ray(mx, my)
+        v = np.asarray(ray_dir, dtype=float)
+        vn = float(np.linalg.norm(v))
+        if vn > 1e-12:
+            v = v / vn
+
+        hit_pt = self._cursor_on_resize_plane(mx, my, grab_world, plane_normal=sheet_normal)
+
+        for ax in active_axes:
+            if ax in snapped_axes:
+                continue
+            u_ax = axis_worlds[ax]
+            f_pt = fixed_face_pts[ax]
+            raw_len = float(np.dot(hit_pt - f_pt, u_ax))
+            clamped_len = max(min_size, raw_len)
+
+            if not snap_desc and self.grid_enabled and self.is_ortho:
+                step = max(0.1, float(self.grid_step))
+                side = int(corner[ax])
+                moving_coord = (
+                    ([x0, y0, z0][ax] + clamped_len)
+                    if side == 1
+                    else ([x0 + w, y0 + h, z0 + d][ax] - clamped_len)
+                )
+                snapped_coord = round(moving_coord / step) * step
+                cand_len = (
+                    (snapped_coord - [x0, y0, z0][ax])
+                    if side == 1
+                    else ([x0 + w, y0 + h, z0 + d][ax] - snapped_coord)
+                )
+                if cand_len >= min_size:
+                    clamped_len = cand_len
+
+            new_lens[ax] = clamped_len
+
+        nx, ny, nz, nw, nh, nd = glmath.compute_corner_push_pull_box(
+            (x0, y0, z0, w, h, d),
+            corner,
+            new_lens,
+            panel=panel,
+            min_size=min_size,
+        )
+        panel.x, panel.y, panel.z = nx, ny, nz
+        panel.width, panel.height, panel.depth = nw, nh, nd
+
+        if hasattr(panel, "lock_thickness_to_material"):
+            panel.lock_thickness_to_material()
+
+        panel.mesh_data = CADKernel.make_aabb_mesh(
+            panel.x,
+            panel.y,
+            panel.z,
+            panel.width,
+            panel.height,
+            panel.depth,
+            getattr(panel, "rx", 0.0),
+            getattr(panel, "ry", 0.0),
+            getattr(panel, "rz", 0.0),
+        )
+        panel._gl_arrays = None
+        panel.geometry_generation = int(getattr(panel, "geometry_generation", 0)) + 1
+        panel.geometry_pending = True
+        self.resize_face_snap_desc = snap_desc
+        return snap_desc
 
     def _cursor_on_face_axis(
         self,
@@ -4127,7 +4595,7 @@ class Viewport3D(QOpenGLWidget):
         """Отрисовывает:
         - Оранжевые ромбики без заливки в центрах торцов («Тянуть грань в 3D» / Push-Pull)
           — тот же стиль, что у угловых точек и Ctrl-магнита;
-        - Оранжевые ромбы углов панели.
+        - Оранжевые ромбы углов панели с подсветкой прилегающих рабочих граней и векторов вытягивания.
         """
         if self.drag_mode or self.fastener_mode or self.measure_mode:
             return
@@ -4194,7 +4662,7 @@ class Viewport3D(QOpenGLWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPolygon(poly)
 
-            # 2. Угловые ручки — оранжевые ромбы
+            # 2. Угловые ручки — оранжевые ромбы (с подсветкой рабочих граней и осей Push-Pull)
             for corner, wpt in self._panel_corners(p):
                 scr = self._project_to_screen(wpt)
                 if scr is None:
@@ -4202,6 +4670,44 @@ class Viewport3D(QOpenGLWidget):
                 sx, sy = int(round(scr[0])), int(round(scr[1]))
                 hover = self.resize_hover_corner == corner and self.resize_panel is p
                 active = self.resize_mode and self.resize_corner == corner and self.resize_panel is p
+
+                if hover or active:
+                    cur_box = (
+                        float(p.x), float(p.y), float(p.z),
+                        float(p.width), float(p.height), float(p.depth),
+                    )
+                    act_axes, ax_worlds, _f_pts, _g_w, _s_n = self._corner_active_axes_and_dirs(
+                        p, corner, cur_box
+                    )
+                    for ax_idx in act_axes:
+                        fcorners = self._panel_face_corners_world(p, (ax_idx, int(corner[ax_idx])))
+                        scr_pts = []
+                        for fc in fcorners:
+                            sp = self._project_to_screen(fc)
+                            if sp is not None:
+                                scr_pts.append(QPoint(int(round(sp[0])), int(round(sp[1]))))
+                        if len(scr_pts) == 4:
+                            painter.setPen(QPen(orange, 2.0 if active else 1.5, Qt.PenStyle.SolidLine))
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+                            painter.drawPolygon(scr_pts)
+
+                        wnrm = ax_worlds[ax_idx]
+                        tip_world = wpt + wnrm * 38.0
+                        scr_tip = self._project_to_screen(tip_world)
+                        if scr_tip is not None:
+                            tx, ty = int(round(scr_tip[0])), int(round(scr_tip[1]))
+                            painter.setPen(QPen(orange, 1.8))
+                            painter.drawLine(sx, sy, tx, ty)
+                            tip_r = 4
+                            tip_poly = [
+                                QPoint(tx, ty - tip_r),
+                                QPoint(tx + tip_r, ty),
+                                QPoint(tx, ty + tip_r),
+                                QPoint(tx - tip_r, ty),
+                            ]
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+                            painter.drawPolygon(tip_poly)
+
                 r = 10 if active else (9 if hover else 8)
                 poly = [
                     QPoint(sx, sy - r),
@@ -4219,6 +4725,25 @@ class Viewport3D(QOpenGLWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPolygon(poly)
 
+    def _pick_closest_resize_or_face_handle(self, mx: int, my: int, panel: Panel | None = None):
+        """Выбирает ближайшую к курсору `(mx, my)` ручку — торец (`face`) или угол (`corner`),
+        чтобы на узких деталях ручка центра грани не перехватывала клик у угла."""
+        face_hit = self._find_face_handle(mx, my, panel=panel)
+        corner_hit = self._find_resize_handle(mx, my, panel=panel)
+        if face_hit is not None and corner_hit is not None:
+            f_scr = self._project_to_screen(face_hit[2])
+            c_scr = self._project_to_screen(corner_hit[2])
+            d_f = math.hypot(f_scr[0] - mx, f_scr[1] - my) if f_scr is not None else float("inf")
+            d_c = math.hypot(c_scr[0] - mx, c_scr[1] - my) if c_scr is not None else float("inf")
+            if d_c <= d_f:
+                return ("corner", corner_hit)
+            return ("face", face_hit)
+        if face_hit is not None:
+            return ("face", face_hit)
+        if corner_hit is not None:
+            return ("corner", corner_hit)
+        return None
+
     def mousePressEvent(self, event):
         self.setFocus()
         self.last_mouse_pos = event.pos()
@@ -4226,7 +4751,14 @@ class Viewport3D(QOpenGLWidget):
         self.is_dragging = False
         self.selection_crossing = False
 
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._middle_press_pos = QPoint(event.pos())
+            self._middle_did_drag = False
+
         if event.button() == Qt.MouseButton.LeftButton:
+            # ViewCube: захват для клика (грань/ребро/угол/Home) или вращения перетаскиванием куба
+            if self._begin_viewcube_interaction(event.pos().x(), event.pos().y()):
+                return
             # Точка привязки после Ctrl+C
             if self.clipboard_await_anchor and self.clipboard is not None:
                 pt, desc = self._find_target_snap_point(event.pos().x(), event.pos().y())
@@ -4255,48 +4787,84 @@ class Viewport3D(QOpenGLWidget):
 
             # Вытягивание торца в 3D (Push-Pull) или растягивание за угол выделенной панели
             if not self.drag_mode and not self.fastener_mode and not self.measure_mode and not self.paste_mode:
-                face_hit = self._find_face_handle(event.pos().x(), event.pos().y())
-                if face_hit is not None:
-                    panel, face_id, _wpt, _wnrm, label = face_hit
-                    self.resize_mode = True
-                    self.resize_panel = panel
-                    self.resize_face = face_id
-                    self.resize_corner = None
-                    self.resize_face_snap_desc = ""
-                    self.resize_orig_box = (
-                        float(panel.x), float(panel.y), float(panel.z),
-                        float(panel.width), float(panel.height), float(panel.depth),
-                    )
-                    self.selecting_rect = None
-                    self.fastener_message.emit(
-                        f"↔ Вытягивание [{panel.name}] — {label} | Наведите на деталь для магнита | Esc — отмена"
-                    )
-                    self.update()
-                    return
-
-                hit = self._find_resize_handle(event.pos().x(), event.pos().y())
-                if hit is not None:
-                    panel, corner, _wpt = hit
-                    self.resize_mode = True
-                    self.resize_panel = panel
-                    self.resize_corner = corner
-                    self.resize_face = None
-                    self.resize_orig_box = (
-                        float(panel.x), float(panel.y), float(panel.z),
-                        float(panel.width), float(panel.height), float(panel.depth),
-                    )
-                    self.selecting_rect = None
-                    self.fastener_message.emit(
-                        f"↔ Размер [{panel.name}]: тяните угол | Esc — отмена"
-                    )
-                    self.update()
-                    return
+                picked = self._pick_closest_resize_or_face_handle(event.pos().x(), event.pos().y())
+                if picked is not None:
+                    kind, payload = picked
+                    if kind == "face":
+                        panel, face_id, _wpt, _wnrm, label = payload
+                        self.resize_mode = True
+                        self.resize_panel = panel
+                        self.resize_face = face_id
+                        self.resize_corner = None
+                        self.resize_face_snap_desc = ""
+                        self.resize_orig_box = (
+                            float(panel.x), float(panel.y), float(panel.z),
+                            float(panel.width), float(panel.height), float(panel.depth),
+                        )
+                        self.selecting_rect = None
+                        self.fastener_message.emit(
+                            f"↔ Вытягивание [{panel.name}] — {label} | Наведите на деталь для магнита | Esc — отмена"
+                        )
+                        self.update()
+                        return
+                    else:
+                        panel, corner, _wpt = payload
+                        self.resize_mode = True
+                        self.resize_panel = panel
+                        self.resize_corner = corner
+                        self.resize_face = None
+                        self.resize_face_snap_desc = ""
+                        self.resize_orig_box = (
+                            float(panel.x), float(panel.y), float(panel.z),
+                            float(panel.width), float(panel.height), float(panel.depth),
+                        )
+                        self.selecting_rect = None
+                        self.fastener_message.emit(
+                            f"↔ Вытягивание угла [{panel.name}] | Наведите на деталь для магнита | Esc — отмена"
+                        )
+                        self.update()
+                        return
             if self.is_ortho and not self.drag_mode:
                 self.selecting_rect = QRect(event.pos(), event.pos())
 
     def mouseMoveEvent(self, event):
         dx = event.pos().x() - self.last_mouse_pos.x()
         dy = event.pos().y() - self.last_mouse_pos.y()
+
+        # Перетаскивание самого ViewCube мышью (плавное вращение камеры вокруг 3D-pivot)
+        if self._vc_press_pos is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            from ui.viewcube import pan_for_pivot
+
+            drag_dist = math.hypot(
+                event.pos().x() - self._vc_press_pos.x(),
+                event.pos().y() - self._vc_press_pos.y(),
+            )
+            if drag_dist > 4.0 or self._vc_dragging:
+                self._vc_dragging = True
+                if self._view_anim_timer.isActive():
+                    self._view_anim = None
+                    self._view_anim_timer.stop()
+                self.rot_x = max(-89.9, min(89.9, float(self.rot_x) + dy * 0.65))
+                self.rot_y = float(self.rot_y) + dx * 0.65
+                piv = self._vc_pivot or self._focus_reference_point()
+                self.pan_x, self.pan_y = pan_for_pivot(self.rot_x, self.rot_y, piv)
+                self._focus_pivot = piv
+                self.view_name = "custom"
+                try:
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                except Exception as exc:
+                    _log.debug("Cursor update failed: %s", exc)
+                self.update()
+            self.last_mouse_pos = event.pos()
+            return
+
+        # Hover ViewCube (без зажатых кнопок)
+        if not event.buttons():
+            self._update_viewcube_hover(event.pos().x(), event.pos().y())
+
+        if event.buttons() & Qt.MouseButton.MiddleButton:
+            if abs(dx) > 2 or abs(dy) > 2:
+                self._middle_did_drag = True
 
         if self.resize_mode and self.resize_panel is not None:
             if event.buttons() & Qt.MouseButton.LeftButton:
@@ -4314,22 +4882,13 @@ class Viewport3D(QOpenGLWidget):
                     )
                     self.update()
                 elif self.resize_corner is not None:
-                    box = self.resize_orig_box
-                    x0, y0, z0, w, h, d = box
-                    sx, sy, sz = self.resize_corner
-                    flx = w if sx == 0 else 0.0
-                    fly = h if sy == 0 else 0.0
-                    flz = d if sz == 0 else 0.0
-                    if hasattr(p, "has_rotation") and p.has_rotation() and hasattr(p, "rotate_vector"):
-                        rfx, rfy, rfz = p.rotate_vector(flx - w * 0.5, fly - h * 0.5, flz - d * 0.5)
-                        fixed = np.array([x0 + w * 0.5 + rfx, y0 + h * 0.5 + rfy, z0 + d * 0.5 + rfz], dtype=float)
-                    else:
-                        fixed = np.array([x0 + flx, y0 + fly, z0 + flz], dtype=float)
-                    new_pt = self._cursor_on_resize_plane(event.pos().x(), event.pos().y(), fixed)
-                    self._apply_corner_resize(self.resize_panel, self.resize_corner, new_pt, live=True)
+                    snap_desc = self._apply_corner_push_pull(
+                        p, self.resize_corner, event.pos().x(), event.pos().y()
+                    )
                     self.coordinates_changed.emit(p.x, p.y, p.z)
+                    snap_suffix = f" | {snap_desc}" if snap_desc else ""
                     self.fastener_message.emit(
-                        f"↔ {p.name}: {p.width:.1f} × {p.height:.1f} × {p.depth:.1f} мм"
+                        f"↔ Угол [{p.name}]: {p.width:.1f} × {p.height:.1f} × {p.depth:.1f} мм{snap_suffix}"
                     )
                     self.update()
             self.last_mouse_pos = event.pos()
@@ -4337,15 +4896,19 @@ class Viewport3D(QOpenGLWidget):
 
         # Hover ручек торцов (Push-Pull) и углов размера
         if not self.drag_mode and not self.fastener_mode and not self.measure_mode:
-            face_hit = self._find_face_handle(event.pos().x(), event.pos().y())
-            if face_hit is not None:
-                new_panel, new_face = face_hit[0], face_hit[1]
-                new_corner = None
+            picked = self._pick_closest_resize_or_face_handle(event.pos().x(), event.pos().y())
+            if picked is not None:
+                kind, payload = picked
+                if kind == "face":
+                    new_panel, new_face = payload[0], payload[1]
+                    new_corner = None
+                else:
+                    new_panel, new_corner = payload[0], payload[1]
+                    new_face = None
             else:
+                new_panel = None
                 new_face = None
-                hit = self._find_resize_handle(event.pos().x(), event.pos().y())
-                new_corner = hit[1] if hit is not None else None
-                new_panel = hit[0] if hit is not None else None
+                new_corner = None
 
             if (
                 new_face != self.resize_hover_face
@@ -4445,15 +5008,150 @@ class Viewport3D(QOpenGLWidget):
                 self.rot_y += dx * 0.5
                 self.update()
         elif event.buttons() & (Qt.MouseButton.RightButton | Qt.MouseButton.MiddleButton):
+            from ui.viewcube import pivot_from_pan
+
             # Панорама пропорциональна масштабу вида: далеко — быстрее, близко — точнее
             sp = self._pan_speed_per_pixel()
             self.pan_x += dx * sp
             self.pan_y -= dy * sp
+            self._focus_pivot = pivot_from_pan(
+                self.rot_x, self.rot_y, self.pan_x, self.pan_y, self._focus_reference_point()
+            )
             self.update()
 
         self.last_mouse_pos = event.pos()
 
+    def _begin_viewcube_interaction(self, mx: int, my: int) -> bool:
+        """Начало взаимодействия с ViewCube (клик или перетаскивание куба мышью)."""
+        from ui.viewcube import (
+            build_drawable,
+            hit_test,
+            is_in_viewcube_region,
+            layout_for_widget,
+            pivot_from_pan,
+        )
+
+        layout = layout_for_widget(max(1, self.width()), max(1, self.height()))
+        if not is_in_viewcube_region(float(mx), float(my), layout):
+            return False
+        drawable = build_drawable(float(self.rot_x), float(self.rot_y), layout)
+        hit = hit_test(float(mx), float(my), drawable, layout)
+        if hit is None:
+            return False
+        self._vc_press_pos = QPoint(int(mx), int(my))
+        self._vc_press_hit = hit
+        self._vc_dragging = False
+        self._vc_pivot = pivot_from_pan(
+            float(self.rot_x),
+            float(self.rot_y),
+            float(self.pan_x),
+            float(self.pan_y),
+            self._focus_reference_point(),
+        )
+        return True
+
+    def _apply_viewcube_hit(self, hit: tuple[str, str]) -> bool:
+        """Применяет клик по элементу ViewCube (грань / ребро / угол / Home)."""
+        from ui.viewcube import target_for_hit
+
+        kind, key = hit
+        if kind == "home":
+            self.go_home_view(animate=True)
+            self.fastener_message.emit("⌂ Вид: Домой (изометрия)")
+            return True
+        rx, ry, ortho, label = target_for_hit(kind, key)
+        self.view_name = key if kind == "face" else "custom"
+        self.animate_camera_to(rx, ry, is_ortho=ortho)
+        self.fastener_message.emit(f"🧭 Вид: {label}")
+        return True
+
+    def _try_viewcube_click(self, mx: int, my: int) -> bool:
+        """Прямой клик по ViewCube: грань / ребро / угол / Home. True если обработано."""
+        from ui.viewcube import build_drawable, hit_test, is_in_viewcube_region, layout_for_widget
+
+        layout = layout_for_widget(max(1, self.width()), max(1, self.height()))
+        if not is_in_viewcube_region(float(mx), float(my), layout):
+            return False
+        drawable = build_drawable(float(self.rot_x), float(self.rot_y), layout)
+        hit = hit_test(float(mx), float(my), drawable, layout)
+        if hit is None:
+            return False
+        return self._apply_viewcube_hit(hit)
+
+    def _update_viewcube_hover(self, mx: int, my: int) -> None:
+        from ui.viewcube import build_drawable, hit_test, is_in_viewcube_region, layout_for_widget
+
+        layout = layout_for_widget(max(1, self.width()), max(1, self.height()))
+        if not is_in_viewcube_region(float(mx), float(my), layout):
+            if self._viewcube_hover is not None:
+                self._viewcube_hover = None
+                if not (self.drag_mode or self.fastener_mode or self.measure_mode or self.resize_mode):
+                    try:
+                        self.unsetCursor()
+                    except Exception as exc:
+                        _log.debug("Unset cursor failed: %s", exc)
+                self.update()
+            return
+        drawable = build_drawable(float(self.rot_x), float(self.rot_y), layout)
+        hit = hit_test(float(mx), float(my), drawable, layout)
+        if hit != self._viewcube_hover:
+            self._viewcube_hover = hit
+            if not (self.drag_mode or self.fastener_mode or self.measure_mode or self.resize_mode):
+                try:
+                    if hit is not None:
+                        self.setCursor(Qt.CursorShape.PointingHandCursor)
+                    else:
+                        self.unsetCursor()
+                except Exception as exc:
+                    _log.debug("Set cursor failed: %s", exc)
+            self.update()
+
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._vc_press_pos is not None:
+            was_drag = self._vc_dragging
+            hit = self._vc_press_hit
+            self._vc_press_pos = None
+            self._vc_press_hit = None
+            self._vc_dragging = False
+            self._vc_pivot = None
+            try:
+                if self._viewcube_hover is not None:
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                else:
+                    self.unsetCursor()
+            except Exception as exc:
+                _log.debug("Cursor restore failed: %s", exc)
+            if not was_drag and hit is not None:
+                self._apply_viewcube_hit(hit)
+            self.is_dragging = False
+            return
+
+        if event.button() == Qt.MouseButton.MiddleButton:
+            # Короткий клик СКМ — плавный фокус на точку детали (или плоскости сцены) под курсором
+            if self._middle_press_pos is not None and not self._middle_did_drag:
+                click_dist = math.hypot(
+                    event.pos().x() - self._middle_press_pos.x(),
+                    event.pos().y() - self._middle_press_pos.y(),
+                )
+                if click_dist < 8.0:
+                    try:
+                        self._sync_viewport_matrices()
+                        pt = self._cursor_focus_point(event.pos().x(), event.pos().y())
+                        piv = (float(pt[0]), float(pt[1]), float(pt[2]))
+                        self.animate_camera_to(
+                            float(self.rot_x),
+                            float(self.rot_y),
+                            is_ortho=self.is_ortho,
+                            target_pivot=piv,
+                        )
+                        self.fastener_message.emit(
+                            f"🎯 Фокус на точку ({piv[0]:.0f}, {piv[1]:.0f}, {piv[2]:.0f}) мм"
+                        )
+                    except Exception as exc:
+                        _log.debug("Middle-click focus failed: %s", exc)
+            self._middle_press_pos = None
+            self._middle_did_drag = False
+
         if event.button() == Qt.MouseButton.RightButton:
             if self.drag_mode:
                 self.cancel_drag_mode()
@@ -4633,10 +5331,7 @@ class Viewport3D(QOpenGLWidget):
         has_snap = bool(getattr(self, "ctrl_held", False) and getattr(self, "measure_snap_info", None) is not None)
         has_handles = bool(self.get_selected_panels()) and not self.drag_mode
         has_collisions = bool(self.live_collision_mode and self._live_collision_hits)
-
-        if not has_rect and not has_dims and not has_drag and not has_snap and not has_handles and not has_collisions:
-            return
-
+        # ViewCube всегда рисуем
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
@@ -4652,6 +5347,20 @@ class Viewport3D(QOpenGLWidget):
 
         if has_handles:
             self._draw_resize_handles(painter)
+
+        try:
+            from ui.viewcube import draw_viewcube
+
+            self._viewcube_drawable = draw_viewcube(
+                painter,
+                float(self.rot_x),
+                float(self.rot_y),
+                max(1, self.width()),
+                max(1, self.height()),
+                hover=self._viewcube_hover,
+            )
+        except Exception as exc:
+            _log.debug("ViewCube draw failed: %s", exc)
 
         if has_rect:
             r = self.selecting_rect.normalized()

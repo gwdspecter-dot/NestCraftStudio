@@ -1,10 +1,11 @@
-"""Диалог «Что нового» — список версий слева, изменения справа (из CHANGELOG.md)."""
+"""Диалог «Что нового» — пользовательские заметки из RELEASE_NOTES.md (с fallback на CHANGELOG.md)."""
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -17,7 +18,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.changelog import ChangelogEntry, load_changelog, markdown_to_html
+from core.changelog import ChangelogEntry, load_whats_new, markdown_to_html
 from ui.theme import current_theme
 
 
@@ -60,7 +61,12 @@ def _body_html(body: str) -> str:
 
 
 class WhatsNewDialog(QDialog):
-    def __init__(self, parent=None, entries: list[ChangelogEntry] | None = None):
+    def __init__(
+        self,
+        parent=None,
+        entries: list[ChangelogEntry] | None = None,
+        tech_entries: list[ChangelogEntry] | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Что нового — NestCraft Studio")
         self.resize(860, 540)
@@ -95,6 +101,9 @@ class WhatsNewDialog(QDialog):
                 background-color: {c.bg}; color: {c.text};
                 border: 1px solid {c.border}; border-radius: 4px; padding: 12px 14px;
             }}
+            QCheckBox#techToggle {{
+                color: {c.text_dim}; font-size: 12px;
+            }}
             QPushButton {{
                 background-color: {c.accent}; color: #ffffff; border: none;
                 border-radius: 4px; padding: 6px 18px; font-size: 13px;
@@ -103,7 +112,12 @@ class WhatsNewDialog(QDialog):
             """
         )
 
-        self._entries = entries if entries is not None else load_changelog()
+        if entries is None:
+            self._user_entries, self._tech_entries = load_whats_new()
+        else:
+            self._user_entries = entries
+            self._tech_entries = tech_entries if tech_entries is not None else []
+        self._entries: list[ChangelogEntry] = self._user_entries
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -150,6 +164,11 @@ class WhatsNewDialog(QDialog):
         root.addWidget(splitter, 1)
 
         btn_row = QHBoxLayout()
+        self.tech_cb = QCheckBox("Показать технический журнал")
+        self.tech_cb.setObjectName("techToggle")
+        self.tech_cb.setVisible(bool(self._tech_entries))
+        self.tech_cb.toggled.connect(self._on_tech_toggled)
+        btn_row.addWidget(self.tech_cb)
         btn_row.addStretch(1)
         close_btn = QPushButton("Закрыть")
         close_btn.setDefault(True)
@@ -160,20 +179,35 @@ class WhatsNewDialog(QDialog):
         self.version_list.currentRowChanged.connect(self._on_version_selected)
         self._populate()
 
-    def _populate(self) -> None:
+    def _populate(self, select_version: str | None = None) -> None:
+        self.version_list.blockSignals(True)
         self.version_list.clear()
         if not self._entries:
+            self.version_list.blockSignals(False)
             self.heading.setText("История изменений")
-            self.body.setHtml(_body_html("Файл `CHANGELOG.md` не найден или пуст."))
+            self.body.setHtml(_body_html("Файлы `RELEASE_NOTES.md` и `CHANGELOG.md` не найдены или пусты."))
             return
-        for e in self._entries:
+        target_row = 0
+        for idx, e in enumerate(self._entries):
             label = e.version
             if e.date:
                 label = f"{e.version}  ({e.date})"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, e)
             self.version_list.addItem(item)
-        self.version_list.setCurrentRow(0)
+            if select_version and e.version == select_version:
+                target_row = idx
+        self.version_list.blockSignals(False)
+        self.version_list.setCurrentRow(target_row)
+        self._on_version_selected(target_row)
+
+    def _on_tech_toggled(self, checked: bool) -> None:
+        current_ver: str | None = None
+        row = self.version_list.currentRow()
+        if 0 <= row < len(self._entries):
+            current_ver = self._entries[row].version
+        self._entries = self._tech_entries if (checked and self._tech_entries) else self._user_entries
+        self._populate(select_version=current_ver)
 
     def _on_version_selected(self, row: int) -> None:
         if row < 0 or row >= len(self._entries):

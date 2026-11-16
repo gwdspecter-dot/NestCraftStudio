@@ -391,6 +391,40 @@ def compute_face_push_pull_box(
     return (coords[0], coords[1], coords[2], new_dims[0], new_dims[1], new_dims[2])
 
 
+def compute_corner_push_pull_box(
+    orig_box: tuple[float, float, float, float, float, float],
+    corner: tuple[int, int, int],
+    new_lens: dict[int, float],
+    panel: Any = None,
+    min_size: float = 10.0,
+) -> tuple[float, float, float, float, float, float]:
+    """Вычисляет новые `(x, y, z, width, height, depth)` детали при вытягивании угла `corner = (sx, sy, sz)`
+    вдоль его рабочих осей (`new_lens = {axis_idx: length}`) по тому же принципу Push-Pull, что и для граней:
+    противоположные грани и противоположный угол остаются строго неподвижными в мире, без переворота бокса."""
+    cur_box = tuple(float(v) for v in orig_box)
+    raw_tax = getattr(panel, "thickness_axis", -1) if panel is not None else -1
+    if isinstance(raw_tax, str):
+        tax = {"X": 0, "Y": 1, "Z": 2}.get(raw_tax.upper(), -1)
+    else:
+        try:
+            tax = int(raw_tax)
+        except (TypeError, ValueError):
+            tax = -1
+
+    for ax_idx in (0, 1, 2):
+        if ax_idx == tax or ax_idx not in new_lens:
+            continue
+        side = int(corner[ax_idx])
+        cur_box = compute_face_push_pull_box(
+            cur_box,
+            (ax_idx, side),
+            float(new_lens[ax_idx]),
+            panel=panel,
+            min_size=min_size,
+        )
+    return cur_box
+
+
 def compute_aabb_intersection_box(
     a0: tuple[float, float, float],
     a1: tuple[float, float, float],
