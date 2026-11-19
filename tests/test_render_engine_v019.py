@@ -123,6 +123,40 @@ class TestRenderEngineV019(unittest.TestCase):
         self.assertIn("def _corner_active_axes_and_dirs", src)
         self.assertIn("def _apply_corner_push_pull", src)
         self.assertIn("def _pick_closest_resize_or_face_handle", src)
+        self.assertIn("def _camera_axes", src)
+        self.assertIn("def _find_magnetic_snap_point", src)
+        self.assertNotIn("def _face_to_face_snap", src)
+
+        import ast
+
+        tree = ast.parse(src)
+        vp_cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Viewport3D")
+        vp_methods = {n.name for n in vp_cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        qt_inherited = {"devicePixelRatioF", "width", "height", "update", "setFocus", "setCursor", "unsetCursor"}
+        for mname in (
+            "_camera_axes",
+            "_apply_axis_lock",
+            "_view_plane_axes",
+            "_view_plane_normal_axis",
+            "_find_magnetic_snap_point",
+            "_find_target_snap_point",
+            "_cursor_on_face_axis",
+            "_apply_corner_push_pull",
+        ):
+            fn = next(n for n in vp_cls.body if isinstance(n, ast.FunctionDef) and n.name == mname)
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                ):
+                    attr = node.func.attr
+                    self.assertIn(
+                        attr,
+                        vp_methods | qt_inherited,
+                        f"Метод Viewport3D.{mname} вызывает несуществующий self.{attr}",
+                    )
 
     def test_smart_formula_evaluator_v019(self):
         """Проверяем безопасное вычисление арифметических формул и контекстных переменных детали (w, h, d, t, cur)."""
@@ -360,8 +394,110 @@ class TestRenderEngineV019(unittest.TestCase):
         finally:
             Panel._controller_unbound = False
 
+    def test_ortho_2d_drag_preserves_depth_axis(self):
+        """В 2D-видах (Спереди, Слева, Сверху/Снизу) перетаскивание детали не уносит её вдоль оси глубины камеры."""
+        import numpy as np
+
+        # 1. Вид Спереди (XY, normal_axis=2): origin на z_near = +8000 мм, луч смотрит вдоль -Z
+        base_front = np.array([100.0, 350.0, 560.0], dtype=float)
+        origin_front = np.array([280.0, 420.0, 8000.0], dtype=float)
+        ray_front = np.array([0.0, 0.0, -1.0], dtype=float)
+        target_front, desc_front = glmath.project_ray_to_drag_plane(
+            origin_front,
+            ray_front,
+            base_front,
+            is_ortho=True,
+            normal_axis=2,
+            camera_forward=ray_front,
+        )
+        self.assertEqual(desc_front, "Плоскость 2D-вида")
+        self.assertAlmostEqual(float(target_front[0]), 280.0)
+        self.assertAlmostEqual(float(target_front[1]), 420.0)
+        self.assertAlmostEqual(float(target_front[2]), 560.0)
+
+        delta_front = glmath.constrain_drag_delta_to_view(
+            target_front - base_front,
+            axis_lock=None,
+            is_ortho=True,
+            normal_axis=2,
+        )
+        self.assertAlmostEqual(float(delta_front[0]), 180.0)
+        self.assertAlmostEqual(float(delta_front[1]), 70.0)
+        self.assertAlmostEqual(float(delta_front[2]), 0.0)
+
+        # Даже если в 2D-виде курсор примагнитился к точке задней стенки (Z=0), смещение по Z строго 0
+        snapped_back_wall = np.array([220.0, 390.0, 0.0], dtype=float)
+        delta_snapped = glmath.constrain_drag_delta_to_view(
+            snapped_back_wall - base_front,
+            axis_lock=None,
+            is_ortho=True,
+            normal_axis=2,
+        )
+        self.assertAlmostEqual(float(delta_snapped[0]), 120.0)
+        self.assertAlmostEqual(float(delta_snapped[1]), 40.0)
+        self.assertAlmostEqual(float(delta_snapped[2]), 0.0)
+
+        # 2. Вид Слева (ZY, normal_axis=0): origin на x_near = -8000 мм, луч вдоль +X
+        base_left = np.array([16.0, 500.0, 200.0], dtype=float)
+        origin_left = np.array([-8000.0, 620.0, 340.0], dtype=float)
+        ray_left = np.array([1.0, 0.0, 0.0], dtype=float)
+        target_left, _ = glmath.project_ray_to_drag_plane(
+            origin_left,
+            ray_left,
+            base_left,
+            is_ortho=True,
+            normal_axis=0,
+            camera_forward=ray_left,
+        )
+        self.assertAlmostEqual(float(target_left[0]), 16.0)
+        self.assertAlmostEqual(float(target_left[1]), 620.0)
+        self.assertAlmostEqual(float(target_left[2]), 340.0)
+
+        # 3. Вид Сверху (XZ, normal_axis=1): верхняя крышка на высоте Y=1800 мм остаётся на Y=1800 мм (не падает на пол Y=0)
+        base_top = np.array([300.0, 1800.0, 250.0], dtype=float)
+        origin_top = np.array([450.0, 8000.0, 310.0], dtype=float)
+        ray_top = np.array([0.0, -1.0, 0.0], dtype=float)
+        target_top, _ = glmath.project_ray_to_drag_plane(
+            origin_top,
+            ray_top,
+            base_top,
+            is_ortho=True,
+            normal_axis=1,
+            camera_forward=ray_top,
+        )
+        self.assertAlmostEqual(float(target_top[0]), 450.0)
+        self.assertAlmostEqual(float(target_top[1]), 1800.0)
+        self.assertAlmostEqual(float(target_top[2]), 310.0)
+
+        # 4. В 3D-виде (is_ortho=False) при захвате полки на высоте Y=1500 мм свободное движение идёт в плоскости Y=1500 мм
+        base_3d = np.array([200.0, 1500.0, 250.0], dtype=float)
+        origin_3d = np.array([350.0, 2000.0, 1250.0], dtype=float)
+        ray_3d = np.array([0.0, -0.5, -1.0], dtype=float)
+        target_3d, desc_3d = glmath.project_ray_to_drag_plane(
+            origin_3d,
+            ray_3d,
+            base_3d,
+            is_ortho=False,
+            normal_axis=None,
+            camera_forward=ray_3d,
+        )
+        self.assertEqual(desc_3d, "Свободное перемещение")
+        self.assertAlmostEqual(float(target_3d[1]), 1500.0)
+        self.assertAlmostEqual(float(target_3d[0]), 350.0)
+        self.assertAlmostEqual(float(target_3d[2]), 250.0)
+
+    def test_toggleable_magnetic_snap_replaces_face_to_face(self):
+        """Кнопка «🧲 Магнит» (face_snap_enabled) включает и отключает магнитную привязку для перемещения и растягивания."""
+        mw_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ui",
+            "main_window.py",
+        )
+        with open(mw_path, "r", encoding="utf-8") as f:
+            mw_src = f.read()
+        self.assertIn('QAction("🧲 Магнит", self)', mw_src)
+        self.assertNotIn("📐 Грань↔грань", mw_src)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

@@ -709,7 +709,7 @@ def draw_viewcube(
         if alpha < 35:
             continue
         caption = f.get("caption", f["label"].upper())
-        font = QFont("Segoe UI")
+        font = QFont()
         font.setPointSize(7 if len(caption) >= 6 else 8)
         font.setBold(True)
         painter.setFont(font)
@@ -731,7 +731,7 @@ def draw_viewcube(
         )
 
     # 5. Синхронизированная 3D-триада осей X / Y / Z (слева-снизу от куба)
-    axis_font = QFont("Segoe UI")
+    axis_font = QFont()
     axis_font.setPointSize(7)
     axis_font.setBold(True)
     painter.setFont(axis_font)
@@ -811,35 +811,6 @@ def draw_viewcube(
     walls.lineTo(hcx + 4.4, hcy + 5.2)
     walls.lineTo(hcx + 4.4, hcy - 1.5)
     painter.drawPath(walls)
-
-    # 7. HUD-подсказка ракурса в фирменном стиле вьюпорта (QColor(15, 23, 42, 230))
-    if hover is not None:
-        h_kind, h_key = hover
-        if h_kind == "home":
-            tip_text = "Домой (Изометрия)"
-            tip_border = QColor(56, 189, 248)
-        elif h_kind == "face":
-            _rx, _ry, _ortho, lbl = target_for_hit(h_kind, h_key)
-            tip_text = lbl
-            tip_border = QColor(56, 189, 248)
-        else:
-            _rx, _ry, _ortho, lbl = target_for_hit(h_kind, h_key)
-            tip_text = lbl
-            tip_border = QColor(249, 115, 22)
-
-        tip_font = QFont("Segoe UI")
-        tip_font.setPointSize(8)
-        tip_font.setBold(True)
-        painter.setFont(tip_font)
-        tw = max(78, min(190, len(tip_text) * 7 + 18))
-        th = 20
-        tx = int(min(max(6.0, layout.cx - tw * 0.5), float(width) - tw - 6.0))
-        ty = int(round(layout.cy + ring_r + 6.0))
-        painter.setBrush(QBrush(QColor(15, 23, 42, 232)))
-        painter.setPen(QPen(tip_border, 1.2))
-        painter.drawRoundedRect(tx, ty, tw, th, 6, 6)
-        painter.setPen(QColor(248, 250, 252))
-        painter.drawText(tx, ty, tw, th, int(Qt.AlignmentFlag.AlignCenter), tip_text)
 
     drawable["layout"] = layout
     return drawable

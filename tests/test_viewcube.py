@@ -208,3 +208,134 @@ def test_ortho_scale_and_projection_matrix_blend():
     assert abs(ndc_x_mid - ndc_x_ortho) < 1e-5
 
 
+def test_draw_viewcube_has_no_hover_tooltip():
+    """При наведении на грань, ребро, угол или кнопку «Домой» всплывающая HUD-подсказка не рисуется."""
+    import sys
+    import types
+
+    from ui.viewcube import draw_viewcube
+
+    saved = {k: sys.modules.get(k) for k in ("PyQt6", "PyQt6.QtCore", "PyQt6.QtGui")}
+    if "PyQt6.QtGui" not in sys.modules:
+        qt_mod = types.ModuleType("PyQt6")
+        qt_core = types.ModuleType("PyQt6.QtCore")
+        qt_gui = types.ModuleType("PyQt6.QtGui")
+
+        class _EnumVal:
+            def __init__(self, v: int = 0):
+                self._v = v
+
+            def __int__(self):
+                return self._v
+
+        qt_core.QPointF = lambda x=0.0, y=0.0: (x, y)
+        qt_core.Qt = types.SimpleNamespace(
+            PenStyle=types.SimpleNamespace(NoPen=_EnumVal(0), SolidLine=_EnumVal(1)),
+            BrushStyle=types.SimpleNamespace(NoBrush=_EnumVal(0)),
+            PenCapStyle=types.SimpleNamespace(RoundCap=_EnumVal(1)),
+            PenJoinStyle=types.SimpleNamespace(RoundJoin=_EnumVal(1)),
+            AlignmentFlag=types.SimpleNamespace(AlignCenter=_EnumVal(1)),
+        )
+
+        class _Color:
+            def __init__(self, *a):
+                self.args = a
+
+            def darker(self, _f=150):
+                return self
+
+            def lighter(self, _f=150):
+                return self
+
+        class _Grad:
+            def __init__(self, *a):
+                pass
+
+            def setColorAt(self, *a):
+                pass
+
+        class _Font:
+            def __init__(self, *a):
+                pass
+
+            def setPointSize(self, _s):
+                pass
+
+            def setBold(self, _b):
+                pass
+
+        class _Path:
+            def moveTo(self, *a):
+                pass
+
+            def lineTo(self, *a):
+                pass
+
+            def closeSubpath(self):
+                pass
+
+        qt_gui.QColor = _Color
+        qt_gui.QBrush = lambda *a: None
+        qt_gui.QPen = lambda *a: None
+        qt_gui.QFont = _Font
+        qt_gui.QPainterPath = _Path
+        qt_gui.QLinearGradient = _Grad
+        qt_gui.QRadialGradient = _Grad
+        qt_mod.QtCore = qt_core
+        qt_mod.QtGui = qt_gui
+        sys.modules["PyQt6"] = qt_mod
+        sys.modules["PyQt6.QtCore"] = qt_core
+        sys.modules["PyQt6.QtGui"] = qt_gui
+
+    class _RecorderPainter:
+        def __init__(self):
+            self.rounded_rects: list[tuple[int, int, int, int]] = []
+            self.texts: list[str] = []
+
+        def setPen(self, *_a):
+            pass
+
+        def setBrush(self, *_a):
+            pass
+
+        def setFont(self, *_a):
+            pass
+
+        def drawEllipse(self, *_a):
+            pass
+
+        def drawLine(self, *_a):
+            pass
+
+        def drawPath(self, *_a):
+            pass
+
+        def drawRoundedRect(self, x, y, w, h, *_a):
+            self.rounded_rects.append((x, y, w, h))
+
+        def drawText(self, _x, _y, _w, _h, _align, txt):
+            self.texts.append(txt)
+
+    try:
+        for hover_item in (
+            ("face", "front"),
+            ("edge", "e_front_top"),
+            ("corner", "c_RTF"),
+            ("home", "home"),
+        ):
+            p = _RecorderPainter()
+            draw_viewcube(p, 25.0, -35.0, 800, 600, hover=hover_item)
+            # Единственный drawRoundedRect — кнопка Home (никакого бейджа-подсказки)
+            assert len(p.rounded_rects) == 1
+            assert "Домой (Изометрия)" not in p.texts
+            assert "Спереди + Сверху" not in p.texts
+            assert "Спереди" not in p.texts
+    finally:
+        for k, prev in saved.items():
+            if prev is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = prev
+
+
+

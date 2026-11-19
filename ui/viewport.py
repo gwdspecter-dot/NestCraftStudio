@@ -323,9 +323,8 @@ class Viewport3D(QOpenGLWidget):
         self.fastener_preview_points: list | None = None
         self._last_fastener_params: dict | None = None
         self.assoc_preview_point: tuple[float, float, float] | None = None
-        # Грань-к-грани при Grab
+        # Магнитная привязка (🧲) при перемещении (G), вставке и растягивании граней/углов
         self.face_snap_enabled = True
-        self.drag_face_snap_gap = 25.0  # мм: порог притяжения
         self.drag_face_snap_desc = ""
 
         # Инструмент «Рулетка / Размерные линии и углы»
@@ -421,19 +420,17 @@ class Viewport3D(QOpenGLWidget):
         self._rebuild_scene_gpu_ids()
 
     def _apply_axis_lock(self, delta: np.ndarray) -> np.ndarray:
-        """Обнуляет компоненты смещения вне зафиксированной оси (Grab)."""
-        d = np.asarray(delta, dtype=float).copy()
-        lock = self.drag_axis_lock
-        if lock == "X":
-            d[1] = 0.0
-            d[2] = 0.0
-        elif lock == "Y":
-            d[0] = 0.0
-            d[2] = 0.0
-        elif lock == "Z":
-            d[0] = 0.0
-            d[1] = 0.0
-        return d
+        """Обнуляет компоненты смещения вне зафиксированной оси (Grab) или вне плоскости 2D-вида."""
+        is_ortho = bool(getattr(self, "is_ortho", False))
+        n_ax = self._view_plane_normal_axis() if is_ortho else None
+        cam_fwd = self._camera_axes()[2] if (is_ortho and n_ax is None) else None
+        return glmath.constrain_drag_delta_to_view(
+            delta,
+            axis_lock=self.drag_axis_lock,
+            is_ortho=is_ortho,
+            normal_axis=n_ax,
+            camera_forward=cam_fwd,
+        )
 
     def _view_plane_axes(self) -> tuple[int, int] | None:
         """Оси плоскости текущего 2D-вида: 0=X, 1=Y, 2=Z."""
@@ -442,8 +439,22 @@ class Viewport3D(QOpenGLWidget):
             return (0, 1)
         if name in ("left", "right"):
             return (2, 1)
-        if name == "top":
+        if name in ("top", "bottom"):
             return (0, 2)
+        if getattr(self, "is_ortho", False):
+            rx = float(getattr(self, "rot_x", 0.0)) % 360.0
+            ry = float(getattr(self, "rot_y", 0.0)) % 360.0
+            if rx > 180.0:
+                rx -= 360.0
+            if ry > 180.0:
+                ry -= 360.0
+            if abs(abs(rx) - 90.0) < 1e-2:
+                return (0, 2)
+            if abs(rx) < 1e-2:
+                if abs(ry) < 1e-2 or abs(abs(ry) - 180.0) < 1e-2:
+                    return (0, 1)
+                if abs(abs(ry) - 90.0) < 1e-2:
+                    return (2, 1)
         return None
 
     def _view_plane_normal_axis(self) -> int | None:
@@ -512,156 +523,62 @@ class Viewport3D(QOpenGLWidget):
             out[ax] = round(float(out[ax]) / step) * step
         return out
 
-    def _face_to_face_snap(self, panel: Panel, delta: np.ndarray, max_gap: float | None = None) -> tuple[np.ndarray, str]:
+    def _find_magnetic_snap_point(
+        self,
+        mx: int,
+        my: int,
+        exclude_panel: Panel | None = None,
+        base_radius: float = 20.0,
+    ) -> tuple[np.ndarray | None, str]:
+        """Ищет ближайшую к курсору `(mx, my)` магнитную точку привязки (`🧲`) на других деталях сцены.
+
+        Управляется переключателем `self.face_snap_enabled` (кнопка «🧲 Магнит» на верхней панели)
+        или временным удержанием клавиши `[Ctrl]`.
         """
-        Притягивает перемещаемую панель гранью к грани другой панели.
-        Для неповёрнутых или повернутых на кратные 90° панелей использует world_aabb(),
-        а для произвольно повернутых панелей поддерживает также притяжение по нормалям OBB-граней.
-        """
-        if not getattr(self, "face_snap_enabled", True):
-            return np.asarray(delta, dtype=float), ""
-        if panel is None or self.drag_orig_pos is None:
-            return np.asarray(delta, dtype=float), ""
-        max_gap = float(max_gap if max_gap is not None else self.drag_face_snap_gap)
-        min_lateral = 8.0  # мм минимального бокового перекрытия
-        penetrate_eps = 0.5  # мм: допуск «касания» без пересечения
+        is_ctrl = bool(getattr(self, "ctrl_held", False))
+        if not (bool(getattr(self, "face_snap_enabled", True)) or is_ctrl):
+            return None, ""
 
-        ox, oy, oz = self.drag_orig_pos
-        d0 = np.asarray(delta, dtype=float).copy()
+        dpr = float(self.devicePixelRatioF())
+        vp = self._vp_size
+        mvp = self._mvp
+        snap_radius = 52.0 if is_ctrl else float(base_radius)
+        plane = self.current_section_plane()
 
-        # Временный сдвиг для вычисления world_aabb / obb в новой точке
-        saved_xyz = (float(panel.x), float(panel.y), float(panel.z))
-        try:
-            panel.x, panel.y, panel.z = ox + d0[0], oy + d0[1], oz + d0[2]
-            if hasattr(panel, "world_aabb"):
-                (nx0, ny0, nz0), (nx1, ny1, nz1) = panel.world_aabb()
-            else:
-                nx0, ny0, nz0 = float(panel.x), float(panel.y), float(panel.z)
-                nx1, ny1, nz1 = nx0 + float(panel.width), ny0 + float(panel.height), nz0 + float(panel.depth)
-            moved_obb = panel.obb() if hasattr(panel, "obb") else None
-        finally:
-            panel.x, panel.y, panel.z = saved_xyz
-
-        w_box, h_box, d_box = nx1 - nx0, ny1 - ny0, nz1 - nz0
-
-        # (axis, coord, sign, lat0_lo, lat0_hi, lat1_lo, lat1_hi, name)
-        moved_faces = [
-            (0, nx0, -1, ny0, ny1, nz0, nz1, "X−"),
-            (0, nx1, +1, ny0, ny1, nz0, nz1, "X+"),
-            (1, ny0, -1, nx0, nx1, nz0, nz1, "Y−"),
-            (1, ny1, +1, nx0, nx1, nz0, nz1, "Y+"),
-            (2, nz0, -1, nx0, nx1, ny0, ny1, "Z−"),
-            (2, nz1, +1, nx0, nx1, ny0, ny1, "Z+"),
-        ]
-
-        lock = self.drag_axis_lock
-        lock_axis = {"X": 0, "Y": 1, "Z": 2}.get(lock) if lock else None
-
-        best_delta = d0
-        best_score = max_gap + 1.0
+        best_pt: np.ndarray | None = None
         best_desc = ""
+        min_d = snap_radius
 
         for block in self.blocks:
             for other in block.panels:
-                if other is panel:
+                if other is exclude_panel:
                     continue
-                if hasattr(other, "world_aabb"):
-                    (ox0, oy0, oz0), (ox1, oy1, oz1) = other.world_aabb()
-                else:
-                    ox0, oy0, oz0 = float(other.x), float(other.y), float(other.z)
-                    ox1, oy1, oz1 = ox0 + float(other.width), oy0 + float(other.height), oz0 + float(other.depth)
-                other_faces = [
-                    (0, ox0, -1, oy0, oy1, oz0, oz1, other.name, "X−"),
-                    (0, ox1, +1, oy0, oy1, oz0, oz1, other.name, "X+"),
-                    (1, oy0, -1, ox0, ox1, oz0, oz1, other.name, "Y−"),
-                    (1, oy1, +1, ox0, ox1, oz0, oz1, other.name, "Y+"),
-                    (2, oz0, -1, ox0, ox1, oy0, oy1, other.name, "Z−"),
-                    (2, oz1, +1, ox0, ox1, oy0, oy1, other.name, "Z+"),
-                ]
-                for ax, mc, msign, a0, a1, b0, b1, mname in moved_faces:
-                    if lock_axis is not None and ax != lock_axis:
+                if not self._panel_within_screen_radius(other, mx, my, snap_radius, mvp, vp, dpr):
+                    continue
+                for item in self._collect_panel_snap_points(other, label_prefix=other.name):
+                    pt, desc = item[0], item[1]
+                    if plane is not None and not glmath.point_passes_clip_plane(
+                        float(pt[0]), float(pt[1]), float(pt[2]), plane
+                    ):
                         continue
-                    for oax, oc, osign, oa0, oa1, ob0, ob1, oname, ofname in other_faces:
-                        if oax != ax:
+                    try:
+                        wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
+                        if wz < 0.0 or wz > 1.0:
                             continue
-                        if msign == osign:
-                            continue
-                        gap = float(oc - mc)
-                        if abs(gap) > max_gap or abs(gap) < 1e-9:
-                            continue
-                        lat0 = min(a1, oa1) - max(a0, oa0)
-                        lat1 = min(b1, ob1) - max(b0, ob0)
-                        if lat0 < min_lateral or lat1 < min_lateral:
-                            continue
+                        sx = wx / dpr
+                        sy = (vp[3] - wy) / dpr
+                        dist = math.hypot(sx - mx, sy - my)
+                        if dist < min_d:
+                            min_d = dist
+                            best_pt = np.asarray(pt, dtype=float).copy()
+                            best_desc = desc
+                    except Exception as exc:
+                        _log.debug("Ошибка проекции точки магнитной привязки: %s", exc)
 
-                        cand = d0.copy()
-                        cand[ax] = d0[ax] + gap
-
-                        m_min = [nx0, ny0, nz0]
-                        m_max = [nx0 + w_box, ny0 + h_box, nz0 + d_box]
-                        m_min[ax] += gap
-                        m_max[ax] += gap
-                        o_min = (ox0, oy0, oz0)
-                        o_max = (ox1, oy1, oz1)
-                        ov_axis = min(m_max[ax], o_max[ax]) - max(m_min[ax], o_min[ax])
-                        if ov_axis > penetrate_eps:
-                            continue
-
-                        score = abs(gap) - 0.001 * (lat0 + lat1)
-                        if score < best_score:
-                            best_score = score
-                            best_delta = cand
-                            best_desc = f"грань↔грань [{mname}] → [{oname} {ofname}] ({gap:+.1f} мм)"
-
-                # OBB грань↔грань для повёрнутых панелей с коллинеарными нормалями граней
-                if moved_obb is not None and lock_axis is None and hasattr(other, "obb") and (
-                    (hasattr(panel, "has_rotation") and panel.has_rotation())
-                    or (hasattr(other, "has_rotation") and other.has_rotation())
-                ):
-                    mc_pt, m_axes, m_half = moved_obb
-                    oc_pt, o_axes, o_half = other.obb()
-                    m_c = np.asarray(mc_pt, dtype=float)
-                    o_c = np.asarray(oc_pt, dtype=float)
-                    m_ax = [np.asarray(a, dtype=float) for a in m_axes]
-                    o_ax = [np.asarray(a, dtype=float) for a in o_axes]
-                    rel_c = o_c - m_c
-                    for i in range(3):
-                        n_i = m_ax[i]
-                        for j in range(3):
-                            dot_ij = float(np.dot(n_i, o_ax[j]))
-                            if abs(dot_ij) < 0.995:
-                                continue
-                            dist_c = float(np.dot(rel_c, n_i))
-                            sign_dir = 1.0 if dist_c >= 0.0 else -1.0
-                            target_dist = float(m_half[i]) + float(o_half[j])
-                            gap = dist_c - sign_dir * target_dist
-                            if abs(gap) > max_gap or abs(gap) < 1e-9:
-                                continue
-                            # Проверка перекрытия в касательной плоскости
-                            t_axes = [m_ax[(i + 1) % 3], m_ax[(i + 2) % 3]]
-                            lat_ok = True
-                            lat_sum = 0.0
-                            for k_idx, t_ax in enumerate(t_axes):
-                                r_m = float(m_half[(i + 1 + k_idx) % 3])
-                                r_o = sum(float(o_half[m]) * abs(float(np.dot(o_ax[m], t_ax))) for m in range(3))
-                                proj_d = abs(float(np.dot(rel_c, t_ax)))
-                                ov = (r_m + r_o) - proj_d
-                                if ov < min_lateral:
-                                    lat_ok = False
-                                    break
-                                lat_sum += ov
-                            if not lat_ok:
-                                continue
-                            cand = d0 + n_i * gap
-                            score = abs(gap) - 0.001 * lat_sum
-                            if score < best_score:
-                                best_score = score
-                                best_delta = cand
-                                best_desc = f"OBB грань↔грань → [{other.name}] ({gap:+.1f} мм)"
-
-        if best_score <= max_gap:
-            return best_delta, best_desc
-        return d0, ""
+        if best_pt is not None:
+            prefix = "🧲 [Ctrl] " if is_ctrl else "🧲 "
+            return best_pt, f"{prefix}{best_desc}"
+        return None, ""
 
     def _check_panel_collisions(self, panel: Panel, vol_eps: float = 0.1) -> list[tuple]:
         """Список (other_panel, volume_mm3) пересечений с panel."""
@@ -1076,6 +993,18 @@ class Viewport3D(QOpenGLWidget):
     def _rotation_matrix(self) -> np.ndarray:
         """Rx * Ry — поворот сцены (world → view без панорамирования)."""
         return glmath.mul(glmath.rotate_x(self.rot_x), glmath.rotate_y(self.rot_y))
+
+    def _camera_axes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Возвращает мировые ортонормированные оси камеры `(right, up, forward)`."""
+        R3 = self._rotation_matrix()[:3, :3].T
+        right = np.asarray(R3 @ np.array([1.0, 0.0, 0.0], dtype=float), dtype=float)
+        up = np.asarray(R3 @ np.array([0.0, 1.0, 0.0], dtype=float), dtype=float)
+        forward = np.asarray(R3 @ np.array([0.0, 0.0, -1.0], dtype=float), dtype=float)
+        out = []
+        for vec in (right, up, forward):
+            n = float(np.linalg.norm(vec))
+            out.append(vec / n if n > 1e-12 else vec)
+        return out[0], out[1], out[2]
 
     @property
     def panels(self) -> list[Panel]:
@@ -2742,6 +2671,12 @@ class Viewport3D(QOpenGLWidget):
             self.measure_current_target = target
             return hit_pt, target.format_hover_summary(), "surface", s_hit, False, 0.0, hit_panel
 
+        if getattr(self, "is_ortho", False):
+            vp_pt = self._intersect_ray_with_view_plane(origin, ray_dir)
+            if vp_pt is not None:
+                self.measure_current_target = build_measure_target(vp_pt, "Плоскость 2D-вида", "space", None)
+                return vp_pt, "Плоскость 2D-вида", "space", None, False, 0.0, None
+
         # Плоскость пола Y=0
         if abs(ray_dir[1]) > 1e-6:
             t = (0.0 - origin[1]) / ray_dir[1]
@@ -3445,88 +3380,75 @@ class Viewport3D(QOpenGLWidget):
         dpr = float(self.devicePixelRatioF())
         vp = self._vp_size
         mvp = self._mvp
-        is_ctrl = getattr(self, "ctrl_held", False)
-        min_screen_dist = 54.0 if is_ctrl else 24.0
-
-        candidates: list[tuple] = []
+        is_ctrl = bool(getattr(self, "ctrl_held", False))
+        snap_active = bool(getattr(self, "face_snap_enabled", True)) or is_ctrl
         plane = self.current_section_plane()
-        for block in self.blocks:
-            for p in block.panels:
-                if p is self.drag_panel:
-                    continue
-                if not self._panel_within_screen_radius(p, mx, my, min_screen_dist, mvp, vp, dpr):
-                    continue
-                pts = self._collect_panel_snap_points(p, label_prefix=p.name)
-                if plane is not None:
-                    pts = [
-                        item for item in pts
-                        if glmath.point_passes_clip_plane(float(item[0][0]), float(item[0][1]), float(item[0][2]), plane)
-                    ]
-                candidates.extend(pts)
 
-        best_pt = None
-        best_desc = ""
+        is_ortho = bool(getattr(self, "is_ortho", False))
+        n_ax = self._view_plane_normal_axis() if is_ortho else None
+        cam_fwd = self._camera_axes()[2]
+        ref_pt: np.ndarray | None = None
+        if self.drag_mode and self.drag_base_point is not None:
+            ref_pt = np.asarray(self.drag_base_point, dtype=float)
+        elif self.paste_mode and self.clipboard is not None and self.clipboard.anchor is not None:
+            ref_pt = np.asarray(self.clipboard.anchor, dtype=float)
 
-        for item in candidates:
-            pt, desc = item[0], item[1]
-            try:
-                wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
-                if wz < 0.0 or wz > 1.0:
-                    continue
-                sx = wx / dpr
-                sy = (vp[3] - wy) / dpr
-                dist = math.hypot(sx - mx, sy - my)
-                if dist < min_screen_dist:
-                    min_screen_dist = dist
-                    best_pt = pt
-                    best_desc = desc
-            except Exception as exc:
-                _log.debug("Ошибка проекции целевой точки привязки при перетаскивании: %s", exc)
-
+        best_pt, best_label = self._find_magnetic_snap_point(
+            mx, my, exclude_panel=self.drag_panel, base_radius=24.0
+        )
         if best_pt is not None:
-            prefix = "🧲 [Ctrl] " if is_ctrl else ""
-            return best_pt, f"{prefix}{best_desc}"
+            out_pt = np.asarray(best_pt, dtype=float).copy()
+            if is_ortho and ref_pt is not None and self.drag_axis_lock is None:
+                if n_ax in (0, 1, 2):
+                    out_pt[int(n_ax)] = float(ref_pt[int(n_ax)])
+                else:
+                    out_pt = out_pt - float(np.dot(out_pt - ref_pt, cam_fwd)) * cam_fwd
+            return out_pt, best_label
 
         origin, ray_dir = self._mouse_ray(mx, my)
 
-        # Пересечение с поверхностью другой детали (с учётом Screen-Space BBox Cull, OBB и плоскости сечения)
-        min_t = float("inf")
-        hit_pt = None
-        hit_desc = ""
-        for block in self.blocks:
-            for p in block.panels:
-                if p is self.drag_panel:
-                    continue
-                if not self._panel_within_screen_radius(p, mx, my, 4.0, mvp, vp, dpr):
-                    continue
-                t_hit = self._intersect_ray_panel(origin, ray_dir, p)
-                if t_hit is not None and t_hit < min_t:
-                    cand_pt = origin + t_hit * ray_dir
-                    if plane is not None and not glmath.point_passes_clip_plane(
-                        float(cand_pt[0]), float(cand_pt[1]), float(cand_pt[2]), plane
-                    ):
+        # Пересечение с поверхностью другой детали (активно только при включённой магнитной привязке или с Ctrl)
+        if snap_active:
+            min_t = float("inf")
+            hit_pt = None
+            hit_desc = ""
+            for block in self.blocks:
+                for p in block.panels:
+                    if p is self.drag_panel:
                         continue
-                    min_t = t_hit
-                    hit_pt = cand_pt
-                    hit_desc = f"Поверхность [{p.name}]"
+                    if not self._panel_within_screen_radius(p, mx, my, 4.0, mvp, vp, dpr):
+                        continue
+                    t_hit = self._intersect_ray_panel(origin, ray_dir, p)
+                    if t_hit is not None and t_hit < min_t:
+                        cand_pt = origin + t_hit * ray_dir
+                        if plane is not None and not glmath.point_passes_clip_plane(
+                            float(cand_pt[0]), float(cand_pt[1]), float(cand_pt[2]), plane
+                        ):
+                            continue
+                        min_t = t_hit
+                        hit_pt = cand_pt
+                        prefix = "🧲 [Ctrl] " if is_ctrl else "🧲 "
+                        hit_desc = f"{prefix}Поверхность [{p.name}]"
 
-        if hit_pt is not None:
-            return hit_pt, hit_desc
+            if hit_pt is not None:
+                out_hit = np.asarray(hit_pt, dtype=float).copy()
+                if is_ortho and ref_pt is not None and self.drag_axis_lock is None:
+                    if n_ax in (0, 1, 2):
+                        out_hit[int(n_ax)] = float(ref_pt[int(n_ax)])
+                    else:
+                        out_hit = out_hit - float(np.dot(out_hit - ref_pt, cam_fwd)) * cam_fwd
+                return out_hit, hit_desc
 
-        # Пересечение с плоскостью пола Y=0
-        if abs(ray_dir[1]) > 1e-5:
-            t_floor = (0.0 - origin[1]) / ray_dir[1]
-            if t_floor > 0:
-                pt_floor = origin + t_floor * ray_dir
-                return pt_floor, "Плоскость пола (Y=0)"
-
-        # Плоскость на высоте базовой точки
-        if self.drag_base_point is not None and abs(ray_dir[1]) > 1e-5:
-            t_plane = (self.drag_base_point[1] - origin[1]) / ray_dir[1]
-            if t_plane > 0:
-                return origin + t_plane * ray_dir, "Свободное перемещение"
-
-        return origin + ray_dir * 500.0, "Пространство"
+        return glmath.project_ray_to_drag_plane(
+            origin,
+            ray_dir,
+            ref_pt,
+            is_ortho=is_ortho,
+            normal_axis=n_ax,
+            camera_forward=cam_fwd,
+            axis_lock=self.drag_axis_lock,
+            fallback_pivot=self._focus_reference_point(),
+        )
 
     def _draw_ghost_panel(self, p: Panel, dx: float, dy: float, dz: float):
         """Отрисовывает полупрозрачный 3D фантом панели со смещением (dx, dy, dz)."""
@@ -4280,42 +4202,10 @@ class Viewport3D(QOpenGLWidget):
             ax_only = active_axes[0]
             return self._apply_face_push_pull(panel, (ax_only, int(corner[ax_only])), mx, my)
 
-        # 1. Магнитная привязка к точкам других панелей сцены (как в _cursor_on_face_axis)
-        dpr = float(self.devicePixelRatioF())
-        vp = self._vp_size
-        mvp = self._mvp
-        is_ctrl = bool(getattr(self, "ctrl_held", False))
-        snap_radius = 52.0 if is_ctrl else 18.0
-        plane = self.current_section_plane()
-
-        best_snap_pt = None
-        best_snap_desc = ""
-        min_d = snap_radius
-        for block in self.blocks:
-            for other in block.panels:
-                if other is panel:
-                    continue
-                if not self._panel_within_screen_radius(other, mx, my, snap_radius, mvp, vp, dpr):
-                    continue
-                for item in self._collect_panel_snap_points(other, label_prefix=other.name):
-                    pt, desc = item[0], item[1]
-                    if plane is not None and not glmath.point_passes_clip_plane(
-                        float(pt[0]), float(pt[1]), float(pt[2]), plane
-                    ):
-                        continue
-                    try:
-                        wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
-                        if wz < 0.0 or wz > 1.0:
-                            continue
-                        sx_scr = wx / dpr
-                        sy_scr = (vp[3] - wy) / dpr
-                        dist = math.hypot(sx_scr - mx, sy_scr - my)
-                        if dist < min_d:
-                            min_d = dist
-                            best_snap_pt = pt
-                            best_snap_desc = desc
-                    except Exception as exc:
-                        _log.debug("Ошибка проекции точки магнита при вытягивании угла: %s", exc)
+        # 1. Магнитная привязка к точкам других панелей сцены (если включён «🧲 Магнит» или зажат [Ctrl])
+        best_snap_pt, best_snap_label = self._find_magnetic_snap_point(
+            mx, my, exclude_panel=panel, base_radius=18.0
+        )
 
         snapped_axes: set[int] = set()
         new_lens: dict[int, float] = {}
@@ -4329,7 +4219,7 @@ class Viewport3D(QOpenGLWidget):
                     new_lens[ax] = proj_len
                     snapped_axes.add(ax)
             if snapped_axes:
-                snap_desc = f"🧲 {best_snap_desc}"
+                snap_desc = best_snap_label
 
         # 2. Точная проекция луча мыши на рабочую плоскость плиты через grab_world
         origin, ray_dir = self._mouse_ray(mx, my)
@@ -4416,47 +4306,14 @@ class Viewport3D(QOpenGLWidget):
         if un > 1e-12:
             u = u / un
 
-        # Магнитная привязка к точкам других панелей сцены
-        dpr = float(self.devicePixelRatioF())
-        vp = self._vp_size
-        mvp = self._mvp
-        is_ctrl = bool(getattr(self, "ctrl_held", False))
-        snap_radius = 52.0 if is_ctrl else 18.0
-        plane = self.current_section_plane()
-
-        best_snap_pt = None
-        best_snap_desc = ""
-        min_d = snap_radius
-        for block in self.blocks:
-            for other in block.panels:
-                if other is panel:
-                    continue
-                if not self._panel_within_screen_radius(other, mx, my, snap_radius, mvp, vp, dpr):
-                    continue
-                for item in self._collect_panel_snap_points(other, label_prefix=other.name):
-                    pt, desc = item[0], item[1]
-                    if plane is not None and not glmath.point_passes_clip_plane(
-                        float(pt[0]), float(pt[1]), float(pt[2]), plane
-                    ):
-                        continue
-                    try:
-                        wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
-                        if wz < 0.0 or wz > 1.0:
-                            continue
-                        sx = wx / dpr
-                        sy = (vp[3] - wy) / dpr
-                        dist = math.hypot(sx - mx, sy - my)
-                        if dist < min_d:
-                            min_d = dist
-                            best_snap_pt = pt
-                            best_snap_desc = desc
-                    except Exception as exc:
-                        _log.debug("Ошибка проекции точки магнита при вытягивании грани: %s", exc)
-
+        # Магнитная привязка к точкам других панелей сцены (если включён «🧲 Магнит» или зажат [Ctrl])
+        best_snap_pt, best_snap_label = self._find_magnetic_snap_point(
+            mx, my, exclude_panel=panel, base_radius=18.0
+        )
         if best_snap_pt is not None:
             proj_len = float(np.dot(np.asarray(best_snap_pt, dtype=float) - fixed_pt, u))
             if proj_len >= 10.0:
-                return proj_len, f"🧲 {best_snap_desc}"
+                return proj_len, best_snap_label
 
         # Ближайшая точка на прямой F(s) = fixed_pt + s * u к лучу R(t) = origin + t * ray_dir
         origin, ray_dir = self._mouse_ray(mx, my)
@@ -4926,12 +4783,18 @@ class Viewport3D(QOpenGLWidget):
             if raw is None:
                 raw = self._ray_hit_workplane(event.pos().x(), event.pos().y())
             if raw is not None:
-                snapped = self._snap_point_to_grid(raw) if hasattr(self, "_snap_point_to_grid") else raw
+                is_mag_snap = bool(desc and desc.startswith("🧲"))
+                snapped = (
+                    raw
+                    if is_mag_snap
+                    else (self._snap_point_to_grid(raw) if hasattr(self, "_snap_point_to_grid") else raw)
+                )
                 self.paste_target_point = snapped
                 ax = self.clipboard.anchor
                 d = snapped - np.asarray(ax, dtype=float)
+                snap_str = f" | {desc}" if is_mag_snap else ""
                 self.fastener_message.emit(
-                    f"📋 Вставка Δ ({d[0]:.1f}, {d[1]:.1f}, {d[2]:.1f}) | клик — поставить, Esc — отмена"
+                    f"📋 Вставка Δ ({d[0]:.1f}, {d[1]:.1f}, {d[2]:.1f}){snap_str} | клик — поставить, Esc — отмена"
                 )
             self.update()
             return
@@ -4946,26 +4809,22 @@ class Viewport3D(QOpenGLWidget):
                 raw_target, self.drag_target_desc = self._find_target_snap_point(event.pos().x(), event.pos().y())
                 if self.drag_base_point is not None and raw_target is not None and self.drag_panel is not None:
                     delta = self._apply_axis_lock(raw_target - self.drag_base_point)
-                    delta, face_desc = self._face_to_face_snap(self.drag_panel, delta)
-                    self.drag_face_snap_desc = face_desc
+                    is_mag_snap = bool(self.drag_target_desc and self.drag_target_desc.startswith("🧲"))
+                    self.drag_face_snap_desc = self.drag_target_desc if is_mag_snap else ""
                     target = self.drag_base_point + delta
-                    if not face_desc:
+                    if not is_mag_snap:
                         snapped = self._snap_point_to_grid(target)
                         delta = snapped - self.drag_base_point
                         target = snapped
                     self.drag_target_point = target
-                    if face_desc:
-                        self.drag_target_desc = face_desc
                     dist = float(np.linalg.norm(delta))
                     axis_str = f" | ось [{self.drag_axis_lock}]" if self.drag_axis_lock else " | X/Y/Z — ось"
-                    face_str = " | 📐 грань" if face_desc else ""
                     grid_str = ""
-                    if self.grid_enabled and self.is_ortho and not face_desc:
+                    if self.grid_enabled and self.is_ortho and not is_mag_snap:
                         grid_str = f" | сетка {self.grid_step:g} мм"
-                    ctrl_str = " [🧲 Ctrl]" if getattr(self, "ctrl_held", False) else ""
                     msg = (
                         f"📍 ΔX={delta[0]:+.1f} ΔY={delta[1]:+.1f} ΔZ={delta[2]:+.1f} "
-                        f"(L={dist:.1f}) | {self.drag_target_desc}{face_str}{grid_str}{axis_str}{ctrl_str} | ЛКМ — OK"
+                        f"(L={dist:.1f}) | {self.drag_target_desc}{grid_str}{axis_str} | ЛКМ — OK"
                     )
                     self.fastener_message.emit(msg)
                 self.update()

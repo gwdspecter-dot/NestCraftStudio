@@ -199,6 +199,10 @@ class MainWindow(QMainWindow):
                     self.grid_step_combo.blockSignals(True)
                     self.grid_step_combo.setCurrentIndex(idx)
                     self.grid_step_combo.blockSignals(False)
+        if hasattr(self, "act_face_snap"):
+            self.act_face_snap.blockSignals(True)
+            self.act_face_snap.setChecked(bool(getattr(vp, "face_snap_enabled", True)))
+            self.act_face_snap.blockSignals(False)
         self._bind_undo_listener(vp)
         self._refresh_history_dock()
 
@@ -220,6 +224,10 @@ class MainWindow(QMainWindow):
                 self.act_live_collisions.blockSignals(True)
                 self.act_live_collisions.setChecked(bool(getattr(vp, "live_collision_mode", True)))
                 self.act_live_collisions.blockSignals(False)
+            if hasattr(self, "act_face_snap"):
+                self.act_face_snap.blockSignals(True)
+                self.act_face_snap.setChecked(bool(getattr(vp, "face_snap_enabled", True)))
+                self.act_face_snap.blockSignals(False)
 
     def _on_undo_stack_changed(self):
         self._refresh_history_dock()
@@ -1859,12 +1867,13 @@ class MainWindow(QMainWindow):
         self.act_grid.triggered.connect(self._toggle_grid)
         top_tb1.addAction(self.act_grid)
 
-        self.act_face_snap = QAction("📐 Грань↔грань", self)
+        self.act_face_snap = QAction("🧲 Магнит", self)
         self.act_face_snap.setCheckable(True)
         self.act_face_snap.setChecked(True)
         self.act_face_snap.setToolTip(
-            "При перемещении (G) притягивать панель гранью к грани другой детали. "
-            "Снимите галочку, чтобы отключить."
+            "Магнитная привязка (🧲) к точкам, рёбрам и граням других деталей "
+            "при перемещении (G), вставке (Ctrl+V) и растягивании торцов/углов.\n"
+            "Снимите галочку, чтобы отключить (или удерживайте Ctrl для временного магнита)."
         )
         self.act_face_snap.triggered.connect(self._toggle_face_snap)
         top_tb1.addAction(self.act_face_snap)
@@ -2066,6 +2075,7 @@ class MainWindow(QMainWindow):
         if not vp:
             return
         vp.face_snap_enabled = bool(checked)
+        vp.update()
 
     def _on_grid_step_changed(self, text: str):
         vp = self.workspace.current_viewport()

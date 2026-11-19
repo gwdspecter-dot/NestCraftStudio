@@ -520,4 +520,138 @@ def find_live_panel_collisions(
     return hits
 
 
+def constrain_drag_delta_to_view(
+    delta: np.ndarray | tuple[float, float, float] | list[float],
+    axis_lock: str | None = None,
+    is_ortho: bool = False,
+    normal_axis: int | None = None,
+    camera_forward: np.ndarray | tuple[float, float, float] | None = None,
+) -> np.ndarray:
+    """Ограничивает вектор перемещения `delta` выбранной осью (`X`/`Y`/`Z`) или плоскостью 2D-вида.
 
+    В ортографическом 2D-виде (`is_ortho=True`) без явно заданной оси `axis_lock` обнуляет
+    компоненту вдоль нормали плоскости вида (`normal_axis`: 2 в виде Спереди/Сзади, 0 Слева/Справа,
+    1 Сверху/Снизу), чтобы перетаскиваемая деталь никогда не смещалась по скрытой оси глубины.
+    """
+    d = np.asarray(delta, dtype=float).copy()
+    if axis_lock == "X":
+        d[1] = 0.0
+        d[2] = 0.0
+        return d
+    if axis_lock == "Y":
+        d[0] = 0.0
+        d[2] = 0.0
+        return d
+    if axis_lock == "Z":
+        d[0] = 0.0
+        d[1] = 0.0
+        return d
+
+    if is_ortho:
+        if normal_axis in (0, 1, 2):
+            d[int(normal_axis)] = 0.0
+        elif camera_forward is not None:
+            fwd = np.asarray(camera_forward, dtype=float)
+            fn = float(np.linalg.norm(fwd))
+            if fn > 1e-12:
+                fwd = fwd / fn
+                d = d - float(np.dot(d, fwd)) * fwd
+    return d
+
+
+def project_ray_to_drag_plane(
+    origin: np.ndarray | tuple[float, float, float],
+    ray_dir: np.ndarray | tuple[float, float, float],
+    ref_pt: np.ndarray | tuple[float, float, float] | None = None,
+    *,
+    is_ortho: bool = False,
+    normal_axis: int | None = None,
+    camera_forward: np.ndarray | tuple[float, float, float] | None = None,
+    axis_lock: str | None = None,
+    fallback_pivot: np.ndarray | tuple[float, float, float] | None = None,
+) -> tuple[np.ndarray, str]:
+    """Вычисляет целевую 3D-точку на рабочей плоскости перемещения по лучу курсора `(origin, ray_dir)`.
+
+    Исключает использование `origin + ray_dir * 500` от ближней плоскости отсечения (`z_near ≈ -8000 мм`),
+    из-за которого в 2D-видах панель улетала далеко от камеры по оси глубины.
+    """
+    o = np.asarray(origin, dtype=float)
+    v = np.asarray(ray_dir, dtype=float)
+    vn = float(np.linalg.norm(v))
+    if vn > 1e-12:
+        v = v / vn
+
+    anchor = (
+        np.asarray(ref_pt, dtype=float)
+        if ref_pt is not None
+        else (
+            np.asarray(fallback_pivot, dtype=float)
+            if fallback_pivot is not None
+            else np.zeros(3, dtype=float)
+        )
+    )
+
+    fwd = np.asarray(camera_forward, dtype=float) if camera_forward is not None else v
+    fn = float(np.linalg.norm(fwd))
+    if fn > 1e-12:
+        fwd = fwd / fn
+    else:
+        fwd = v
+
+    # 1. Ортографический 2D-вид: движение строго в плоскости вида, проходящей через опорную точку `anchor`
+    if is_ortho:
+        if normal_axis in (0, 1, 2):
+            n_ax = int(normal_axis)
+            dv = float(v[n_ax])
+            if abs(dv) > 1e-8:
+                t = (float(anchor[n_ax]) - float(o[n_ax])) / dv
+                pt = o + t * v
+            else:
+                pt = o.copy()
+            pt[n_ax] = float(anchor[n_ax])
+            return pt, "Плоскость 2D-вида"
+
+        denom = float(np.dot(v, fwd))
+        if abs(denom) > 1e-8:
+            t = float(np.dot(anchor - o, fwd)) / denom
+            return o + t * v, "Плоскость 2D-вида"
+        return o + float(np.dot(anchor - o, v)) * v, "Плоскость 2D-вида"
+
+    # 2. Перспективный 3D-вид при наличии базовой точки захвата `ref_pt`
+    if ref_pt is not None:
+        # При фиксации вертикальной оси Y или пологом взгляде используем картинную плоскость через `anchor`
+        if axis_lock == "Y" or abs(float(v[1])) <= 0.15:
+            denom = float(np.dot(v, fwd))
+            if abs(denom) > 1e-8:
+                t = float(np.dot(anchor - o, fwd)) / denom
+                if t > 0.0:
+                    return o + t * v, "Свободное перемещение"
+            return o + float(np.dot(anchor - o, v)) * v, "Свободное перемещение"
+
+        t_plane = (float(anchor[1]) - float(o[1])) / float(v[1])
+        if t_plane > 0.0:
+            pt_plane = o + t_plane * v
+            pt_plane[1] = float(anchor[1])
+            return pt_plane, "Свободное перемещение"
+
+        denom = float(np.dot(v, fwd))
+        if abs(denom) > 1e-8:
+            t = float(np.dot(anchor - o, fwd)) / denom
+            if t > 0.0:
+                return o + t * v, "Свободное перемещение"
+        return o + float(np.dot(anchor - o, v)) * v, "Свободное перемещение"
+
+    # 3. 3D-вид без базовой точки (например, выбор опорной точки буфера в пустом месте)
+    if abs(float(v[1])) > 1e-5:
+        t_floor = (0.0 - float(o[1])) / float(v[1])
+        if t_floor > 0.0:
+            pt_floor = o + t_floor * v
+            pt_floor[1] = 0.0
+            return pt_floor, "Плоскость пола (Y=0)"
+
+    denom = float(np.dot(v, fwd))
+    if abs(denom) > 1e-8:
+        t = float(np.dot(anchor - o, fwd)) / denom
+        if t > 0.0:
+            return o + t * v, "Пространство"
+    return o + max(0.0, float(np.dot(anchor - o, v))) * v, "Пространство"
