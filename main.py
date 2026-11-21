@@ -29,6 +29,7 @@ def main():
     fmt.setVersion(3, 3)
     fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
     fmt.setDepthBufferSize(24)
+    fmt.setStencilBufferSize(8)
     fmt.setSamples(4)
     QSurfaceFormat.setDefaultFormat(fmt)
 

@@ -175,12 +175,19 @@ class MainWindow(QMainWindow):
                 _log.debug("Сигнал вьюпорта ещё не был подключён (%s): %s", slot.__name__, exc)
             sig.connect(slot)
 
-        try:
-            vp.measurement_updated.disconnect(self._on_measurement_updated)
-        except (TypeError, AttributeError) as exc:
-            # Слот ещё не подключён или вьюпорт не поддерживает сигнал рулетки
-            _log.debug("Отключение measurement_updated пропущено: %s", exc)
-        vp.measurement_updated.connect(self._on_measurement_updated)
+        for sig_name, slot in (
+            ("measurement_updated", self._on_measurement_updated),
+            ("hole_navigated", self._on_hole_navigated),
+            ("hole_edit_requested", self._on_hole_edit_requested),
+        ):
+            sig = getattr(vp, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                sig.disconnect(slot)
+            except (TypeError, AttributeError) as exc:
+                _log.debug("Отключение %s пропущено: %s", sig_name, exc)
+            sig.connect(slot)
         if hasattr(self, "act_measure"):
             self.act_measure.setChecked(vp.measure_mode)
         if hasattr(self, "act_live_collisions"):
@@ -314,6 +321,10 @@ class MainWindow(QMainWindow):
             b.selected = False
             for p in getattr(b, "panels", []):
                 p.selected = str(getattr(p, "uid", "")) in {pa_uid, pb_uid}
+        if hasattr(vp, "set_assoc_preview_point"):
+            vp.set_assoc_preview_point(None)
+        if hasattr(vp, "set_active_hole_owner"):
+            vp.set_active_hole_owner(block, "joint", joint_uid)
         vp.update()
 
     def _on_joint_modified(self, block, joint_uid: str, old_state: dict, new_state: dict) -> None:
@@ -335,6 +346,8 @@ class MainWindow(QMainWindow):
         cmd = DeleteJointCommand(block, joint_uid, "Удаление стыка")
         vp.undo_stack.push(cmd, execute=True)
         self._refresh_structure()
+        if hasattr(vp, "set_active_hole_owner"):
+            vp.set_active_hole_owner(None)
         sel = vp.get_selected_panel()
         if sel is not None:
             self.properties_dock.show_object_properties(sel)
@@ -344,7 +357,7 @@ class MainWindow(QMainWindow):
         vp = self.workspace.current_viewport()
         if not vp or block is None:
             return
-        from core.assoc import AssocRef, face_point_world, panel_face_frame
+        from core.assoc import AssocRef, resolve_assoc_world_point
 
         ref = None
         for raw in getattr(block, "assoc_refs", None) or []:
@@ -362,20 +375,10 @@ class MainWindow(QMainWindow):
             b.selected = False
             for p in getattr(b, "panels", []):
                 p.selected = str(getattr(p, "uid", "")) in {t_uid, s_uid}
-        # Превью точки на грани source
-        source = block.get_panel_by_uid(s_uid) if hasattr(block, "get_panel_by_uid") else None
-        if source is not None and hasattr(vp, "set_assoc_preview_point"):
-            try:
-                u = float(ref.params.get("u") or 0.0)
-                v = float(ref.params.get("v") or 0.0)
-                inset = float(ref.params.get("inset") or 0.0)
-                _o, normal, _ua, _va = panel_face_frame(source, ref.source_face)
-                pt = face_point_world(source, ref.source_face, u, v)
-                if abs(inset) > 1e-9:
-                    pt = pt + (-inset) * normal
-                vp.set_assoc_preview_point((float(pt[0]), float(pt[1]), float(pt[2])))
-            except Exception:
-                vp.set_assoc_preview_point(None)
+        if hasattr(vp, "set_assoc_preview_point"):
+            vp.set_assoc_preview_point(resolve_assoc_world_point(block, ref))
+        if hasattr(vp, "set_active_hole_owner"):
+            vp.set_active_hole_owner(block, "assoc", assoc_uid)
         vp.update()
 
     def _on_assoc_modified(self, block, assoc_uid: str, old_state: dict, new_state: dict) -> None:
@@ -403,10 +406,77 @@ class MainWindow(QMainWindow):
             self.assoc_dock.load_assocs(vp.blocks)
         if hasattr(vp, "set_assoc_preview_point"):
             vp.set_assoc_preview_point(None)
+        if hasattr(vp, "set_active_hole_owner"):
+            vp.set_active_hole_owner(None)
         sel = vp.get_selected_panel()
         if sel is not None:
             self.properties_dock.show_object_properties(sel)
         vp.update()
+
+    def navigate_to_hole_owner(self, block, kind: str, owner_uid: str, panel=None) -> bool:
+        """Переходит от 3D-отверстия к его владельцу в док-панелях «Стыки», «Ассоциации» или «Свойства»."""
+        vp = self.workspace.current_viewport()
+        if vp is None:
+            return False
+
+        norm_kind = str(kind or "").strip()
+        uid = str(owner_uid or "").strip()
+
+        if norm_kind == "joint" and uid and hasattr(self, "joints_dock") and self.joints_dock is not None:
+            self.joints_dock.show()
+            self.joints_dock.raise_()
+            found = self.joints_dock.select_joint_by_uid(uid)
+            if not found:
+                self.joints_dock.load_joints(vp.blocks)
+                found = self.joints_dock.select_joint_by_uid(uid)
+            if found:
+                self._on_joint_selected(block, uid)
+                if hasattr(self, "statusBar") and self.statusBar() is not None:
+                    self.statusBar().showMessage("🔩 Переход к стыку в панели «Стыки»", 4000)
+                return True
+
+        if norm_kind == "assoc" and uid and hasattr(self, "assoc_dock") and self.assoc_dock is not None:
+            self.assoc_dock.show()
+            self.assoc_dock.raise_()
+            found = self.assoc_dock.select_assoc_by_uid(uid)
+            if not found:
+                self.assoc_dock.load_assocs(vp.blocks)
+                found = self.assoc_dock.select_assoc_by_uid(uid)
+            if found:
+                self._on_assoc_selected(block, uid)
+                if hasattr(self, "statusBar") and self.statusBar() is not None:
+                    self.statusBar().showMessage("🔗 Переход к ассоциации в панели «Ассоциации»", 4000)
+                return True
+
+        if panel is not None:
+            for b in vp.blocks:
+                b.selected = False
+                for p in getattr(b, "panels", []):
+                    p.selected = p is panel
+            if hasattr(vp, "set_assoc_preview_point"):
+                vp.set_assoc_preview_point(None)
+            if hasattr(vp, "set_active_hole_owner"):
+                vp.set_active_hole_owner(None)
+            self.properties_dock.show()
+            self.properties_dock.raise_()
+            self.properties_dock.show_object_properties(panel)
+            self.structure_dock.highlight_object(panel)
+            self._update_coord_boxes(panel.x, panel.y, panel.z)
+            vp.update()
+            if hasattr(self, "statusBar") and self.statusBar() is not None:
+                self.statusBar().showMessage(
+                    f"○ Ручное отверстие на детали «{getattr(panel, 'name', 'Панель')}»", 4000
+                )
+            return True
+        return False
+
+    def _on_hole_navigated(self, block, kind: str, owner_uid: str, panel=None) -> None:
+        self.navigate_to_hole_owner(block, kind, owner_uid, panel=panel)
+
+    def _on_hole_edit_requested(self, block, kind: str, owner_uid: str, panel=None) -> None:
+        self.navigate_to_hole_owner(block, kind, owner_uid, panel=panel)
+        if str(kind or "") == "assoc" and owner_uid and block is not None:
+            self._on_assoc_edit_dialog(block, str(owner_uid))
 
     def _on_assoc_edit_dialog(self, block, assoc_uid: str) -> None:
         """Полный диалог правки выбранной ассоциации."""
@@ -1367,7 +1437,14 @@ class MainWindow(QMainWindow):
             return
 
         # Конструктор параметрической фурнитуры
-        dlg = FastenerConstructorDialog(self)
+        sel_panel = vp.get_selected_panel() if hasattr(vp, "get_selected_panel") else None
+        panel_t = 16.0
+        if sel_panel is not None and hasattr(sel_panel, "material_thickness_mm"):
+            try:
+                panel_t = float(sel_panel.material_thickness_mm())
+            except (TypeError, ValueError):
+                panel_t = 16.0
+        dlg = FastenerConstructorDialog(self, panel_thickness=panel_t)
         if not dlg.exec():
             return
         chosen = dlg.selected_fastener() or {}
@@ -1971,6 +2048,17 @@ class MainWindow(QMainWindow):
         self.section_flip_btn.toggled.connect(self._on_section_flip_toggled)
         top_tb2.addWidget(self.section_flip_btn)
 
+        self.section_cap_btn = QToolButton()
+        self.section_cap_btn.setText("▤")
+        self.section_cap_btn.setCheckable(True)
+        self.section_cap_btn.setChecked(True)
+        self.section_cap_btn.setToolTip(
+            "Сплошная заглушка и штриховка среза (Stencil Cap)\n"
+            "Отключите для просмотра полого контура сечения"
+        )
+        self.section_cap_btn.toggled.connect(self._on_section_cap_toggled)
+        top_tb2.addWidget(self.section_cap_btn)
+
         self.section_slider = QSlider(Qt.Orientation.Horizontal)
         self.section_slider.setRange(0, 100)
         self.section_slider.setValue(50)
@@ -2131,6 +2219,12 @@ class MainWindow(QMainWindow):
             vp.set_section_ratio(vp.section_ratio)
         else:
             vp.update()
+
+    def _on_section_cap_toggled(self, checked: bool):
+        vp = self.workspace.current_viewport()
+        if not vp:
+            return
+        vp.toggle_section_cap(bool(checked))
 
     def _on_section_slider_changed(self, value: int):
         vp = self.workspace.current_viewport()

@@ -9,10 +9,12 @@ import tests.conftest as _conf
 
 _conf.pytest_configure(None)
 
+from core.assoc import AssocRef, capture_face_hint, freeze_assoc_ref_state
 from core.issues import (
     ISSUE_CHECKS,
     Issue,
     check,
+    check_broken_assocs_in_blocks,
     check_collisions_in_blocks,
     check_edge_width_in_blocks,
     check_fastener_issues_in_blocks,
@@ -256,6 +258,70 @@ def test_select_panel_by_uid_from_issue():
     assert win.vp.updated is True
 
 
+def test_broken_and_drifted_assocs_in_unified_issues():
+    """Проверка ассоциативных ссылок в ISSUE_CHECKS: missing panel, out_of_target, face_drifted, fixed."""
+    assert check_broken_assocs_in_blocks in ISSUE_CHECKS
+
+    b = Block("Корпус", "1", "01.00")
+    src = Panel("Боковина", 0, 0, 0, 16, 720, 560, uid="a-src", rebuild=False)
+    tgt = Panel("Полка", 16, 352, 0, 568, 16, 560, uid="a-tgt", rebuild=False)
+    b.panels = [src, tgt]
+
+    # 1. Здоровая ссылка -> 0 замечаний
+    ok_ref = AssocRef(
+        target_uid=tgt.uid,
+        source_uid=src.uid,
+        source_face="X+",
+        params={"u": 0.0, "v": 0.0, "diameter": 8.0, "depth": 12.0},
+        face_hint=capture_face_hint(src, "X+"),
+    )
+    b.assoc_refs = [ok_ref]
+    assert check_broken_assocs_in_blocks([b]) == []
+
+    # 2. Зафиксированная ссылка (fixed=True) даже после удаления source -> 0 замечаний
+    frozen = AssocRef.from_dict(freeze_assoc_ref_state(b, ok_ref))
+    b_fixed = Block("Фикс", "2", "02.00")
+    b_fixed.panels = [tgt]
+    b_fixed.assoc_refs = [frozen]
+    assert check_broken_assocs_in_blocks([b_fixed]) == []
+
+    # 3. Проблемные ссылки: удалённый source (error), выход за пределы target (warning), дрейф грани (warning)
+    missing_ref = AssocRef(
+        target_uid=tgt.uid,
+        source_uid="deleted-src-uid",
+        source_face="X+",
+        params={"u": 0.0, "v": 0.0, "diameter": 8.0, "depth": 12.0},
+    )
+    out_ref = AssocRef(
+        target_uid=tgt.uid,
+        source_uid=src.uid,
+        source_face="X+",
+        params={"u": 200.0, "v": 0.0, "diameter": 8.0, "depth": 12.0},
+    )
+    drifted_ref = AssocRef(
+        target_uid=tgt.uid,
+        source_uid=src.uid,
+        source_face="X+",
+        params={"u": 0.0, "v": 0.0, "diameter": 8.0, "depth": 12.0},
+        face_hint={"normal": (0.0, 0.0, 1.0)},  # нормаль не совпадает с текущей X+ (+1, 0, 0)
+    )
+    b.assoc_refs = [missing_ref, out_ref, drifted_ref]
+
+    issues = check_broken_assocs_in_blocks([b])
+    by_code = {i.code: i for i in issues}
+    assert "assoc_panel_missing" in by_code
+    assert by_code["assoc_panel_missing"].severity == "error"
+    assert by_code["assoc_panel_missing"].panel_uid == tgt.uid
+    assert "assoc_out_of_target" in by_code
+    assert by_code["assoc_out_of_target"].severity == "warning"
+    assert "assoc_face_drifted" in by_code
+    assert by_code["assoc_face_drifted"].severity == "warning"
+
+    # Входит в единый check_scene_issues([b])
+    all_codes = {i.code for i in check_scene_issues([b])}
+    assert {"assoc_panel_missing", "assoc_out_of_target", "assoc_face_drifted"}.issubset(all_codes)
+
+
 if __name__ == "__main__":
     import tempfile
 
@@ -268,4 +334,5 @@ if __name__ == "__main__":
     test_hole_in_groove_and_holes_intersection()
     test_panel_collision_and_oversized_panel_in_unified_check()
     test_select_panel_by_uid_from_issue()
+    test_broken_and_drifted_assocs_in_unified_issues()
     print("ALL 2.2 ISSUE TESTS PASSED")

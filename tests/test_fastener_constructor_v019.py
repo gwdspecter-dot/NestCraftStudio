@@ -116,3 +116,177 @@ def test_apply_joints_preserves_custom_constructor_params_across_serialization()
     for h_edge in shelf.holes:
         assert abs(h_edge[3] - 2.8) < 1e-6  # D2=5.6 -> radius=2.8
         assert abs(h_edge[4] - 45.0) < 1e-6  # H1=45.0
+
+
+def test_fastener_formulas_recalc_and_thickness_dependency():
+    from core.fastener_constructor import (
+        apply_fastener_cell_input,
+        recalculate_confirmat_row,
+    )
+
+    row = ConfirmatParams("Конфирмат формульный", d1=8.0, d2=5.0, h=50.0, h1=0.0)
+
+    ok, err = apply_fastener_cell_input(row, "d2", "=D1 - 3")
+    assert ok and not err
+    assert abs(row.d2 - 5.0) < 1e-6
+    assert row.formula_for("d2") == "D1 - 3"
+
+    ok, err = apply_fastener_cell_input(row, "h1", "H - t + 4", panel_thickness=16.0)
+    assert ok and not err
+    assert abs(row.h1 - 38.0) < 1e-6
+    assert row.formula_for("h1") == "H - t + 4"
+
+    # Меняем D1 и H — зависимые D2 и H1 пересчитываются автоматически
+    ok, err = apply_fastener_cell_input(row, "d1", "9,0")
+    assert ok and not err
+    assert abs(row.d1 - 9.0) < 1e-6
+    assert abs(row.d2 - 6.0) < 1e-6
+
+    ok, err = apply_fastener_cell_input(row, "h", "+= 20", panel_thickness=16.0)
+    assert ok and not err
+    assert abs(row.h - 70.0) < 1e-6
+    assert not row.has_formula("h")  # += одноразовое приращение
+    assert abs(row.h1 - 58.0) < 1e-6
+
+    # Динамический расчёт edge_depth и selected_dict для плиты 18 мм (t=18)
+    assert abs(row.edge_depth(18.0) - 56.0) < 1e-6
+    sel18 = row.to_selected_fastener_dict(panel_thickness=18.0)
+    assert abs(sel18["drill_edge_depth"] - 56.0) < 1e-6
+    assert sel18["formulas"]["h1"] == "H - t + 4"
+
+    # Пересчёт на плите 22 мм
+    errs = recalculate_confirmat_row(row, panel_thickness=22.0)
+    assert not errs
+    assert abs(row.h1 - 52.0) < 1e-6
+
+    # Ввод обычного числа снимает формулу с поля
+    ok, err = apply_fastener_cell_input(row, "h1", "44")
+    assert ok and not err
+    assert not row.has_formula("h1")
+    assert abs(row.h1 - 44.0) < 1e-6
+
+
+def test_fastener_formula_cycle_and_error_rollback():
+    from core.fastener_constructor import apply_fastener_cell_input, detect_formula_cycle
+
+    row = ConfirmatParams("Тест циклов", d1=8.0, d2=5.0, h=50.0, h1=38.0)
+    assert apply_fastener_cell_input(row, "d2", "=D1 - 3")[0]
+
+    # Прямой цикл D1 -> D2 -> D1 должен отклоняться с откатом
+    ok, err = apply_fastener_cell_input(row, "d1", "=D2 + 3")
+    assert not ok
+    assert "Цикл" in err
+    assert abs(row.d1 - 8.0) < 1e-6
+    assert not row.has_formula("d1")
+
+    # Самоссылка H1 = H1 + 2 должна отклоняться
+    ok2, err2 = apply_fastener_cell_input(row, "h1", "=H1 + 2")
+    assert not ok2
+    assert "Цикл" in err2
+    assert abs(row.h1 - 38.0) < 1e-6
+
+    # Деление на ноль и выход за границы не портят строку
+    ok3, _ = apply_fastener_cell_input(row, "h", "=50 / 0")
+    assert not ok3
+    assert abs(row.h - 50.0) < 1e-6
+
+    ok4, _ = apply_fastener_cell_input(row, "d1", "-5")
+    assert not ok4
+    assert abs(row.d1 - 8.0) < 1e-6
+
+    cyc = detect_formula_cycle({"d1": "d2 + 1", "d2": "d1 - 1"})
+    assert cyc is not None and len(cyc) >= 3
+
+
+def test_fastener_dirty_status_star_and_persistence_with_formulas():
+    import tempfile
+    from pathlib import Path
+
+    from core.fastener_constructor import (
+        apply_fastener_cell_input,
+        compute_rows_dirty_state,
+        format_constructor_title,
+        format_row_number_label,
+        validate_confirmat_row,
+    )
+
+    saved = [
+        ConfirmatParams("Базовый", 8.0, 5.0, 50.0, 38.0, formulas={"h1": "H - t + 4"}),
+    ]
+    current = [r.clone() for r in saved]
+
+    # Неизменённый список — чистый, даже при смене толщины плиты t в предпросмотре
+    is_dirty, dirty_rows = compute_rows_dirty_state(current, saved, panel_thickness=16.0)
+    assert not is_dirty and not dirty_rows
+    assert format_constructor_title("Конструктор", is_dirty) == "Конструктор"
+    assert format_row_number_label(0, False) == "1"
+
+    is_dirty18, dirty_rows18 = compute_rows_dirty_state(current, saved, panel_thickness=18.0)
+    assert not is_dirty18 and not dirty_rows18
+
+    # Меняем H — появляется статус * у заголовка и строки 0
+    assert apply_fastener_cell_input(current[0], "h", "70", panel_thickness=16.0)[0]
+    is_dirty, dirty_rows = compute_rows_dirty_state(current, saved, panel_thickness=16.0)
+    assert is_dirty and dirty_rows == {0}
+    assert format_constructor_title("Конструктор", is_dirty) == "Конструктор *"
+    assert format_row_number_label(0, True) == "1*"
+
+    # Откатываем H обратно к 50 — статус * пропадает
+    assert apply_fastener_cell_input(current[0], "h", "50", panel_thickness=16.0)[0]
+    is_dirty, dirty_rows = compute_rows_dirty_state(current, saved, panel_thickness=16.0)
+    assert not is_dirty and not dirty_rows
+
+    # Проверка инженерных предупреждений
+    warn_row = ConfirmatParams("Странный", d1=5.0, d2=8.0, h=40.0, h1=55.0)
+    warns = validate_confirmat_row(warn_row)
+    assert len(warns) == 2
+
+    # Round-trip сохранения и загрузки с формулами
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "fastener_formulas.json"
+        assert apply_fastener_cell_input(current[0], "d2", "=D1 - 3")[0]
+        save_confirmat_rows(current, selected_index=0, custom_path=store)
+        loaded, sel = load_confirmat_rows(custom_path=store)
+        assert sel == 0
+        assert loaded[0].formula_for("h1") == "H - t + 4"
+        assert loaded[0].formula_for("d2") == "D1 - 3"
+        assert abs(loaded[0].h1 - 38.0) < 1e-6
+
+
+def test_fastener_constructor_dialog_ast_wiring():
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "ui" / "fastener_constructor_dialog.py").read_text(encoding="utf-8")
+    tree = ast.parse(src, filename="ui/fastener_constructor_dialog.py")
+    cls_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+    fn_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+
+    assert "_FormulaCellDelegate" in cls_names
+    for fn in (
+        "_apply_row_cells",
+        "_refresh_dirty_state",
+        "_sync_formula_bar",
+        "_apply_formula_bar",
+        "_on_thickness_changed",
+        "_save_rows",
+        "_apply_theme",
+        "refresh_theme",
+        "showEvent",
+        "changeEvent",
+    ):
+        assert fn in fn_names, f"Missing {fn} in FastenerConstructorDialog"
+
+    # Убеждаемся, что при редактировании ячеек нет преждевременного _persist_rows
+    assert "_persist_rows" not in fn_names
+    assert "format_constructor_title" in src
+    assert "format_row_number_label" in src
+    assert "apply_fastener_cell_input" in src
+    # Обычные числовые ячейки не запекают жёсткий цвет текста (унаследуют цвет текущей темы)
+    assert "ForegroundRole, None" in src
+    # Светлая тема перекрашивает контуры и подпись H1 (#FDE68A -> #b45309) на SVG-схемах
+    assert '"#FDE68A": "#b45309"' in src
+    assert '"#E2F1FF": "#1e293b"' in src
+
+

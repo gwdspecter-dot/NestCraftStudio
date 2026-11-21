@@ -618,6 +618,32 @@ def check_broken_joints_in_blocks(blocks) -> list[Issue]:
     return issues
 
 
+def check_broken_assocs_in_blocks(blocks) -> list[Issue]:
+    """Ассоциативные ссылки с ошибками, дрейфом грани или выходом за габариты (face-attachments.md)."""
+    from core.assoc import AssocRef, evaluate_assoc_ref
+
+    issues: list[Issue] = []
+    for b in blocks or []:
+        for raw in getattr(b, "assoc_refs", None) or []:
+            ref = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
+            st = evaluate_assoc_ref(b, ref)
+            if st.severity == "ok":
+                continue
+            panel_uid = str(ref.target_uid or ref.source_uid or getattr(b, "uid", "") or "")
+            msg = st.message
+            if st.remedy:
+                msg = f"{msg} — {st.remedy}"
+            issues.append(
+                Issue(
+                    severity=st.severity,
+                    panel_uid=panel_uid,
+                    code=st.code or "assoc_broken",
+                    message=msg,
+                )
+            )
+    return issues
+
+
 # Реестр проверок модели: список функций check(blocks) -> list[Issue] (ревизия 2, п. 2.2)
 ISSUE_CHECKS: list[Callable[[list], list[Issue]]] = [
     check_missing_materials_in_blocks,
@@ -629,6 +655,7 @@ ISSUE_CHECKS: list[Callable[[list], list[Issue]]] = [
     check_holes_intersection_in_blocks,
     check_oversized_panels_in_blocks,
     check_broken_joints_in_blocks,
+    check_broken_assocs_in_blocks,
     check_collisions_in_blocks,
 ]
 

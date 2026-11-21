@@ -80,12 +80,122 @@ class TestRenderEngineV019(unittest.TestCase):
         self.assertGreater(z_far_far, 100000.0)
         self.assertGreater(z_near_far, 50.0)
 
-        # Ортографическая проекция — симметричный охват
+        # Ортографическая проекция — симметричный охват при 3-аргументном вызове
         ortho_near, ortho_far = glmath.compute_adaptive_clip_planes(
             zoom=-1800.0, is_ortho=True, scene_radius=2000.0
         )
         self.assertEqual(ortho_near, -ortho_far)
         self.assertGreaterEqual(ortho_far, 2000.0)
+
+        # Сферический fallback при камере снаружи сферы подтягивает z_near к передней границе
+        z_near_ext, z_far_ext = glmath.compute_adaptive_clip_planes(
+            zoom=-5000.0, is_ortho=False, scene_radius=1000.0
+        )
+        self.assertGreater(z_near_ext, 2500.0)
+        self.assertLess(z_far_ext / z_near_ext, 3.0)
+
+    def test_view_space_depth_bounds_and_tight_clip_planes(self):
+        """Точный обжим z_near / z_far по view_matrix: высокая точность Z-буфера снаружи,
+        безопасный пол внутри шкафа, невырожденный Persp<->Ortho переход и учёт OBB повёрнутых деталей.
+        """
+        import numpy as np
+        from models.panel import Panel
+        from ui.viewcube import ORTHO_HALF_TAN, blend_projection_matrices
+
+        Panel._controller_unbound = True
+        try:
+            # Стандартный корпус 600×720×560 у начала координат + скрытая панель вдалеке
+            p_left = Panel("Левая", 0.0, 0.0, 0.0, 16.0, 720.0, 560.0, rebuild=False)
+            p_right = Panel("Правая", 584.0, 0.0, 0.0, 16.0, 720.0, 560.0, rebuild=False)
+            p_hidden = Panel("Скрытая", 50000.0, 0.0, 0.0, 16.0, 720.0, 560.0, rebuild=False)
+            p_hidden.visible = False
+
+            # Камера в изометрии на zoom=-1800, наведена на центр корпуса (300, 360, 280)
+            rot = glmath.mul(glmath.rotate_x(25.0), glmath.rotate_y(-35.0))
+            center_v = rot @ np.array([300.0, 360.0, 280.0, 1.0], dtype=float)
+            view = glmath.mul(
+                glmath.translate(-float(center_v[0]), -float(center_v[1]), -1800.0),
+                rot,
+            )
+
+            bounds = glmath.compute_scene_view_depth_bounds([p_left, p_right, p_hidden], view)
+            self.assertIsNotNone(bounds)
+            d_min, d_max = bounds
+            # Скрытая панель на x=50000 не должна влиять; d_min/d_max совпадают с точным перебором всех углов
+            all_ds = []
+            for p in (p_left, p_right):
+                for c in p.world_corners():
+                    vpt = view @ np.array([float(c[0]), float(c[1]), float(c[2]), 1.0], dtype=float)
+                    all_ds.append(-float(vpt[2]))
+            self.assertAlmostEqual(d_min, min(all_ds), places=3)
+            self.assertAlmostEqual(d_max, max(all_ds), places=3)
+            self.assertGreater(d_min, 700.0)
+            self.assertLess(d_max, 2800.0)
+
+            z_near, z_far = glmath.compute_adaptive_clip_planes(
+                zoom=-1800.0, is_ortho=False, scene_radius=1200.0, view_depth_bounds=bounds
+            )
+            # Ни одна видимая вершина не обрезается, при этом отношение z_far/z_near < 4 (против >40 раньше)
+            self.assertLess(z_near, d_min - 35.0)
+            self.assertGreater(z_far, d_max + 150.0)
+            self.assertLess(z_far / z_near, 4.0)
+
+            # Повёрнутая на 45° деталь: OBB-проекция через world_corners() точнее, чем грубый AABB
+            p_rot = Panel("Диагональ", 0.0, 0.0, 0.0, 16.0, 100.0, 600.0, rebuild=False)
+            p_rot.ry = 45.0
+            view_front = glmath.translate(0.0, 0.0, -2000.0)
+            rot_bounds = glmath.compute_scene_view_depth_bounds([p_rot], view_front)
+            self.assertIsNotNone(rot_bounds)
+            corners = p_rot.world_corners()
+            expected_ds = [2000.0 - float(c[2]) for c in corners]
+            self.assertAlmostEqual(rot_bounds[0], min(expected_ds), places=3)
+            self.assertAlmostEqual(rot_bounds[1], max(expected_ds), places=3)
+
+            # Камера внутри шкафа (d_min < 0 < d_max): z_near строго положительный и держит max_depth_ratio
+            z_near_in, z_far_in = glmath.compute_adaptive_clip_planes(
+                zoom=-120.0, is_ortho=False, view_depth_bounds=(-250.0, 900.0), max_depth_ratio=5000.0
+            )
+            self.assertGreaterEqual(z_near_in, 0.5)
+            self.assertGreater(z_far_in, 900.0)
+            self.assertLessEqual(z_far_in / z_near_in, 5000.0 + 1e-6)
+
+            # Вся геометрия за спиной камеры (d_max <= 0): валидный положительный frustum
+            z_near_back, z_far_back = glmath.compute_adaptive_clip_planes(
+                zoom=-500.0, is_ortho=False, view_depth_bounds=(-1200.0, -50.0)
+            )
+            self.assertGreater(z_near_back, 0.0)
+            self.assertGreater(z_far_back, z_near_back)
+
+            # Ортографический режим с view_depth_bounds: плотный охват без обрезки, даже если d_min < 0
+            o_near, o_far = glmath.compute_adaptive_clip_planes(
+                zoom=-1200.0, is_ortho=True, view_depth_bounds=(-400.0, 1600.0)
+            )
+            self.assertLess(o_near, -400.0)
+            self.assertGreater(o_far, 1600.0)
+            self.assertLess(o_far - o_near, 4000.0)
+
+            # Плавный переход Persp <-> Ortho: раздельные (z_near_p, z_far_p) и (z_near_o, z_far_o)
+            # гарантируют отсутствие обрезки и инверсии на всех шагах анимации ortho_blend ∈ [0..1]
+            z_np, z_fp = glmath.compute_adaptive_clip_planes(
+                zoom=-1800.0, is_ortho=False, view_depth_bounds=bounds
+            )
+            z_no, z_fo = glmath.compute_adaptive_clip_planes(
+                zoom=-1800.0, is_ortho=True, view_depth_bounds=bounds
+            )
+            scale = 1800.0 * ORTHO_HALF_TAN
+            aspect = 16.0 / 9.0
+            proj_p = glmath.perspective(45.0, aspect, z_np, z_fp)
+            proj_o = glmath.ortho(-scale * aspect, scale * aspect, -scale, scale, z_no, z_fo)
+            for b in (0.0, 0.25, 0.5, 0.75, 1.0):
+                proj_b = blend_projection_matrices(proj_p, proj_o, b, -1800.0)
+                for d_sample in (d_min, 0.5 * (d_min + d_max), d_max):
+                    clip = proj_b @ np.array([0.0, 0.0, -d_sample, 1.0], dtype=float)
+                    self.assertGreater(float(clip[3]), 0.0)
+                    ndc_z = float(clip[2]) / float(clip[3])
+                    self.assertGreaterEqual(ndc_z, -1.0)
+                    self.assertLessEqual(ndc_z, 1.0)
+        finally:
+            Panel._controller_unbound = False
 
     def test_viewport_shader_has_studio_lights_and_polygon_offset(self):
         """Проверяем наличие dFdx/dFdy, uKeyDir/uFillDir, _scene_bounding_radius по self.blocks и _apply_studio_light_uniforms."""
@@ -101,6 +211,8 @@ class TestRenderEngineV019(unittest.TestCase):
         self.assertIn("uniform vec3 uFillDir;", src)
         self.assertIn("def _apply_studio_light_uniforms", src)
         self.assertIn("compute_adaptive_clip_planes", src)
+        self.assertIn("def _scene_view_depth_bounds", src)
+        self.assertIn("view_depth_bounds=", src)
         self.assertIn('blocks = getattr(self, "blocks", None)', src)
         self.assertIn("def panels(self)", src)
         # Пакет 3: Screen-Space BBox Cull, кэш точек привязки и удержание VAO/VBO без мигания

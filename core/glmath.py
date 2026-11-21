@@ -110,26 +110,166 @@ def unproject(win_x: float, win_y: float, win_z: float, mvp: np.ndarray,
     return (world[:3] / world[3]).astype(float)
 
 
+def compute_scene_view_depth_bounds(
+    panels: list[Any] | tuple[Any, ...],
+    view_matrix: Any,
+    extra_aabbs: list[tuple[tuple[float, float, float], tuple[float, float, float]]] | None = None,
+) -> tuple[float, float] | None:
+    """Точный диапазон глубин `[d_min, d_max]` видимой геометрии вдоль оси взгляда камеры.
+
+    В правостороннем пространстве камеры OpenGL (камера смотрит вдоль `-Z`) глубина
+    точки перед камерой равна `d = -z_view = -(V[2,0]*x + V[2,1]*y + V[2,2]*z + V[2,3])`.
+    - Для неповёрнутых панелей используется точная O(1) опорная проекция AABB на вектор взгляда;
+    - Для повёрнутых панелей (`rx/ry/rz ≠ 0`) проецируются реальные 8 углов OBB (`world_corners()`),
+      чтобы не раздувать диапазон на диагональных деталях;
+    - Возвращает `None`, если видимых элементов нет (fallback на сферический `scene_radius`).
+    """
+    row2 = view_matrix[2]
+    fx = -float(row2[0])
+    fy = -float(row2[1])
+    fz = -float(row2[2])
+    d0 = -float(row2[3])
+
+    d_min = float("inf")
+    d_max = float("-inf")
+
+    def _extend_aabb(mn: tuple[float, float, float], mx: tuple[float, float, float]) -> None:
+        nonlocal d_min, d_max
+        x0, y0, z0 = float(mn[0]), float(mn[1]), float(mn[2])
+        x1, y1, z1 = float(mx[0]), float(mx[1]), float(mx[2])
+        if x0 > x1:
+            x0, x1 = x1, x0
+        if y0 > y1:
+            y0, y1 = y1, y0
+        if z0 > z1:
+            z0, z1 = z1, z0
+        lo = (
+            d0
+            + (fx * x0 if fx >= 0.0 else fx * x1)
+            + (fy * y0 if fy >= 0.0 else fy * y1)
+            + (fz * z0 if fz >= 0.0 else fz * z1)
+        )
+        hi = (
+            d0
+            + (fx * x1 if fx >= 0.0 else fx * x0)
+            + (fy * y1 if fy >= 0.0 else fy * y0)
+            + (fz * z1 if fz >= 0.0 else fz * z0)
+        )
+        if lo < d_min:
+            d_min = lo
+        if hi > d_max:
+            d_max = hi
+
+    for p in panels or ():
+        if p is None or not getattr(p, "visible", True):
+            continue
+        is_rot = (
+            abs(float(getattr(p, "rx", 0.0))) > 1e-6
+            or abs(float(getattr(p, "ry", 0.0))) > 1e-6
+            or abs(float(getattr(p, "rz", 0.0))) > 1e-6
+        )
+        if is_rot and hasattr(p, "world_corners"):
+            corners = p.world_corners()
+            if corners:
+                for c in corners:
+                    d = d0 + fx * float(c[0]) + fy * float(c[1]) + fz * float(c[2])
+                    if d < d_min:
+                        d_min = d
+                    if d > d_max:
+                        d_max = d
+                continue
+        if hasattr(p, "world_aabb"):
+            mn, mx = p.world_aabb()
+            _extend_aabb(mn, mx)
+        else:
+            x0, y0, z0 = float(p.x), float(p.y), float(p.z)
+            _extend_aabb((x0, y0, z0), (x0 + float(p.width), y0 + float(p.height), z0 + float(p.depth)))
+
+    if extra_aabbs:
+        for mn, mx in extra_aabbs:
+            _extend_aabb(mn, mx)
+
+    if not (math.isfinite(d_min) and math.isfinite(d_max)) or d_min > d_max:
+        return None
+    return (d_min, d_max)
+
+
 def compute_adaptive_clip_planes(
     zoom: float,
     is_ortho: bool,
     scene_radius: float = 0.0,
+    view_depth_bounds: tuple[float, float] | None = None,
+    max_depth_ratio: float = 10000.0,
 ) -> tuple[float, float]:
-    """Вычисляет адаптивные плоскости отсечения `(z_near, z_far)` под текущий зум и габарит сцены.
+    """Вычисляет адаптивные плоскости отсечения `(z_near, z_far)` под текущий зум,
+    габарит сцены и (опционально) точный диапазон глубин в пространстве камеры.
 
-    По принципу QymCAD (`ProjParams` / `parts_far_apart_draw_clean`):
-    - не раздувает диапазон Z-буфера до фиксированных ±50 000 мм на близких планах,
-      повышая точность буфера глубины на тонких кромках и отверстиях в 10–15 раз;
-    - автоматически расширяет диапазон при отдалении камеры или большой сцене.
+    Принципы (SolidCraft / QymCAD):
+    - При передаче `view_depth_bounds = (d_min, d_max)` из `compute_scene_view_depth_bounds`
+      плоскости плотно обжимают реальный диапазон видимых деталей вдоль оси взгляда:
+      * в перспективе `z_near` подтягивается вплотную к ближайшей видимой грани (с безопасным
+        зазором под гизмо/рёбра/превью), уменьшая отношение `z_far / z_near` в 10–30 раз
+        и устраняя z-fighting на тонких 4 мм задниках, кромках и отверстиях;
+      * при влёте камеры внутрь шкафа (`d_min <= min_near`) `z_near` опускается до безопасного
+        положительного порога с контролем `max_depth_ratio` для 24-битного Z-буфера;
+      * в ортографической проекции интервал сжимается вокруг `[d_min, d_max]` без обрезки
+        удалённых от `(0,0,0)` модулей.
+    - Без `view_depth_bounds` сохраняется обратная совместимость с 3-аргументным вызовом
+      по `scene_radius` (симметричный охват в ортографии + обжатие `z_near` снаружи сферы).
     """
     cam_dist = max(50.0, abs(float(zoom)))
-    extent = max(1500.0, float(scene_radius) * 1.6, cam_dist * 1.8)
+    radius = max(0.0, float(scene_radius))
+    max_ratio = max(100.0, float(max_depth_ratio))
+
+    if view_depth_bounds is not None:
+        d_min = float(view_depth_bounds[0])
+        d_max = float(view_depth_bounds[1])
+        if math.isfinite(d_min) and math.isfinite(d_max):
+            if d_min > d_max:
+                d_min, d_max = d_max, d_min
+            span = max(100.0, d_max - d_min)
+
+            if is_ortho:
+                pad = max(250.0, span * 0.20, cam_dist * 0.10)
+                return (d_min - pad, d_max + pad)
+
+            # Перспектива: вся геометрия за спиной камеры — держим валидный frustum перед камерой
+            if d_max <= 1.0:
+                z_far = max(2000.0, cam_dist * 3.0)
+                z_near = max(1.0, min(250.0, cam_dist * 0.02), z_far / max_ratio)
+                return (z_near, max(z_far, z_near * 10.0))
+
+            far_pad = max(200.0, span * 0.25, cam_dist * 0.20)
+            z_far = max(d_max, cam_dist) + far_pad
+
+            # Нижний порог z_near при осмотре изнутри сцены с защитой точности 24-bit Z-buffer
+            floor_near = max(0.5, min(20.0, cam_dist * 0.015))
+            min_near = max(floor_near, z_far / max_ratio)
+
+            # Подтягиваем z_near к ближайшей грани с зазором 40 мм / 10% под гизмо сечения и рёбра
+            near_from_scene = min(d_min * 0.90, d_min - 40.0)
+            z_near = near_from_scene if near_from_scene > min_near else min_near
+
+            if z_far < z_near * 1.25 + 100.0:
+                z_far = z_near * 1.25 + 100.0
+            return (z_near, z_far)
+
+    # Fallback по сферическому радиусу сцены (обратная совместимость 3-аргументного вызова)
     if is_ortho:
-        half_depth = max(3500.0, cam_dist * 2.5 + extent)
+        half_depth = max(2000.0, cam_dist + radius * 1.5, radius * 2.0)
         return (-half_depth, half_depth)
 
-    z_near = max(2.0, min(250.0, cam_dist * 0.04))
-    z_far = max(z_near * 60.0, cam_dist + extent * 2.5)
+    if radius > 0.0 and cam_dist > radius * 1.15:
+        z_far = max(1500.0, cam_dist + radius * 1.6, cam_dist * 2.0)
+        min_near = max(1.0, min(250.0, cam_dist * 0.03), z_far / max_ratio)
+        z_near = max(min_near, (cam_dist - radius) * 0.85)
+        if z_far < z_near * 1.25 + 100.0:
+            z_far = z_near * 1.25 + 100.0
+        return (z_near, z_far)
+
+    z_far = max(1500.0, cam_dist + radius * 2.2, cam_dist * 3.0)
+    z_near = max(1.0, min(250.0, cam_dist * 0.03), z_far / max_ratio)
+    z_far = max(z_far, z_near * 60.0)
     return (z_near, z_far)
 
 
@@ -280,6 +420,237 @@ def compute_scene_axis_bounds(
         defaults = {"X": (0.0, 600.0), "Y": (0.0, 820.0), "Z": (0.0, 560.0)}
         return defaults.get(str(axis or "Z").upper(), (0.0, 600.0))
     return (lo, hi)
+
+
+def panel_intersects_section_plane(
+    panel: Any,
+    axis: str,
+    offset: float,
+    eps: float = 0.05,
+) -> bool:
+    """True, если видимая панель строго пересекается секущей плоскостью `axis == offset`.
+
+    Исключает касательные грани (`<= eps`), чтобы не тратить stencil-проход на неразрезанные
+    детали и не вызывать z-fighting на совпадающих с плоскостью гранях.
+    """
+    if panel is None or not getattr(panel, "visible", True):
+        return False
+    ax_idx = {"X": 0, "Y": 1, "Z": 2}.get(str(axis or "Z").upper(), 2)
+    if hasattr(panel, "world_aabb"):
+        mn, mx = panel.world_aabb()
+        c_lo, c_hi = float(mn[ax_idx]), float(mx[ax_idx])
+    else:
+        coords = (
+            (float(panel.x), float(panel.x) + float(panel.width)),
+            (float(panel.y), float(panel.y) + float(panel.height)),
+            (float(panel.z), float(panel.z) + float(panel.depth)),
+        )[ax_idx]
+        c_lo, c_hi = min(coords), max(coords)
+    off = float(offset)
+    tol = max(0.0, float(eps))
+    return c_lo < (off - tol) and c_hi > (off + tol)
+
+
+def compute_section_cap_quad(
+    axis: str,
+    offset: float,
+    flip: bool,
+    bounds_min: tuple[float, float, float],
+    bounds_max: tuple[float, float, float],
+    pad: float = 20.0,
+) -> tuple[
+    list[tuple[float, float, float]],
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    """Строит 2 треугольника (6 вершин) заглушки сечения в плоскости `axis == offset`.
+
+    Ориентация вершин (CCW) строго согласована с внешней нормалью среза `cap_normal = -n_keep`,
+    благодаря чему `GL_CULL_FACE` (GL_BACK) автоматически скрывает заглушку при взгляде
+    с неразрезанной стороны модели.
+
+    Возвращает `(verts_6, cap_normal, u_axis, v_axis)`, где `(u_axis, v_axis, cap_normal)` —
+    правый ортонормированный базис плоскости среза.
+    """
+    ax = str(axis or "Z").upper()
+    off = float(offset)
+    p = float(pad)
+    x0 = min(float(bounds_min[0]), float(bounds_max[0])) - p
+    x1 = max(float(bounds_min[0]), float(bounds_max[0])) + p
+    y0 = min(float(bounds_min[1]), float(bounds_max[1])) - p
+    y1 = max(float(bounds_min[1]), float(bounds_max[1])) + p
+    z0 = min(float(bounds_min[2]), float(bounds_max[2])) - p
+    z1 = max(float(bounds_min[2]), float(bounds_max[2])) + p
+
+    if ax == "X":
+        if not flip:
+            cap_normal = (1.0, 0.0, 0.0)
+            u_axis = (0.0, 1.0, 0.0)
+            v_axis = (0.0, 0.0, 1.0)
+            c0 = (off, y0, z0)
+            c1 = (off, y1, z0)
+            c2 = (off, y1, z1)
+            c3 = (off, y0, z1)
+        else:
+            cap_normal = (-1.0, 0.0, 0.0)
+            u_axis = (0.0, 0.0, 1.0)
+            v_axis = (0.0, 1.0, 0.0)
+            c0 = (off, y0, z0)
+            c1 = (off, y0, z1)
+            c2 = (off, y1, z1)
+            c3 = (off, y1, z0)
+    elif ax == "Y":
+        if not flip:
+            cap_normal = (0.0, 1.0, 0.0)
+            u_axis = (0.0, 0.0, 1.0)
+            v_axis = (1.0, 0.0, 0.0)
+            c0 = (x0, off, z0)
+            c1 = (x0, off, z1)
+            c2 = (x1, off, z1)
+            c3 = (x1, off, z0)
+        else:
+            cap_normal = (0.0, -1.0, 0.0)
+            u_axis = (1.0, 0.0, 0.0)
+            v_axis = (0.0, 0.0, 1.0)
+            c0 = (x0, off, z0)
+            c1 = (x1, off, z0)
+            c2 = (x1, off, z1)
+            c3 = (x0, off, z1)
+    else:
+        if not flip:
+            cap_normal = (0.0, 0.0, 1.0)
+            u_axis = (1.0, 0.0, 0.0)
+            v_axis = (0.0, 1.0, 0.0)
+            c0 = (x0, y0, off)
+            c1 = (x1, y0, off)
+            c2 = (x1, y1, off)
+            c3 = (x0, y1, off)
+        else:
+            cap_normal = (0.0, 0.0, -1.0)
+            u_axis = (0.0, 1.0, 0.0)
+            v_axis = (1.0, 0.0, 0.0)
+            c0 = (x0, y0, off)
+            c1 = (x0, y1, off)
+            c2 = (x1, y1, off)
+            c3 = (x1, y0, off)
+
+    verts_6 = [c0, c1, c2, c0, c2, c3]
+    return verts_6, cap_normal, u_axis, v_axis
+
+
+def compute_section_cap_style(
+    panel: Any,
+    panel_index: int = 0,
+    is_selected: bool = False,
+    is_colliding: bool = False,
+) -> dict[str, Any]:
+    """Вычисляет инженерный стиль заглушки среза детали (цвет среза, контраст и шаг/угол штриховки).
+
+    - Разные ориентации плит (вертикаль / горизонталь / фронт-задник) получают встречные
+      углы штриховки (как на машиностроительных/мебельных чертежах), чтобы стыки были чётко видны;
+    - Шаг штриховки адаптируется под толщину материала (ХДФ ≤ 6.5 мм — частый 4.5 мм,
+      ЛДСП 16–22 мм — 8.0 мм, толстые плиты/столешницы > 22 мм — 12.0 мм);
+    - На тёмных декорах (Венге, Антрацит) линии штриховки автоматически светлее фона.
+    """
+    raw_tax = getattr(panel, "thickness_axis", -1)
+    if isinstance(raw_tax, str):
+        tax = {"X": 0, "Y": 1, "Z": 2}.get(raw_tax.upper(), -1)
+    else:
+        try:
+            tax = int(raw_tax)
+        except (TypeError, ValueError):
+            tax = -1
+
+    dims = (
+        abs(float(getattr(panel, "width", 16.0))),
+        abs(float(getattr(panel, "height", 16.0))),
+        abs(float(getattr(panel, "depth", 16.0))),
+    )
+    if tax not in (0, 1, 2):
+        tax = min(range(3), key=lambda i: dims[i])
+
+    raw_th = getattr(panel, "thickness", None)
+    if raw_th is not None:
+        try:
+            thickness_mm = abs(float(raw_th))
+        except (TypeError, ValueError):
+            thickness_mm = dims[tax]
+    else:
+        thickness_mm = dims[tax]
+    if thickness_mm <= 0.1:
+        thickness_mm = dims[tax] if dims[tax] > 0.1 else 16.0
+
+    # Углы штриховки: вертикальные (45°/60°), горизонтальные (135°/120°), фронтальные/ХДФ (25°/155°)
+    alt = int(panel_index) % 2
+    angle_table = {
+        0: (45.0, 60.0),
+        1: (135.0, 120.0),
+        2: (25.0, 155.0),
+    }
+    angle_deg = angle_table[tax][alt]
+    rad = math.radians(angle_deg)
+    hatch_dir = (math.cos(rad), math.sin(rad))
+
+    if thickness_mm <= 6.5:
+        spacing_mm = 4.5
+    elif thickness_mm <= 22.0:
+        spacing_mm = 8.0
+    else:
+        spacing_mm = 12.0
+
+    raw_col = getattr(panel, "color", (0.85, 0.80, 0.72))
+    try:
+        br, bg, bb = float(raw_col[0]), float(raw_col[1]), float(raw_col[2])
+    except (TypeError, ValueError, IndexError):
+        br, bg, bb = 0.85, 0.80, 0.72
+    br = min(1.0, max(0.0, br))
+    bg = min(1.0, max(0.0, bg))
+    bb = min(1.0, max(0.0, bb))
+
+    if is_colliding:
+        cap_color = (0.96, 0.36, 0.38)
+        hatch_color = (0.52, 0.06, 0.10)
+    elif is_selected:
+        cap_color = (0.95, 0.72, 0.62)
+        hatch_color = (0.58, 0.22, 0.14)
+    else:
+        # Тёплый тон внутреннего распила плиты с сохранением характера декора панели
+        core_r, core_g, core_b = 0.88, 0.73, 0.54
+        mix_k = 0.34
+        cr = br * (1.0 - mix_k) + core_r * mix_k
+        cg = bg * (1.0 - mix_k) + core_g * mix_k
+        cb = bb * (1.0 - mix_k) + core_b * mix_k
+        cap_color = (
+            min(1.0, max(0.0, cr)),
+            min(1.0, max(0.0, cg)),
+            min(1.0, max(0.0, cb)),
+        )
+        luma = 0.299 * cap_color[0] + 0.587 * cap_color[1] + 0.114 * cap_color[2]
+        if luma < 0.42:
+            # Тёмный материал (Венге/Антрацит) — светлые контрастные штрихи
+            hatch_color = (
+                min(1.0, cap_color[0] * 0.45 + 0.48),
+                min(1.0, cap_color[1] * 0.45 + 0.46),
+                min(1.0, cap_color[2] * 0.45 + 0.42),
+            )
+        else:
+            # Светлый/средний материал — тёмные графитовые/древесные штрихи
+            hatch_color = (
+                max(0.0, cap_color[0] * 0.40),
+                max(0.0, cap_color[1] * 0.38),
+                max(0.0, cap_color[2] * 0.35),
+            )
+
+    return {
+        "cap_color": cap_color,
+        "hatch_color": hatch_color,
+        "hatch_angle_deg": angle_deg,
+        "hatch_dir": hatch_dir,
+        "hatch_spacing_mm": spacing_mm,
+        "thickness_axis": tax,
+        "thickness_mm": thickness_mm,
+    }
 
 
 def compute_panel_face_handles(

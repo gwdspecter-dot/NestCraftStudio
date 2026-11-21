@@ -14,7 +14,15 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from core.assoc import FACE_NAMES, AssocRef, face_point_world, panel_face_frame
+from core.assoc import (
+    ANCHOR_LABELS,
+    ANCHOR_MODES,
+    FACE_NAMES,
+    AssocRef,
+    capture_face_hint,
+    evaluate_assoc_ref_panels,
+    resolve_assoc_world_point,
+)
 from ui.dialogs import SmartDoubleSpinBox
 
 
@@ -67,6 +75,11 @@ class AssocRefDialog(QDialog):
             self.face_combo.setCurrentIndex(idx_xp)
         form.addRow("Грань source:", self.face_combo)
 
+        self.anchor_combo = QComboBox()
+        for mode in ANCHOR_MODES:
+            self.anchor_combo.addItem(ANCHOR_LABELS.get(mode, mode), mode)
+        form.addRow("Якорь на грани:", self.anchor_combo)
+
         ctx = target_panel
         self.u_spin = self._spin(0.0, -5000.0, 5000.0, ctx)
         self.v_spin = self._spin(0.0, -5000.0, 5000.0, ctx)
@@ -89,8 +102,13 @@ class AssocRefDialog(QDialog):
 
         layout.addLayout(form)
 
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #2e6b3e; font-size: 11px;")
+        layout.addWidget(self.status_label)
+
         hint = QLabel(
-            "Отверстие ставится на target; позиция — центр грани source + u/v.\n"
+            "Отверстие ставится на target; позиция — якорь грани source + u/v.\n"
             "При сдвиге source отверстие пересчитывается. Точка превью — в 3D-виде."
         )
         hint.setWordWrap(True)
@@ -126,9 +144,12 @@ class AssocRefDialog(QDialog):
             self.target_combo,
             self.source_combo,
             self.face_combo,
+            self.anchor_combo,
             self.u_spin,
             self.v_spin,
             self.inset_spin,
+            self.dia_spin,
+            self.depth_spin,
             self.axis_combo,
         ):
             if hasattr(w, "currentIndexChanged"):
@@ -156,6 +177,9 @@ class AssocRefDialog(QDialog):
         fi = self.face_combo.findData(ref.source_face)
         if fi >= 0:
             self.face_combo.setCurrentIndex(fi)
+        anc_i = self.anchor_combo.findData(getattr(ref, "anchor", "center"))
+        if anc_i >= 0:
+            self.anchor_combo.setCurrentIndex(anc_i)
         self.u_spin.setValue(float(ref.params.get("u") or 0.0))
         self.v_spin.setValue(float(ref.params.get("v") or 0.0))
         self.inset_spin.setValue(float(ref.params.get("inset") or 0.0))
@@ -209,25 +233,27 @@ class AssocRefDialog(QDialog):
         self._emit_preview()
 
     def _emit_preview(self, *_args) -> None:
-        if self._preview_callback is None:
-            return
         try:
             ref = self.build_ref()
+            target = self.target_combo.currentData()
             source = self.source_combo.currentData()
-            if source is None:
-                self._preview_callback(None)
-                return
-            u = float(ref.params.get("u") or 0.0)
-            v = float(ref.params.get("v") or 0.0)
-            inset = float(ref.params.get("inset") or 0.0)
-
-            _origin, normal, _ua, _va = panel_face_frame(source, ref.source_face)
-            pt = face_point_world(source, ref.source_face, u, v)
-            if abs(inset) > 1e-9:
-                pt = pt + (-float(inset)) * normal
-            self._preview_callback((float(pt[0]), float(pt[1]), float(pt[2])))
+            st = evaluate_assoc_ref_panels(target, source, ref)
+            if st.severity == "error":
+                self.status_label.setStyleSheet("color: #c62828; font-size: 11px;")
+                self.status_label.setText(f"❌ {st.message}")
+            elif st.severity == "warning":
+                self.status_label.setStyleSheet("color: #b26a00; font-size: 11px;")
+                self.status_label.setText(f"⚠ {st.message}")
+            else:
+                self.status_label.setStyleSheet("color: #2e6b3e; font-size: 11px;")
+                self.status_label.setText(f"✓ {st.message}")
+            if self._preview_callback is not None:
+                self._preview_callback(resolve_assoc_world_point(self.block, ref))
         except Exception:
-            self._preview_callback(None)
+            self.status_label.setStyleSheet("color: #c62828; font-size: 11px;")
+            self.status_label.setText("⚠ Выберите разные панели target и source")
+            if self._preview_callback is not None:
+                self._preview_callback(None)
 
     def build_ref(self) -> AssocRef:
         target = self.target_combo.currentData()
@@ -251,6 +277,7 @@ class AssocRefDialog(QDialog):
             params["axis"] = axis
 
         face = str(self.face_combo.currentData() or "X+")
+        anchor = str(self.anchor_combo.currentData() or "center")
         uid = ""
         if self._existing_ref is not None:
             uid = str(getattr(self._existing_ref, "uid", "") or "")
@@ -261,6 +288,9 @@ class AssocRefDialog(QDialog):
             source_uid=s_uid,
             source_face=face,
             params=params,
+            anchor=anchor,
+            fixed=False,
+            face_hint=capture_face_hint(source, face),
         )
 
     def reject(self) -> None:

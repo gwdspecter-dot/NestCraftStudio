@@ -476,6 +476,13 @@ def apply_theme(app: QApplication | None = None, theme: ThemeColors | None = Non
     icons_dir = Path(__file__).resolve().parent / "icons"
     app.setPalette(build_palette(c))
     app.setStyleSheet(build_stylesheet(c, icons_dir=icons_dir))
+    for w in app.topLevelWidgets():
+        refresh = getattr(w, "refresh_theme", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                _log.debug("refresh_theme failed on %r", w, exc_info=True)
     _log.info("Theme applied: %s (system_dark=%s)", c.name, is_system_dark())
     return c
 
@@ -487,7 +494,16 @@ def install_system_theme_watcher(app: QApplication | None = None) -> None:
         return
     try:
         hints = app.styleHints()
-        hints.colorSchemeChanged.connect(lambda *_: apply_theme(app))
+
+        def _on_scheme_changed(scheme=None) -> None:
+            if scheme == Qt.ColorScheme.Dark:
+                apply_theme(app, DARK)
+            elif scheme == Qt.ColorScheme.Light:
+                apply_theme(app, LIGHT)
+            else:
+                apply_theme(app)
+
+        hints.colorSchemeChanged.connect(_on_scheme_changed)
         _log.debug("System colorScheme watcher installed")
     except Exception:
         _log.debug("colorSchemeChanged not available", exc_info=True)

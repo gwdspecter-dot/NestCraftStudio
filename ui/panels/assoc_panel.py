@@ -107,6 +107,13 @@ except ImportError:  # Headless
     class QLabel(QWidget):  # type: ignore[no-redef]
         def __init__(self, text: str = "", parent: Any = None) -> None:
             super().__init__(parent)
+            self._text = str(text)
+
+        def setText(self, text: str) -> None:
+            self._text = str(text)
+
+        def text(self) -> str:
+            return self._text
 
         def setWordWrap(self, _v: bool) -> None:
             pass
@@ -119,11 +126,28 @@ except ImportError:  # Headless
 
         def __init__(self, text: str = "", parent: Any = None) -> None:
             super().__init__(parent)
+            self._text = str(text)
+
+        def setText(self, text: str) -> None:
+            self._text = str(text)
+
+        def text(self) -> str:
+            return self._text
 
     class QListWidgetItem:  # type: ignore[no-redef]
         def __init__(self, text: str = "") -> None:
             self._text = text
             self._data: dict[int, Any] = {}
+            self._tooltip = ""
+
+        def text(self) -> str:
+            return self._text
+
+        def setToolTip(self, tip: str) -> None:
+            self._tooltip = str(tip)
+
+        def toolTip(self) -> str:
+            return self._tooltip
 
         def setData(self, role: int, value: Any) -> None:
             self._data[int(role)] = value
@@ -230,7 +254,21 @@ except ImportError:  # Headless
             return self._val
 
 
-from core.assoc import FACE_NAMES, AssocRef
+from core.assoc import (
+    ANCHOR_LABELS,
+    ANCHOR_MODES,
+    FACE_NAMES,
+    AssocAttachmentStatus,
+    AssocRef,
+    capture_face_hint,
+    evaluate_assoc_ref,
+    freeze_assoc_ref_state,
+    rebind_assoc_ref_state,
+    unfreeze_assoc_ref_state,
+)
+from core.logging_setup import get_logger
+
+_log = get_logger("assoc_panel")
 
 
 class AssocDock(QDockWidget):
@@ -274,11 +312,34 @@ class AssocDock(QDockWidget):
         top.addWidget(self.btn_delete)
         layout.addLayout(top)
 
+        recovery_row = QHBoxLayout()
+        self.btn_toggle_fixed = QPushButton("📌 Зафиксировать")
+        self.btn_toggle_fixed.setToolTip(
+            "Заморозить текущие координаты отверстия на target (отвязать от грани source) или вернуть привязку"
+        )
+        self.btn_toggle_fixed.setEnabled(False)
+        self.btn_toggle_fixed.clicked.connect(self.toggle_fixed_selected_assoc)
+        recovery_row.addWidget(self.btn_toggle_fixed)
+
+        self.btn_rebind_face = QPushButton("🧭 Подобрать грань")
+        self.btn_rebind_face.setToolTip(
+            "Подобрать актуальную грань source (после поворота или перемещения) и обновить привязку"
+        )
+        self.btn_rebind_face.setEnabled(False)
+        self.btn_rebind_face.clicked.connect(self.rebind_selected_assoc)
+        recovery_row.addWidget(self.btn_rebind_face)
+        layout.addLayout(recovery_row)
+
         self.list_widget = QListWidget()
         self.list_widget.currentItemChanged.connect(self._on_current_item_changed)
         if hasattr(self.list_widget, "itemDoubleClicked"):
             self.list_widget.itemDoubleClicked.connect(lambda _it: self._emit_edit_requested())
         layout.addWidget(self.list_widget, 1)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.status_label)
 
         form_w = QWidget()
         form = QFormLayout(form_w)
@@ -290,6 +351,12 @@ class AssocDock(QDockWidget):
             self.face_combo.addItem(face, face)
         self.face_combo.currentIndexChanged.connect(self._on_params_edited)
         form.addRow(QLabel("Грань source:"), self.face_combo)
+
+        self.anchor_combo = QComboBox()
+        for mode in ANCHOR_MODES:
+            self.anchor_combo.addItem(ANCHOR_LABELS.get(mode, mode), mode)
+        self.anchor_combo.currentIndexChanged.connect(self._on_params_edited)
+        form.addRow(QLabel("Якорь грани:"), self.anchor_combo)
 
         self.u_spin = QDoubleSpinBox()
         self.u_spin.setRange(-5000.0, 5000.0)
@@ -334,8 +401,8 @@ class AssocDock(QDockWidget):
         layout.addWidget(form_w)
 
         hint = QLabel(
-            "Отверстие на target считается от грани source.\n"
-            "Двойной клик — полный диалог. Параметры ниже правятся сразу."
+            "Отверстие на target считается от грани source с учётом якоря.\n"
+            "📌 Зафиксировать — заморозить позицию на target; 🧭 Подобрать грань — восстановить после поворота."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #666; font-size: 11px;")
@@ -347,6 +414,7 @@ class AssocDock(QDockWidget):
     def _set_controls_enabled(self, enabled: bool) -> None:
         for w in (
             self.face_combo,
+            self.anchor_combo,
             self.u_spin,
             self.v_spin,
             self.inset_spin,
@@ -354,11 +422,42 @@ class AssocDock(QDockWidget):
             self.depth_spin,
             self.btn_delete,
             self.btn_edit,
+            self.btn_toggle_fixed,
+            self.btn_rebind_face,
         ):
             w.setEnabled(enabled)
+        if not enabled:
+            self.btn_toggle_fixed.setText("📌 Зафиксировать")
+            self.status_label.setText("")
 
     @staticmethod
-    def _format_item(block, ref: AssocRef) -> str:
+    def _status_badge(status: AssocAttachmentStatus | None, ref: AssocRef) -> tuple[str, str]:
+        """Возвращает `(префикс, суффикс)` для строки списка."""
+        if status is None:
+            return ("📌", " [фикс.]") if ref.fixed else ("🔗", "")
+        if status.severity == "error":
+            if status.state == "broken_missing_panel":
+                return ("❌", " [нет детали]")
+            if status.state == "broken_same_panel":
+                return ("❌", " [та же деталь]")
+            return ("❌", " [ошибка]")
+        if status.severity == "warning":
+            tags = {
+                "out_of_target": " [вне детали]",
+                "out_of_source_face": " [вне грани]",
+                "face_drifted": (
+                    f" [сдвиг грани → {status.suggested_face}]"
+                    if status.suggested_face and status.suggested_face != ref.source_face
+                    else " [сдвиг грани]"
+                ),
+            }
+            return ("⚠", tags.get(status.state, " [предупр.]"))
+        if status.state == "fixed" or ref.fixed:
+            return ("📌", " [фикс.]")
+        return ("🔗", "")
+
+    @staticmethod
+    def _format_item(block, ref: AssocRef, status: AssocAttachmentStatus | None = None) -> str:
         by_uid = {
             str(getattr(p, "uid", "")): getattr(p, "name", "Панель")
             for p in getattr(block, "panels", []) or []
@@ -367,7 +466,28 @@ class AssocDock(QDockWidget):
         src = by_uid.get(ref.source_uid, (ref.source_uid or "?")[:8])
         dia = float(ref.params.get("diameter") or 0.0)
         face = ref.source_face or "?"
-        return f"🔗 {tgt} ← {src}.{face}  Ø{dia:g}"
+        prefix, suffix = AssocDock._status_badge(status, ref)
+        if ref.fixed and (status is None or status.state == "fixed"):
+            return f"{prefix} {tgt}  Ø{dia:g}{suffix}"
+        return f"{prefix} {tgt} ← {src}.{face}  Ø{dia:g}{suffix}"
+
+    @staticmethod
+    def _apply_item_color(item: QListWidgetItem, status: AssocAttachmentStatus) -> None:
+        rgb: tuple[int, int, int] | None = None
+        if status.severity == "error":
+            rgb = (200, 40, 40)
+        elif status.severity == "warning":
+            rgb = (195, 115, 0)
+        elif status.state == "fixed":
+            rgb = (50, 95, 165)
+        if rgb is None:
+            return
+        try:
+            from PyQt6.QtGui import QBrush, QColor
+
+            item.setForeground(QBrush(QColor(*rgb)))
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("QtGui foreground color unavailable (headless): %s", exc)
 
     def load_assocs(self, blocks: list) -> None:
         """Обновляет список ассоциаций по всем блокам сцены."""
@@ -378,37 +498,31 @@ class AssocDock(QDockWidget):
         try:
             self.list_widget.clear()
             total = 0
+            problems = 0
             selected_row = -1
             for b in self.blocks_ref:
-                by_uid = {
-                    str(getattr(p, "uid", "") or ""): p
-                    for p in getattr(b, "panels", []) or []
-                    if str(getattr(p, "uid", "") or "")
-                }
                 for raw in getattr(b, "assoc_refs", None) or []:
                     ref = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
-                    txt = self._format_item(b, ref)
-                    broken = False
-                    if by_uid.get(ref.target_uid) is None or by_uid.get(ref.source_uid) is None:
-                        broken = True
-                        txt = "⚠ " + txt + " [нет детали]"
+                    st = evaluate_assoc_ref(b, ref)
+                    if st.severity != "ok":
+                        problems += 1
+                    txt = self._format_item(b, ref, st)
                     item = QListWidgetItem(txt)
                     item.setData(Qt.ItemDataRole.UserRole, (b, ref.uid))
-                    if broken:
-                        try:
-                            from PyQt6.QtGui import QBrush, QColor
-
-                            item.setForeground(QBrush(QColor(200, 40, 40)))
-                        except Exception as exc:
-                            # headless / без QtGui — текст уже с ⚠
-                            _ = exc
+                    tip = st.message + (f"\n{st.remedy}" if st.remedy else "")
+                    if hasattr(item, "setToolTip"):
+                        item.setToolTip(tip)
+                    self._apply_item_color(item, st)
                     self.list_widget.addItem(item)
                     if prev_uid and ref.uid == prev_uid and (prev_block is None or b is prev_block):
                         selected_row = total
                     total += 1
 
             if total > 0:
-                self.setWindowTitle(f"Ассоциации ({total})")
+                if problems > 0:
+                    self.setWindowTitle(f"Ассоциации ({total} · ⚠ {problems})")
+                else:
+                    self.setWindowTitle(f"Ассоциации ({total})")
                 if selected_row >= 0:
                     self.list_widget.setCurrentRow(selected_row)
                 elif self.list_widget.count() > 0:
@@ -444,22 +558,82 @@ class AssocDock(QDockWidget):
                 return ref
         return None
 
+    @staticmethod
+    def _find_panel(block, panel_uid: str):
+        if block is None or not panel_uid:
+            return None
+        for p in getattr(block, "panels", None) or []:
+            if str(getattr(p, "uid", "")) == str(panel_uid):
+                return p
+        return None
+
+    def _update_status_banner(self, status: AssocAttachmentStatus) -> None:
+        text = status.message
+        if status.remedy:
+            text = f"{text}\n{status.remedy}"
+        self.status_label.setText(text)
+        if status.severity == "error":
+            self.status_label.setStyleSheet("color: #c82828; font-size: 11px; font-weight: bold;")
+        elif status.severity == "warning":
+            self.status_label.setStyleSheet("color: #b56800; font-size: 11px;")
+        elif status.state == "fixed":
+            self.status_label.setStyleSheet("color: #325fa5; font-size: 11px;")
+        else:
+            self.status_label.setStyleSheet("color: #2e7d32; font-size: 11px;")
+
     def _sync_controls_from_record(self, block, assoc_uid: str) -> None:
         ref = self._find_record(block, assoc_uid)
         if ref is None:
             self._set_controls_enabled(False)
             return
+        st = evaluate_assoc_ref(block, ref)
+        target = self._find_panel(block, ref.target_uid)
+        source = self._find_panel(block, ref.source_uid)
+
         self._updating_ui = True
         try:
             self._set_controls_enabled(True)
+            self._update_status_banner(st)
+
             idx = self.face_combo.findData(ref.source_face)
             if idx >= 0:
                 self.face_combo.setCurrentIndex(idx)
+            aidx = self.anchor_combo.findData(ref.anchor)
+            if aidx >= 0:
+                self.anchor_combo.setCurrentIndex(aidx)
+
             self.u_spin.setValue(float(ref.params.get("u") or 0.0))
             self.v_spin.setValue(float(ref.params.get("v") or 0.0))
             self.inset_spin.setValue(float(ref.params.get("inset") or 0.0))
             self.dia_spin.setValue(float(ref.params.get("diameter") or 5.0))
             self.depth_spin.setValue(float(ref.params.get("depth") or 12.0))
+
+            # В режиме fixed позиция заморожена на target — отключаем поля грани/смещений
+            is_fixed = bool(ref.fixed)
+            for w in (self.face_combo, self.anchor_combo, self.u_spin, self.v_spin, self.inset_spin):
+                w.setEnabled(not is_fixed)
+
+            if is_fixed:
+                self.btn_toggle_fixed.setText("🔗 Привязать")
+                self.btn_toggle_fixed.setEnabled(target is not None and source is not None)
+            else:
+                self.btn_toggle_fixed.setText("📌 Зафиксировать")
+                self.btn_toggle_fixed.setEnabled(target is not None)
+
+            can_rebind = (
+                target is not None
+                and source is not None
+                and str(getattr(target, "uid", "")) != str(getattr(source, "uid", ""))
+            )
+            self.btn_rebind_face.setEnabled(can_rebind)
+            if st.suggested_face:
+                self.btn_rebind_face.setToolTip(
+                    f"Перепривязать к рекомендуемой грани {st.suggested_face} и обновить снимок грани"
+                )
+            else:
+                self.btn_rebind_face.setToolTip(
+                    "Подобрать ближайшую подходящую грань source и обновить привязку"
+                )
         finally:
             self._updating_ui = False
 
@@ -483,17 +657,62 @@ class AssocDock(QDockWidget):
             return
         old_state = ref.to_dict()
         new_state = ref.to_dict()
-        new_state["source_face"] = str(self.face_combo.currentData() or ref.source_face)
+        new_face = str(self.face_combo.currentData() or ref.source_face)
+        new_anchor = str(self.anchor_combo.currentData() or ref.anchor or "center")
+        new_state["source_face"] = new_face
+        if new_anchor != "center":
+            new_state["anchor"] = new_anchor
+        else:
+            new_state.pop("anchor", None)
         new_state["params"] = dict(new_state.get("params") or {})
         new_state["params"]["u"] = float(self.u_spin.value())
         new_state["params"]["v"] = float(self.v_spin.value())
         new_state["params"]["inset"] = float(self.inset_spin.value())
         new_state["params"]["diameter"] = float(self.dia_spin.value())
         new_state["params"]["depth"] = float(self.depth_spin.value())
+
+        if not ref.fixed:
+            source = self._find_panel(block, ref.source_uid)
+            if source is not None:
+                hint = capture_face_hint(source, new_face)
+                if hint is not None:
+                    new_state["face_hint"] = hint
+
         if old_state == new_state:
             return
         self.assoc_modified.emit(block, uid, old_state, new_state)
         self.load_assocs(self.blocks_ref)
+
+    def toggle_fixed_selected_assoc(self) -> bool:
+        """Переключает выбранную ссылку между живой привязкой и режимом ``fixed=True`` (Undo/Redo)."""
+        block, uid = self.current_assoc_ref()
+        ref = self._find_record(block, uid)
+        if block is None or ref is None:
+            return False
+        old_state = ref.to_dict()
+        if ref.fixed:
+            new_state = unfreeze_assoc_ref_state(block, ref)
+        else:
+            new_state = freeze_assoc_ref_state(block, ref)
+        if not new_state or new_state == old_state:
+            return False
+        self.assoc_modified.emit(block, uid, old_state, new_state)
+        self.load_assocs(self.blocks_ref)
+        return True
+
+    def rebind_selected_assoc(self, new_face: str | None = None) -> bool:
+        """Перепривязывает выбранную ссылку к актуальной грани ``source`` (Undo/Redo)."""
+        block, uid = self.current_assoc_ref()
+        ref = self._find_record(block, uid)
+        if block is None or ref is None:
+            return False
+        old_state = ref.to_dict()
+        new_state = rebind_assoc_ref_state(block, ref, new_face=new_face)
+        if not new_state or new_state == old_state:
+            return False
+        self.assoc_modified.emit(block, uid, old_state, new_state)
+        self.load_assocs(self.blocks_ref)
+        return True
 
     def _emit_edit_requested(self) -> None:
         block, uid = self.current_assoc_ref()

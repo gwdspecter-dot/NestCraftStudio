@@ -15,12 +15,14 @@ from __future__ import annotations
 import ast
 import math
 import operator
+import re
 from typing import Any
 
 from core.logging_setup import get_logger
 
 _log = get_logger("formula")
 _MAX_FORMULA_LEN = 200
+_DECIMAL_COMMA_RE = re.compile(r"(?<=\d),(?=\d)")
 
 _BINARY_OPS = {
     ast.Add: operator.add,
@@ -151,8 +153,11 @@ def eval_math_expression(
         if not s:
             raise ValueError("Empty expression after '='")
 
-    # Заменяем запятые на точки, а символы '×' и '÷' на '*' и '/'
-    s = s.replace(",", ".").replace("×", "*").replace("÷", "/")
+    # Заменяем символы '×' и '÷' на '*' и '/', а ';' на ',' (разделитель аргументов при десятичной запятой)
+    s_base = s.replace("×", "*").replace("÷", "/")
+    s_raw_ops = s_base.replace(";", ",")
+    # Сначала заменяем десятичную запятую между цифрами на точку, затем ';' на ',' (для 'round(10,556;2)')
+    s = _DECIMAL_COMMA_RE.sub(".", s_base).replace(";", ",")
 
     # Быстрый путь для обычного числа
     try:
@@ -177,6 +182,7 @@ def eval_math_expression(
                 raise ValueError(f"Relative operator '{prefix}' requires current_value")
             rel_op = op_fn
             s = s[len(prefix):].strip()
+            s_raw_ops = s_raw_ops[len(prefix):].strip()
             break
 
     env: dict[str, float] = {"pi": math.pi}
@@ -189,8 +195,12 @@ def eval_math_expression(
 
     try:
         tree = ast.parse(s, mode="eval")
-    except SyntaxError as exc:
-        raise ValueError(f"Invalid formula syntax: {raw}") from exc
+    except SyntaxError:
+        # Fallback: если запятая без пробела была разделителем аргументов (например 'round(10.5,0)')
+        try:
+            tree = ast.parse(s_raw_ops, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(f"Invalid formula syntax: {raw}") from exc
 
     def _eval_node(node: ast.AST) -> float:
         if isinstance(node, ast.Expression):
@@ -237,17 +247,34 @@ def eval_math_expression(
             args = [_eval_node(a) for a in node.args]
             if not args:
                 raise ValueError(f"Function {fname} requires arguments")
+            if fname in ("min", "max") and len(args) < 2:
+                raise ValueError(f"Function {fname} requires at least 2 arguments")
+            if fname == "round" and len(args) == 2:
+                return float(round(args[0], int(round(args[1]))))
             return float(fn(*args))
         raise ValueError(f"Unsupported syntax node: {type(node).__name__}")
 
-    try:
-        result = _eval_node(tree)
+    def _run_tree(parsed_tree: ast.AST) -> float:
+        res = _eval_node(parsed_tree)
         if rel_op is not None and current_value is not None:
-            if rel_op is operator.truediv and abs(result) < 1e-12:
+            if rel_op is operator.truediv and abs(res) < 1e-12:
                 raise ValueError("Division by zero")
-            result = float(rel_op(float(current_value), result))
+            res = float(rel_op(float(current_value), res))
+        return res
+
+    try:
+        result = _run_tree(tree)
     except (ZeroDivisionError, OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(f"Formula evaluation error: {raw}") from exc
+        # Если в записи вида 'max(1,2)' запятая без пробела превратилась в 'max(1.2)',
+        # пробуем разобрать исходную строку без замены запятой на точку
+        if s != s_raw_ops:
+            try:
+                alt_tree = ast.parse(s_raw_ops, mode="eval")
+                result = _run_tree(alt_tree)
+            except Exception:  # noqa: BLE001 — fallback не сработал, поднимаем исходную ошибку
+                raise ValueError(f"Formula evaluation error: {raw}") from exc
+        else:
+            raise ValueError(f"Formula evaluation error: {raw}") from exc
 
     if not math.isfinite(result):
         raise ValueError("Formula result is not finite")

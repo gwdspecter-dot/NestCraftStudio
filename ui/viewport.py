@@ -1,34 +1,51 @@
-from PyQt6.QtWidgets import QTabWidget
+from PyQt6.QtWidgets import QMenu, QTabWidget
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtGui import QSurfaceFormat, QPainter, QColor, QPen, QFont
 from PyQt6.QtCore import Qt, QPoint, QRect, QTimer, pyqtSignal
 from OpenGL.GL import (
     GL_ALIASED_LINE_WIDTH_RANGE,
+    GL_ALWAYS,
     GL_ARRAY_BUFFER,
+    GL_BACK,
     GL_BLEND,
+    GL_CCW,
     GL_COLOR_BUFFER_BIT,
     GL_CLIP_DISTANCE0,
     GL_COMPILE_STATUS,
     GL_CULL_FACE,
+    GL_DECR_WRAP,
     GL_DEPTH_BUFFER_BIT,
+    GL_DEPTH_STENCIL_ATTACHMENT,
     GL_DEPTH_TEST,
+    GL_DRAW_FRAMEBUFFER,
+    GL_DRAW_FRAMEBUFFER_BINDING,
     GL_DYNAMIC_DRAW,
     GL_ELEMENT_ARRAY_BUFFER,
     GL_FALSE,
     GL_FLOAT,
     GL_FRAGMENT_SHADER,
+    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+    GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE,
+    GL_FRONT,
     GL_GREATER,
+    GL_INCR_WRAP,
+    GL_KEEP,
     GL_LEQUAL,
     GL_LESS,
     GL_LINES,
     GL_LINK_STATUS,
     GL_MULTISAMPLE,
+    GL_NONE,
+    GL_NOTEQUAL,
     GL_ONE_MINUS_SRC_ALPHA,
     GL_POLYGON_OFFSET_FILL,
     GL_PROGRAM_POINT_SIZE,
     GL_SCISSOR_TEST,
     GL_SRC_ALPHA,
     GL_STATIC_DRAW,
+    GL_STENCIL,
+    GL_STENCIL_ATTACHMENT,
+    GL_STENCIL_BUFFER_BIT,
     GL_STENCIL_TEST,
     GL_TRIANGLES,
     GL_TRUE,
@@ -41,10 +58,12 @@ from OpenGL.GL import (
     glBufferData,
     glClear,
     glClearColor,
+    glClearStencil,
     glColorMask,
     glCompileShader,
     glCreateProgram,
     glCreateShader,
+    glCullFace,
     glDeleteBuffers,
     glDeleteProgram,
     glDeleteShader,
@@ -56,9 +75,12 @@ from OpenGL.GL import (
     glDrawElements,
     glEnable,
     glEnableVertexAttribArray,
+    glFrontFace,
     glGenBuffers,
     glGenVertexArrays,
     glGetFloatv,
+    glGetFramebufferAttachmentParameteriv,
+    glGetIntegerv,
     glGetProgramInfoLog,
     glGetProgramiv,
     glGetShaderInfoLog,
@@ -68,7 +90,12 @@ from OpenGL.GL import (
     glLinkProgram,
     glPolygonOffset,
     glShaderSource,
+    glStencilFunc,
+    glStencilMask,
+    glStencilOp,
+    glStencilOpSeparate,
     glUniform1f,
+    glUniform2f,
     glUniform3f,
     glUniform4f,
     glUniformMatrix4fv,
@@ -93,10 +120,17 @@ from core.joint import (
     FASTENER_PRESET_ORDER, JointRecord, get_fastener_preset,
     tag_joint_hole, hole_joint_uid,
 )
+from core.hole_nav import (
+    HoleHit,
+    collect_owner_holes,
+    describe_hole_hit,
+    pick_hole_at_ray,
+)
 from core.cad_kernel import CADKernel
 from core.geometry_service import GeometryService
 from core.scene_controller import SceneController
 from core.logging_setup import get_logger
+from ui.theme import current_theme
 
 _log = get_logger("viewport")
 from core import glmath
@@ -199,6 +233,80 @@ void main() {
 }
 """
 
+_SECTION_MASK_VS = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+uniform vec4 uClipPlane;
+void main() {
+    gl_Position = uMVP * vec4(aPos, 1.0);
+    gl_ClipDistance[0] = dot(vec4(aPos, 1.0), uClipPlane);
+}
+"""
+
+_SECTION_MASK_FS = """
+#version 330 core
+void main() {
+}
+"""
+
+_SECTION_CAP_VS = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+out vec3 vPos;
+void main() {
+    vPos = aPos;
+    gl_Position = uMVP * vec4(aPos, 1.0);
+}
+"""
+
+_SECTION_CAP_FS = """
+#version 330 core
+in vec3 vPos;
+uniform vec3 uCapColor;
+uniform vec3 uHatchColor;
+uniform vec3 uCapNormal;
+uniform vec3 uHatchAxisU;
+uniform vec3 uHatchAxisV;
+uniform vec2 uHatchDir;
+uniform float uHatchSpacing;
+uniform vec3 uKeyDir;
+uniform vec3 uFillDir;
+out vec4 fragColor;
+void main() {
+    // Мировые 2D-координаты на плоскости сечения (мм)
+    vec2 uv = vec2(dot(vPos, uHatchAxisU), dot(vPos, uHatchAxisV));
+    float spacing = max(uHatchSpacing, 1.0);
+    float coord = dot(uv, uHatchDir) / spacing;
+
+    // Аналитический градиент (Евклидов, точнее Manhattan fwidth на диагоналях) + адаптивная октава при отдалении
+    float fw = max(length(vec2(dFdx(coord), dFdy(coord))), 1e-4);
+    if (fw > 0.38) {
+        coord *= 0.5;
+        fw *= 0.5;
+    }
+    float phase = abs(fract(coord) - 0.5);
+    float halfWidth = clamp(max(0.16, fw * 0.75), 0.16, 0.34);
+    float aa = max(fw * 0.85, 0.015);
+    float lineMask = 1.0 - smoothstep(halfWidth - aa, halfWidth + aa, phase);
+    float antiMoire = 1.0 - smoothstep(0.45, 0.85, fw);
+    float hatch = lineMask * antiMoire;
+
+    vec3 baseColor = mix(uCapColor, uHatchColor, hatch * 0.92);
+
+    // Мягкое студийное освещение среза, согласованное с _SOLID_FS
+    vec3 n = normalize(uCapNormal);
+    vec3 keyL = (dot(uKeyDir, uKeyDir) > 1e-4) ? normalize(uKeyDir) : normalize(vec3(0.4, 0.9, 0.6));
+    vec3 fillL = (dot(uFillDir, uFillDir) > 1e-4) ? normalize(uFillDir) : normalize(vec3(-0.4, 0.3, -0.6));
+    float keyDiff = max(dot(n, keyL), 0.0) + 0.18 * max(dot(-n, keyL), 0.0);
+    float fillDiff = max(dot(n, fillL), 0.0) + 0.12 * max(dot(-n, fillL), 0.0);
+    float shade = 0.42 + 0.46 * keyDiff + 0.14 * fillDiff;
+
+    fragColor = vec4(clamp(baseColor * shade, 0.0, 1.0), 1.0);
+}
+"""
+
 
 def _compile_shader(src: str, stype: int) -> int:
     sid = glCreateShader(stype)
@@ -237,6 +345,8 @@ class Viewport3D(QOpenGLWidget):
     fastener_message = pyqtSignal(str)
     scene_structure_changed = pyqtSignal()
     measurement_updated = pyqtSignal(str)
+    hole_navigated = pyqtSignal(object, str, str, object)  # (block, kind, owner_uid, panel)
+    hole_edit_requested = pyqtSignal(object, str, str, object)  # (block, kind, owner_uid, panel)
 
     def __init__(self, title="Модель"):
         super().__init__()
@@ -245,6 +355,7 @@ class Viewport3D(QOpenGLWidget):
         fmt.setVersion(3, 3)
         fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
         fmt.setDepthBufferSize(24)
+        fmt.setStencilBufferSize(8)
         fmt.setSamples(4)
         self.setFormat(fmt)
 
@@ -290,6 +401,9 @@ class Viewport3D(QOpenGLWidget):
         self.section_axis: str = "Z"
         self.section_ratio: float = 0.5
         self.section_flip: bool = False
+        self.section_cap_enabled: bool = True
+        self._has_stencil_buffer: bool = False
+        self._stencil_checked_fbo: int = -1
         self.ghost_others_mode: bool = False
         self.ghost_alpha: float = 0.18
         self._clip_plane_active: bool = False
@@ -323,6 +437,11 @@ class Viewport3D(QOpenGLWidget):
         self.fastener_preview_points: list | None = None
         self._last_fastener_params: dict | None = None
         self.assoc_preview_point: tuple[float, float, float] | None = None
+        # Навигация от отверстия в 3D к стыку / ассоциации
+        self._hovered_hole: HoleHit | None = None
+        self._active_hole_owner: tuple[object, str, str] | None = None
+        self._right_press_pos: QPoint | None = None
+        self._right_did_drag: bool = False
         # Магнитная привязка (🧲) при перемещении (G), вставке и растягивании граней/углов
         self.face_snap_enabled = True
         self.drag_face_snap_desc = ""
@@ -379,6 +498,10 @@ class Viewport3D(QOpenGLWidget):
         # Core Profile ресурсы
         self._prog_solid = 0
         self._prog_line = 0
+        self._prog_section_mask = 0
+        self._prog_section_cap = 0
+        self._cap_vao = 0
+        self._cap_vbo = 0
         self._grid_vao = 0
         self._grid_vbo = 0
         self._grid_count = 0
@@ -967,6 +1090,13 @@ class Viewport3D(QOpenGLWidget):
 
         self._prog_solid = _link_program(_SOLID_VS, _SOLID_FS)
         self._prog_line = _link_program(_LINE_VS, _LINE_FS)
+        self._prog_section_mask = _link_program(_SECTION_MASK_VS, _SECTION_MASK_FS)
+        self._prog_section_cap = _link_program(_SECTION_CAP_VS, _SECTION_CAP_FS)
+
+        # В OpenGL 3.3 Core GL_STENCIL_BITS удалён (GL_INVALID_ENUM), а внутренний FBO
+        # QOpenGLWidget привязывается в paintGL — проверяем через GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE
+        self._stencil_checked_fbo = -1
+        self._detect_stencil_buffer()
 
         # В Core Profile wide lines не обязательны — обычно [1, 1]
         try:
@@ -989,6 +1119,99 @@ class Viewport3D(QOpenGLWidget):
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glBindVertexArray(0)
+
+        # Динамический квад заглушки сечения (6 вершин × vec3)
+        self._cap_vao = glGenVertexArrays(1)
+        self._cap_vbo = glGenBuffers(1)
+        glBindVertexArray(self._cap_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._cap_vbo)
+        glBufferData(GL_ARRAY_BUFFER, 4 * 3 * 6, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glBindVertexArray(0)
+
+    def _detect_stencil_buffer(self) -> bool:
+        """Определяет наличие аппаратного stencil-буфера в текущем FBO (OpenGL 3.3 Core).
+
+        В Core 3.3 старый `glGetIntegerv(GL_STENCIL_BITS)` удалён и вызывает `GL_INVALID_ENUM`.
+        Кроме того, `QOpenGLWidget` рендерит в собственный FBO, который создаётся/меняется при
+        перерисовке и ресайзе — поэтому результат кэшируется по `GL_DRAW_FRAMEBUFFER_BINDING`.
+        """
+        def _as_int(raw) -> int:
+            return int(raw[0]) if hasattr(raw, "__len__") else int(raw)
+
+        def _query_fbo_attachment(attachment: int, pname: int) -> int:
+            buf = (ctypes.c_int * 1)(0)
+            try:
+                res = glGetFramebufferAttachmentParameteriv(
+                    GL_DRAW_FRAMEBUFFER, attachment, pname, buf
+                )
+            except TypeError:
+                res = glGetFramebufferAttachmentParameteriv(
+                    GL_DRAW_FRAMEBUFFER, attachment, pname
+                )
+                return _as_int(res)
+            val = int(buf[0])
+            if val == 0 and res is not None and res is not buf:
+                try:
+                    val = _as_int(res)
+                except (TypeError, ValueError, IndexError) as exc:
+                    _log.debug("Не удалось распаковать ответ glGetFramebufferAttachmentParameteriv: %s", exc)
+            return val
+
+        def _attachment_stencil_bits(attachment: int) -> int:
+            obj_type = _query_fbo_attachment(attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE)
+            if obj_type == int(GL_NONE):
+                return 0
+            return _query_fbo_attachment(attachment, GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE)
+
+        fbo = -1
+        try:
+            fbo = _as_int(glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING))
+        except Exception as exc:
+            _log.debug("Не удалось запросить GL_DRAW_FRAMEBUFFER_BINDING: %s", exc)
+
+        if fbo >= 0 and fbo == self._stencil_checked_fbo:
+            return self._has_stencil_buffer
+
+        sbits = 0
+        queried_ok = False
+        try:
+            if fbo > 0:
+                sbits = _attachment_stencil_bits(GL_STENCIL_ATTACHMENT)
+                queried_ok = True
+                if sbits <= 0:
+                    try:
+                        sbits = _attachment_stencil_bits(GL_DEPTH_STENCIL_ATTACHMENT)
+                    except Exception as exc:
+                        _log.debug("Запрос GL_DEPTH_STENCIL_ATTACHMENT FBO=%s отклонён: %s", fbo, exc)
+            elif fbo == 0:
+                sbits = _attachment_stencil_bits(GL_STENCIL)
+                queried_ok = True
+        except Exception as exc:
+            _log.debug("Не удалось запросить размер stencil-буфера FBO=%s: %s", fbo, exc)
+
+        if sbits <= 0 and not queried_ok:
+            # Резервная проверка формата Qt-контекста (если драйвер отклонил запрос FBO)
+            try:
+                ctx = self.context()
+                if ctx is not None and ctx.format().stencilBufferSize() > 0:
+                    sbits = int(ctx.format().stencilBufferSize())
+                elif self.format().stencilBufferSize() > 0:
+                    sbits = int(self.format().stencilBufferSize())
+            except Exception as exc:
+                _log.debug("Не удалось прочитать stencilBufferSize из QSurfaceFormat: %s", exc)
+
+        self._has_stencil_buffer = sbits > 0
+        if fbo >= 0:
+            self._stencil_checked_fbo = fbo
+        _log.debug(
+            "Определение stencil-буфера: FBO=%s, stencil_bits=%s, enabled=%s",
+            fbo,
+            sbits,
+            self._has_stencil_buffer,
+        )
+        return self._has_stencil_buffer
 
     def _rotation_matrix(self) -> np.ndarray:
         """Rx * Ry — поворот сцены (world → view без панорамирования)."""
@@ -1016,57 +1239,175 @@ class Viewport3D(QOpenGLWidget):
         ]
 
     def _scene_bounding_radius(self) -> float:
-        """Оценка радиуса охвата сцены для адаптивных плоскостей отсечения z_near / z_far."""
+        """Оценка радиуса охвата сцены вокруг опорной точки камеры для z_near / z_far."""
         blocks = getattr(self, "blocks", None)
         if not blocks:
             return 2000.0
-        max_r2 = 0.0
-        pan_cx = -float(self.pan_x)
-        pan_cy = -float(self.pan_y)
+        # Опорная точка на оси взгляда в мировых координатах: R^T @ (-pan_x, -pan_y, 0)
+        R3 = self._rotation_matrix()[:3, :3]
+        px, py = -float(self.pan_x), -float(self.pan_y)
+        cx = float(R3[0, 0]) * px + float(R3[1, 0]) * py
+        cy = float(R3[0, 1]) * px + float(R3[1, 1]) * py
+        cz = float(R3[0, 2]) * px + float(R3[1, 2]) * py
+        max_r = 0.0
         for b in blocks:
             for p in getattr(b, "panels", ()):
                 if not getattr(p, "visible", True):
                     continue
-                dx = (float(p.x) + float(p.width) * 0.5) - pan_cx
-                dy = (float(p.y) + float(p.height) * 0.5) - pan_cy
-                dz = float(p.z) + float(p.depth) * 0.5
-                diag = (float(p.width) ** 2 + float(p.height) ** 2 + float(p.depth) ** 2) ** 0.5
-                r = (dx * dx + dy * dy + dz * dz) ** 0.5 + diag * 0.5
-                if r * r > max_r2:
-                    max_r2 = r * r
-        return max(1000.0, max_r2 ** 0.5) if max_r2 > 0.0 else 2000.0
+                if hasattr(p, "world_aabb"):
+                    mn, mx = p.world_aabb()
+                    mn_x, mn_y, mn_z = float(mn[0]), float(mn[1]), float(mn[2])
+                    mx_x, mx_y, mx_z = float(mx[0]), float(mx[1]), float(mx[2])
+                    pcx = 0.5 * (mn_x + mx_x)
+                    pcy = 0.5 * (mn_y + mx_y)
+                    pcz = 0.5 * (mn_z + mx_z)
+                    half_diag = 0.5 * (
+                        (mx_x - mn_x) ** 2 + (mx_y - mn_y) ** 2 + (mx_z - mn_z) ** 2
+                    ) ** 0.5
+                else:
+                    w, h, d = float(p.width), float(p.height), float(p.depth)
+                    pcx = float(p.x) + w * 0.5
+                    pcy = float(p.y) + h * 0.5
+                    pcz = float(p.z) + d * 0.5
+                    half_diag = 0.5 * (w * w + h * h + d * d) ** 0.5
+                dx, dy, dz = pcx - cx, pcy - cy, pcz - cz
+                r = (dx * dx + dy * dy + dz * dz) ** 0.5 + half_diag
+                if r > max_r:
+                    max_r = r
+        return max(1000.0, max_r) if max_r > 0.0 else 2000.0
+
+    def _scene_view_depth_bounds(
+        self,
+        view_matrix,
+        is_ortho: bool,
+    ) -> tuple[float, float] | None:
+        """Точный интервал глубин `[d_min, d_max]` видимой сцены (и активных превью) вдоль оси взгляда."""
+        blocks = getattr(self, "blocks", None)
+        if not blocks:
+            return None
+        panels = [
+            p
+            for b in blocks
+            for p in getattr(b, "panels", ()) or ()
+            if getattr(p, "visible", True)
+        ]
+        if not panels:
+            return None
+
+        extra_aabbs: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+        sx0 = sy0 = sz0 = float("inf")
+        sx1 = sy1 = sz1 = float("-inf")
+        for p in panels:
+            if hasattr(p, "world_aabb"):
+                mn, mx = p.world_aabb()
+                mn_x, mn_y, mn_z = float(mn[0]), float(mn[1]), float(mn[2])
+                mx_x, mx_y, mx_z = float(mx[0]), float(mx[1]), float(mx[2])
+            else:
+                mn_x, mn_y, mn_z = float(p.x), float(p.y), float(p.z)
+                mx_x = mn_x + float(p.width)
+                mx_y = mn_y + float(p.height)
+                mx_z = mn_z + float(p.depth)
+            if mn_x < sx0:
+                sx0 = mn_x
+            if mn_y < sy0:
+                sy0 = mn_y
+            if mn_z < sz0:
+                sz0 = mn_z
+            if mx_x > sx1:
+                sx1 = mx_x
+            if mx_y > sy1:
+                sy1 = mx_y
+            if mx_z > sz1:
+                sz1 = mx_z
+
+        # Включаем мировые 3D-оси [0..300]^3, если они в пределах 3 м от сцены
+        dx_ax = max(0.0, sx0 - 300.0, -sx1)
+        dy_ax = max(0.0, sy0 - 300.0, -sy1)
+        dz_ax = max(0.0, sz0 - 300.0, -sz1)
+        if (dx_ax * dx_ax + dy_ax * dy_ax + dz_ax * dz_ax) <= 3000.0 * 3000.0:
+            extra_aabbs.append(((0.0, 0.0, 0.0), (300.0, 300.0, 300.0)))
+
+        # В 2D-ортографии сетка рисуется в плоскости через (0, 0, 0) — не даём ей обрезаться
+        if is_ortho and getattr(self, "grid_enabled", False):
+            extra_aabbs.append(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+
+        # Активный предпросмотр перемещения (G) — включаем смещённый бокс фантома
+        if (
+            getattr(self, "drag_mode", False)
+            and getattr(self, "drag_stage", 0) == 2
+            and getattr(self, "drag_panel", None) is not None
+            and getattr(self, "drag_base_point", None) is not None
+            and getattr(self, "drag_target_point", None) is not None
+        ):
+            dp = self.drag_panel
+            delta = self.drag_target_point - self.drag_base_point
+            ddx, ddy, ddz = float(delta[0]), float(delta[1]), float(delta[2])
+            if hasattr(dp, "world_aabb"):
+                dmn, dmx = dp.world_aabb()
+                extra_aabbs.append((
+                    (float(dmn[0]) + ddx, float(dmn[1]) + ddy, float(dmn[2]) + ddz),
+                    (float(dmx[0]) + ddx, float(dmx[1]) + ddy, float(dmx[2]) + ddz),
+                ))
+
+        # Активный предпросмотр вставки (Ctrl+V) и ассоциативной точки
+        pt_paste = getattr(self, "paste_target_point", None) if getattr(self, "paste_mode", False) else None
+        if pt_paste is not None and len(pt_paste) >= 3:
+            pp = (float(pt_paste[0]), float(pt_paste[1]), float(pt_paste[2]))
+            extra_aabbs.append((pp, pp))
+
+        pt_assoc = getattr(self, "assoc_preview_point", None)
+        if pt_assoc is not None and len(pt_assoc) >= 3:
+            pa = (float(pt_assoc[0]), float(pt_assoc[1]), float(pt_assoc[2]))
+            extra_aabbs.append((pa, pa))
+
+        return glmath.compute_scene_view_depth_bounds(
+            panels, view_matrix, extra_aabbs=extra_aabbs
+        )
 
     def _rebuild_matrices(self, w: int, h: int):
         from ui.viewcube import ORTHO_HALF_TAN, blend_projection_matrices
 
         aspect = w / max(1, h)
-        scene_radius = self._scene_bounding_radius()
-        z_near, z_far = glmath.compute_adaptive_clip_planes(
-            self.zoom, self.is_ortho, scene_radius
+        # Камера: T * Rx * Ry (считаем до проекции, чтобы точно обжать z_near / z_far по глубине сцены)
+        self._view = glmath.mul(
+            glmath.translate(self.pan_x, self.pan_y, self.zoom),
+            self._rotation_matrix(),
         )
         # Если is_ortho переключён напрямую (например, из тулбара/тестов без анимации), синхронизируем _ortho_blend
         if self._view_anim is None:
             self._ortho_blend = 1.0 if self.is_ortho else 0.0
 
+        scene_radius = self._scene_bounding_radius()
         scale = abs(self.zoom) * ORTHO_HALF_TAN
         if self._ortho_blend <= 1e-4:
+            depth_bounds = self._scene_view_depth_bounds(self._view, is_ortho=False)
+            z_near, z_far = glmath.compute_adaptive_clip_planes(
+                self.zoom, False, scene_radius, view_depth_bounds=depth_bounds
+            )
             self._proj = glmath.perspective(45.0, aspect, z_near, z_far)
         elif self._ortho_blend >= 1.0 - 1e-4:
+            depth_bounds = self._scene_view_depth_bounds(self._view, is_ortho=True)
+            z_near, z_far = glmath.compute_adaptive_clip_planes(
+                self.zoom, True, scene_radius, view_depth_bounds=depth_bounds
+            )
             self._proj = glmath.ortho(
                 -scale * aspect, scale * aspect, -scale, scale, z_near, z_far
             )
         else:
-            proj_p = glmath.perspective(45.0, aspect, z_near, z_far)
+            depth_p = self._scene_view_depth_bounds(self._view, is_ortho=False)
+            depth_o = self._scene_view_depth_bounds(self._view, is_ortho=True)
+            z_near_p, z_far_p = glmath.compute_adaptive_clip_planes(
+                self.zoom, False, scene_radius, view_depth_bounds=depth_p
+            )
+            z_near_o, z_far_o = glmath.compute_adaptive_clip_planes(
+                self.zoom, True, scene_radius, view_depth_bounds=depth_o
+            )
+            proj_p = glmath.perspective(45.0, aspect, z_near_p, z_far_p)
             proj_o = glmath.ortho(
-                -scale * aspect, scale * aspect, -scale, scale, z_near, z_far
+                -scale * aspect, scale * aspect, -scale, scale, z_near_o, z_far_o
             )
             self._proj = blend_projection_matrices(proj_p, proj_o, self._ortho_blend, self.zoom)
 
-        # Камера: T * Rx * Ry  (как раньше glTranslate + glRotate)
-        self._view = glmath.mul(
-            glmath.translate(self.pan_x, self.pan_y, self.zoom),
-            self._rotation_matrix(),
-        )
         self._mvp = glmath.mul(self._proj, self._view)
         self._vp_size = (0, 0, max(1, w), max(1, h))
 
@@ -1155,17 +1496,21 @@ class Viewport3D(QOpenGLWidget):
         self._vp_size = (0, 0, int(w * dpr), int(h * dpr))
 
         # Сброс состояния GL после QPainter оверлея / предыдущих проходов
+        glFrontFace(GL_CCW)
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
         glDepthMask(GL_TRUE)
+        glStencilMask(0xFF)
         glDisable(GL_SCISSOR_TEST)
         glDisable(GL_STENCIL_TEST)
         glDisable(GL_BLEND)
         glDisable(GL_CULL_FACE)
         glDisable(GL_POLYGON_OFFSET_FILL)
         glClearColor(1.0, 1.0, 1.0, 1.0)
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glClearStencil(0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LESS)
+        self._detect_stencil_buffer()
 
         self.draw_grid()
         self.draw_axes()
@@ -1195,6 +1540,7 @@ class Viewport3D(QOpenGLWidget):
                 glDepthMask(GL_TRUE)
                 glDepthFunc(GL_LESS)
                 glDisable(GL_BLEND)
+                opaque_panels: list[tuple[Panel, bool]] = []
                 # 1-й проход: непрозрачные (фокусные или все) панели
                 for block in self.blocks:
                     for panel in block.panels:
@@ -1202,6 +1548,16 @@ class Viewport3D(QOpenGLWidget):
                             continue
                         is_selected = panel.selected or block.selected
                         self._draw_panel_solid(panel, is_selected, alpha=1.0)
+                        opaque_panels.append((panel, is_selected))
+
+                # 1.5-й проход: «мясистая» stencil-заглушка среза с индивидуальной штриховкой каждой детали
+                if (
+                    self.section_enabled
+                    and self.section_cap_enabled
+                    and self._has_stencil_buffer
+                    and opaque_panels
+                ):
+                    self._draw_section_caps(opaque_panels)
 
                 # 2-й проход: полупрозрачные «призраки окружения» без записи в буфер глубины
                 if has_ghosts:
@@ -1252,6 +1608,9 @@ class Viewport3D(QOpenGLWidget):
 
         if self.assoc_preview_point is not None:
             self._draw_assoc_preview()
+
+        if self._hovered_hole is not None or self._active_hole_owner is not None:
+            self._draw_highlighted_holes()
 
         self._draw_dimensions()
 
@@ -1742,6 +2101,170 @@ class Viewport3D(QOpenGLWidget):
         self.update()
         return self.section_flip
 
+    def toggle_section_cap(self, enabled: bool | None = None) -> bool:
+        """Включает/выключает сплошную stencil-заглушку среза со штриховкой деталей."""
+        if enabled is None:
+            self.section_cap_enabled = not bool(self.section_cap_enabled)
+        else:
+            self.section_cap_enabled = bool(enabled)
+        if self.section_enabled:
+            if self.section_cap_enabled and self._gl_ready and not self._has_stencil_buffer:
+                self.fastener_message.emit(
+                    "▤ Заглушка сечения недоступна: драйвер OpenGL не выделил stencil-буфер (активен полый срез)"
+                )
+            else:
+                state_str = "ВКЛ (штриховка)" if self.section_cap_enabled else "ВЫКЛ (полый срез)"
+                self.fastener_message.emit(f"▤ Заглушка сечения: {state_str}")
+        self.update()
+        return self.section_cap_enabled
+
+    def _draw_section_caps(self, opaque_panels: list[tuple[Panel, bool]]) -> None:
+        """Рисует сплошные «мясистые» заглушки сечения по stencil-буферу с индивидуальной штриховкой.
+
+        Двухпроходный алгоритм на каждую разрезанную панель:
+        1. Маска (GL_CLIP_DISTANCE0 ВКЛ, DEPTH_TEST ВЫКЛ, COLOR/DEPTH MASK = FALSE):
+           задние грани +1 (GL_INCR_WRAP), передние -1 (GL_DECR_WRAP). Внутри материала
+           на плоскости среза stencil != 0, а внутри отверстий/пазов — ровно 0.
+        2. Заглушка (GL_CLIP_DISTANCE0 ВЫКЛ, DEPTH_TEST LEQUAL, DEPTH_MASK = TRUE,
+           CULL_FACE = BACK, STENCIL != 0): рисует квад в плоскости среза с процедурной
+           антиалиасинговой штриховкой (fwidth) и записывает точную глубину среза в Z-буфер.
+        """
+        if (
+            not self._prog_section_mask
+            or not self._prog_section_cap
+            or not self._cap_vao
+            or not self._cap_vbo
+        ):
+            return
+        plane = self.current_section_plane()
+        if plane is None:
+            return
+
+        axis = str(self.section_axis or "Z").upper()
+        offset = self.current_section_offset()
+        flip = bool(self.section_flip)
+        key_dir, fill_dir, _view_dir = glmath.compute_camera_studio_lights(
+            self.rot_x, self.rot_y
+        )
+
+        # Кэшируем uniform-локации до цикла по панелям
+        mask_mvp_loc = glGetUniformLocation(self._prog_section_mask, "uMVP")
+        mask_clip_loc = glGetUniformLocation(self._prog_section_mask, "uClipPlane")
+
+        cap_mvp_loc = glGetUniformLocation(self._prog_section_cap, "uMVP")
+        cap_color_loc = glGetUniformLocation(self._prog_section_cap, "uCapColor")
+        cap_hatch_loc = glGetUniformLocation(self._prog_section_cap, "uHatchColor")
+        cap_norm_loc = glGetUniformLocation(self._prog_section_cap, "uCapNormal")
+        cap_u_loc = glGetUniformLocation(self._prog_section_cap, "uHatchAxisU")
+        cap_v_loc = glGetUniformLocation(self._prog_section_cap, "uHatchAxisV")
+        cap_dir_loc = glGetUniformLocation(self._prog_section_cap, "uHatchDir")
+        cap_sp_loc = glGetUniformLocation(self._prog_section_cap, "uHatchSpacing")
+        cap_key_loc = glGetUniformLocation(self._prog_section_cap, "uKeyDir")
+        cap_fill_loc = glGetUniformLocation(self._prog_section_cap, "uFillDir")
+
+        colliding_set = self._live_colliding_panels if self.live_collision_mode else set()
+
+        try:
+            glEnable(GL_STENCIL_TEST)
+            glDisable(GL_BLEND)
+            for idx, (panel, is_selected) in enumerate(opaque_panels):
+                if not glmath.panel_intersects_section_plane(panel, axis, offset):
+                    continue
+                gpu = self._panel_gpu.get(self._panel_gpu_key(panel))
+                if gpu is None or not gpu.get("count"):
+                    continue
+
+                if hasattr(panel, "world_aabb"):
+                    mn, mx = panel.world_aabb()
+                else:
+                    x0, y0, z0 = float(panel.x), float(panel.y), float(panel.z)
+                    mn = (x0, y0, z0)
+                    mx = (x0 + float(panel.width), y0 + float(panel.height), z0 + float(panel.depth))
+
+                verts_6, cap_normal, u_axis, v_axis = glmath.compute_section_cap_quad(
+                    axis, offset, flip, mn, mx, pad=20.0
+                )
+                style = glmath.compute_section_cap_style(
+                    panel,
+                    panel_index=idx,
+                    is_selected=is_selected,
+                    is_colliding=(panel in colliding_set),
+                )
+
+                # --- Проход 1: заполнение stencil-маски для текущей панели ---
+                glFrontFace(GL_CCW)
+                glStencilMask(0xFF)
+                glClearStencil(0)
+                glClear(GL_STENCIL_BUFFER_BIT)
+                glEnable(GL_CLIP_DISTANCE0)
+                glDisable(GL_DEPTH_TEST)
+                glDisable(GL_CULL_FACE)
+                glDisable(GL_POLYGON_OFFSET_FILL)
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
+                glDepthMask(GL_FALSE)
+                glStencilFunc(GL_ALWAYS, 0, 0xFF)
+                glStencilOpSeparate(GL_BACK, GL_KEEP, GL_KEEP, GL_INCR_WRAP)
+                glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_DECR_WRAP)
+
+                glUseProgram(self._prog_section_mask)
+                glUniformMatrix4fv(mask_mvp_loc, 1, GL_TRUE, self._mvp)
+                glUniform4f(
+                    mask_clip_loc,
+                    float(plane[0]),
+                    float(plane[1]),
+                    float(plane[2]),
+                    float(plane[3]),
+                )
+                glBindVertexArray(gpu["vao"])
+                glDrawElements(GL_TRIANGLES, gpu["count"], GL_UNSIGNED_INT, None)
+
+                # --- Проход 2: заливка и штриховка заглушки только там, где stencil != 0 ---
+                glDisable(GL_CLIP_DISTANCE0)
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
+                glDepthMask(GL_TRUE)
+                glEnable(GL_DEPTH_TEST)
+                glDepthFunc(GL_LEQUAL)
+                glEnable(GL_CULL_FACE)
+                glCullFace(GL_BACK)
+                glEnable(GL_POLYGON_OFFSET_FILL)
+                glPolygonOffset(1.0, 1.5)
+                glStencilMask(0x00)
+                glStencilFunc(GL_NOTEQUAL, 0, 0xFF)
+                glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP)
+
+                cap_arr = np.ascontiguousarray(verts_6, dtype=np.float32)
+                glUseProgram(self._prog_section_cap)
+                glUniformMatrix4fv(cap_mvp_loc, 1, GL_TRUE, self._mvp)
+                glUniform3f(cap_color_loc, *style["cap_color"])
+                glUniform3f(cap_hatch_loc, *style["hatch_color"])
+                glUniform3f(cap_norm_loc, *cap_normal)
+                glUniform3f(cap_u_loc, *u_axis)
+                glUniform3f(cap_v_loc, *v_axis)
+                glUniform2f(cap_dir_loc, *style["hatch_dir"])
+                glUniform1f(cap_sp_loc, float(style["hatch_spacing_mm"]))
+                glUniform3f(cap_key_loc, *key_dir)
+                glUniform3f(cap_fill_loc, *fill_dir)
+
+                glBindVertexArray(self._cap_vao)
+                glBindBuffer(GL_ARRAY_BUFFER, self._cap_vbo)
+                glBufferData(GL_ARRAY_BUFFER, cap_arr.nbytes, cap_arr, GL_DYNAMIC_DRAW)
+                glDrawArrays(GL_TRIANGLES, 0, 6)
+        finally:
+            glDisable(GL_STENCIL_TEST)
+            glStencilMask(0xFF)
+            glStencilFunc(GL_ALWAYS, 0, 0xFF)
+            glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP)
+            glDisable(GL_CULL_FACE)
+            glDisable(GL_POLYGON_OFFSET_FILL)
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
+            glDepthMask(GL_TRUE)
+            glEnable(GL_DEPTH_TEST)
+            glDepthFunc(GL_LESS)
+            if self.section_enabled:
+                glEnable(GL_CLIP_DISTANCE0)
+            glBindVertexArray(0)
+            glUseProgram(0)
+
     def toggle_ghost_others_mode(self, enabled: bool | None = None) -> bool:
         """Включает/выключает режим «Призраки окружения» (Isolate / Ghost Others)."""
         if enabled is None:
@@ -1799,14 +2322,14 @@ class Viewport3D(QOpenGLWidget):
             hits = self._refresh_live_collisions()
             if hits:
                 self.fastener_message.emit(
-                    f"⚡ Живые коллизии ВКЛ: обнаружено пересечений — {len(hits)}"
+                    f"Живые коллизии ВКЛ: обнаружено пересечений — {len(hits)}"
                 )
             else:
-                self.fastener_message.emit("⚡ Живые коллизии ВКЛ: пересечений не обнаружено")
+                self.fastener_message.emit("Живые коллизии ВКЛ: пересечений не обнаружено")
         else:
             self._live_collision_hits = []
             self._live_colliding_panels = set()
-            self.fastener_message.emit("⚡ Живые коллизии ВЫКЛ")
+            self.fastener_message.emit("Живые коллизии ВЫКЛ")
         self.update()
         return self.live_collision_mode
 
@@ -1858,36 +2381,21 @@ class Viewport3D(QOpenGLWidget):
             self._draw_lines(np.asarray(pts, dtype=np.float32), (0.98, 0.12, 0.20), 2.0)
         glEnable(GL_DEPTH_TEST)
 
-    def _draw_live_collisions_overlay(self, painter: QPainter) -> None:
-        """Отрисовывает 2D-бейджи зон врезания деталей и индикатор числа коллизий."""
-        if not self.live_collision_mode or not self._live_collision_hits:
-            return
-        self._sync_viewport_matrices()
-        red_border = QColor(239, 68, 68)
-        bg_dark = QColor(69, 10, 10, 225)
-        painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        fm = painter.fontMetrics()
-
-        for pa, pb, box, _vol in self._live_collision_hits[:8]:
-            ix, iy, iz, iw, ih, id_ = box
-            center = np.array([ix + iw * 0.5, iy + ih * 0.5, iz + id_ * 0.5], dtype=float)
-            scr = self._project_to_screen(center)
-            if scr is None:
-                continue
-            sx, sy = int(round(scr[0])), int(round(scr[1]))
-            dims_sorted = sorted([iw, ih, id_])
-            pen_depth = dims_sorted[0]
-            txt = f"⚡ Врезание {pen_depth:.1f} мм: {pa.name} × {pb.name}"
-            tw = fm.horizontalAdvance(txt) + 14
-            th = fm.height() + 6
-            rx = min(max(6, sx - tw // 2), max(6, self.width() - tw - 6))
-            ry = min(max(6, sy - th // 2), max(6, self.height() - th - 6))
-            rect = QRect(rx, ry, tw, th)
-            painter.setPen(QPen(red_border, 1.6))
-            painter.setBrush(bg_dark)
-            painter.drawRoundedRect(rect, 5, 5)
-            painter.setPen(QColor(254, 226, 226))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, txt)
+    def _overlay_palette(self) -> tuple[QColor, QColor, QColor, QColor, QColor, QColor]:
+        """Возвращает цвета текущей темы программы для 2D-оверлеев вьюпорта:
+        ``(bg, border, text, text_dim, accent, warning)``.
+        """
+        t = current_theme()
+        bg = QColor(t.bg_panel)
+        bg.setAlpha(242)
+        return (
+            bg,
+            QColor(t.border),
+            QColor(t.text),
+            QColor(t.text_dim),
+            QColor(t.accent),
+            QColor(t.warning),
+        )
 
     def _draw_panel_edges(self, p: Panel, color, include_features: bool = True):
         """Контур панели (с учётом поворота) + опционально пазы и отверстия."""
@@ -2279,6 +2787,277 @@ class Viewport3D(QOpenGLWidget):
         except Exception as exc:
             _log.debug("Превью ассоциативной точки не отрисовано: %s", exc)
 
+    def set_active_hole_owner(self, block, kind: str = "", owner_uid: str = "") -> None:
+        """Подсветить в 3D все отверстия выбранного стыка (joint) или ассоциации (assoc)."""
+        uid = str(owner_uid or "").strip()
+        if block is None or kind not in ("joint", "assoc") or not uid:
+            if self._active_hole_owner is not None:
+                self._active_hole_owner = None
+                self.update()
+            return
+        new_owner = (block, kind, uid)
+        if self._active_hole_owner != new_owner:
+            self._active_hole_owner = new_owner
+            self.update()
+
+    def _draw_highlighted_holes(self) -> None:
+        """Отрисовка 3D-подсветки отверстий выбранного или наведённого стыка/ассоциации."""
+        try:
+            glDisable(GL_DEPTH_TEST)
+            drawn: set[tuple[int, tuple]] = set()
+
+            # 1. Группа отверстий активного владельца (выбранного в доке «Стыки» / «Ассоциации»)
+            if self._active_hole_owner is not None:
+                blk, kind, uid = self._active_hole_owner
+                color = (0.12, 0.62, 1.0) if kind == "assoc" else (1.0, 0.56, 0.06)
+                for panel, hole in collect_owner_holes(blk, kind, uid):
+                    key = (id(panel), hole[:6])
+                    if key in drawn:
+                        continue
+                    drawn.add(key)
+                    hx, hy, hz, radius, length, axis = hole[:6]
+                    self._draw_panel_hole_wire(
+                        panel, hx, hy, hz, radius, length, axis,
+                        segs=24, color=color, width=2.4,
+                    )
+
+            # 2. Наведённое курсором отверстие + все отверстия того же стыка/ассоциации
+            hit = self._hovered_hole
+            if hit is not None:
+                if hit.has_owner:
+                    grp_color = (0.18, 0.78, 1.0) if hit.kind == "assoc" else (1.0, 0.72, 0.12)
+                    for panel, hole in collect_owner_holes(hit.block, hit.kind, hit.owner_uid):
+                        hx, hy, hz, radius, length, axis = hole[:6]
+                        self._draw_panel_hole_wire(
+                            panel, hx, hy, hz, radius, length, axis,
+                            segs=24, color=grp_color, width=2.4,
+                        )
+                # Акцент на самом отверстии под курсором
+                spot_color = (
+                    (0.25, 0.88, 1.0)
+                    if hit.kind == "assoc"
+                    else ((1.0, 0.88, 0.20) if hit.kind == "joint" else (0.95, 0.95, 0.95))
+                )
+                hx, hy, hz, radius, length, axis = hit.hole[:6]
+                self._draw_panel_hole_wire(
+                    hit.panel, hx, hy, hz, radius, length, axis,
+                    segs=28, color=spot_color, width=3.0,
+                )
+
+            glEnable(GL_DEPTH_TEST)
+        except Exception as exc:
+            _log.debug("Подсветка отверстий не отрисована: %s", exc)
+
+    def _draw_hole_hover_overlay(self, painter: QPainter) -> None:
+        """Компактная 2D-подсказка рядом с отверстием под курсором в стиле системной темы."""
+        hit = self._hovered_hole
+        if hit is None or hit.screen_mid is None:
+            return
+        text = describe_hole_hit(hit, include_hint=False, compact=True)
+        font = QFont("Segoe UI", 8)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(text)
+        th = fm.height()
+
+        stripe_w = 3
+        pad_x, pad_y = 7, 3
+        bw = tw + pad_x * 2 + stripe_w
+        bh = th + pad_y * 2
+
+        sx, sy = hit.screen_mid
+        bx = int(sx + 14)
+        by = int(sy - bh - 10)
+        vw = max(1, self.width())
+        vh = max(1, self.height())
+        if bx + bw > vw - 8:
+            bx = max(8, int(sx - bw - 14))
+        if by < 8:
+            by = min(vh - bh - 8, int(sy + 16))
+        bx = max(8, min(vw - bw - 8, bx))
+        by = max(8, min(vh - bh - 8, by))
+
+        bg, border, text_col, _text_dim, theme_accent, theme_warning = self._overlay_palette()
+        if hit.kind == "assoc":
+            kind_accent = theme_accent
+        elif hit.kind == "joint":
+            kind_accent = theme_warning
+        else:
+            kind_accent = border
+
+        rect = QRect(bx, by, bw, bh)
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, 3, 3)
+        painter.fillRect(QRect(bx + 1, by + 2, 2, max(1, bh - 4)), kind_accent)
+        painter.setPen(text_col)
+        painter.drawText(
+            rect.adjusted(pad_x + stripe_w, 0, -pad_x, 0),
+            Qt.AlignmentFlag.AlignVCenter,
+            text,
+        )
+
+    def _pick_panel_with_depth(self, origin: np.ndarray, ray_dir: np.ndarray) -> tuple[Panel | None, float | None]:
+        """Возвращает ближайшую панель под лучом и параметр глубины ``t`` (с учётом плоскости сечения)."""
+        plane = self.current_section_plane()
+        focus_set = self._get_focus_panels_set() if self.ghost_others_mode else set()
+        has_ghosts = bool(self.ghost_others_mode and focus_set)
+
+        closest_opaque = None
+        min_t_opaque = float("inf")
+        closest_ghost = None
+        min_t_ghost = float("inf")
+
+        for block in self.blocks:
+            for p in block.panels:
+                if not getattr(p, "visible", True):
+                    continue
+                t_hit = self._intersect_ray_panel(origin, ray_dir, p)
+                if t_hit is None:
+                    continue
+                hit_pt = origin + t_hit * ray_dir
+                if plane is not None and not glmath.point_passes_clip_plane(
+                    float(hit_pt[0]), float(hit_pt[1]), float(hit_pt[2]), plane
+                ):
+                    continue
+                if has_ghosts and p not in focus_set and not self.fastener_pick_second:
+                    if t_hit < min_t_ghost:
+                        min_t_ghost = t_hit
+                        closest_ghost = p
+                else:
+                    if t_hit < min_t_opaque:
+                        min_t_opaque = t_hit
+                        closest_opaque = p
+
+        if closest_opaque is not None:
+            return closest_opaque, float(min_t_opaque)
+        if closest_ghost is not None:
+            return closest_ghost, float(min_t_ghost)
+        return None, None
+
+    def pick_hole_at_screen(self, mx: int, my: int, *, max_screen_px: float = 12.0) -> HoleHit | None:
+        """Выбирает ближайшее 3D-отверстие под экранной точкой ``(mx, my)``."""
+        if not self.blocks:
+            return None
+        self._sync_viewport_matrices()
+        origin, ray_dir = self._mouse_ray(mx, my)
+        front_panel, occluded_t = self._pick_panel_with_depth(origin, ray_dir)
+        ignore_occlusion = (
+            self.display_mode in ("wireframe", "xray")
+            or bool(self.wireframe_only)
+        )
+        return pick_hole_at_ray(
+            self.blocks,
+            origin,
+            ray_dir,
+            mvp=self._mvp,
+            viewport=self._vp_size,
+            mouse_xy=(float(mx), float(my)),
+            dpr=float(self.devicePixelRatioF()),
+            max_screen_px=max_screen_px,
+            section_plane=self.current_section_plane(),
+            occluded_t=occluded_t,
+            front_panel=front_panel,
+            ignore_occlusion=ignore_occlusion,
+        )
+
+    def _can_pick_hole_in_current_mode(self) -> bool:
+        return not (
+            self.drag_mode
+            or self.fastener_mode
+            or self.fastener_pick_second
+            or self.measure_mode
+            or self.resize_mode
+            or self.paste_mode
+            or self.clipboard_await_anchor
+        )
+
+    def _update_hole_hover(self, mx: int, my: int) -> None:
+        if (
+            not self._can_pick_hole_in_current_mode()
+            or self._viewcube_hover is not None
+            or self.resize_hover_face is not None
+            or self.resize_hover_corner is not None
+        ):
+            if self._hovered_hole is not None:
+                self._hovered_hole = None
+                self.update()
+            return
+        try:
+            hit = self.pick_hole_at_screen(mx, my)
+        except Exception as exc:
+            _log.debug("Hole hover pick failed: %s", exc)
+            hit = None
+
+        prev = self._hovered_hole
+        changed = (
+            (prev is None) != (hit is None)
+            or (
+                prev is not None
+                and hit is not None
+                and (prev.panel is not hit.panel or prev.hole_index != hit.hole_index)
+            )
+        )
+        if changed:
+            self._hovered_hole = hit
+            try:
+                if hit is not None and hit.has_owner:
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                elif self._viewcube_hover is None:
+                    self.unsetCursor()
+            except Exception as exc:
+                _log.debug("Hole hover cursor update failed: %s", exc)
+            self.update()
+
+    def _navigate_to_hole_hit(self, hit: HoleHit) -> bool:
+        """Переход от 3D-отверстия к породившему стыку, ассоциации или свойствам детали."""
+        if hit.has_owner:
+            self._active_hole_owner = (hit.block, hit.kind, hit.owner_uid)
+        else:
+            self._active_hole_owner = None
+        self.hole_navigated.emit(hit.block, hit.kind, hit.owner_uid, hit.panel)
+        self.update()
+        return True
+
+    def _show_hole_context_menu(self, hit: HoleHit, global_pos) -> None:
+        """Контекстное меню по короткому ПКМ на 3D-отверстии."""
+        menu = QMenu(self)
+        title_act = menu.addAction(describe_hole_hit(hit, include_hint=False, compact=False))
+        title_act.setEnabled(False)
+        menu.addSeparator()
+
+        act_nav = None
+        act_edit = None
+        if hit.kind == "joint":
+            act_nav = menu.addAction("Перейти к стыку в панели «Стыки»")
+        elif hit.kind == "assoc":
+            act_nav = menu.addAction("Перейти к ассоциации в панели «Ассоциации»")
+            act_edit = menu.addAction("Правка ассоциации…")
+        else:
+            act_nav = menu.addAction("Выбрать деталь и открыть «Свойства»")
+
+        act_focus = menu.addAction("Сфокусировать камеру на отверстии")
+
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+        if chosen is act_nav:
+            self._navigate_to_hole_hit(hit)
+        elif act_edit is not None and chosen is act_edit:
+            self._active_hole_owner = (hit.block, hit.kind, hit.owner_uid)
+            self.hole_edit_requested.emit(hit.block, hit.kind, hit.owner_uid, hit.panel)
+            self.update()
+        elif chosen is act_focus:
+            self.animate_camera_to(
+                float(self.rot_x),
+                float(self.rot_y),
+                is_ortho=self.is_ortho,
+                target_pivot=hit.world_mid,
+            )
+            self.fastener_message.emit(
+                f"Фокус на отверстие ({hit.world_mid[0]:.0f}, {hit.world_mid[1]:.0f}, {hit.world_mid[2]:.0f}) мм"
+            )
+
     def _draw_joint_and_preview(self):
         j = self.fastener_joint
         if j is None:
@@ -2350,7 +3129,7 @@ class Viewport3D(QOpenGLWidget):
         self.ctrl_held = False
         self.setCursor(Qt.CursorShape.CrossCursor)
         msg = (
-            "📏 Умная 3D-линейка: наведите на грань, отверстие, ребро или угол | "
+            "Умная 3D-линейка: наведите на грань, отверстие, ребро или угол | "
             "2 грани → в свету / угол | 2 отверстия → шаг | [Ctrl] — магнит | Esc — выход"
         )
         self.measurement_updated.emit(msg)
@@ -2717,7 +3496,7 @@ class Viewport3D(QOpenGLWidget):
                 l1 = ang_tmp.distance1
                 l2 = ang_tmp.distance2
                 right_tag = " [Прямой угол 90°]" if ang_tmp.is_right_angle else ""
-                msg = f"📐 Угол: {deg:.1f}°{right_tag} (L1: {l1:.1f} мм, L2: {l2:.1f} мм){ctrl_badge} | ЛКМ — зафиксировать угол | Esc — оставить отрезок"
+                msg = f"Угол: {deg:.1f}°{right_tag} (L1: {l1:.1f} мм, L2: {l2:.1f} мм){ctrl_badge} | ЛКМ — зафиксировать угол | Esc — оставить отрезок"
                 self.measurement_updated.emit(msg)
                 self.fastener_message.emit(msg)
             elif self.measure_pt1 is not None:
@@ -2741,15 +3520,15 @@ class Viewport3D(QOpenGLWidget):
                 self.measure_preview_dim = None
                 self.measure_preview_angle = None
                 if cur_target.is_hole:
-                    msg = f"🕳 {snap_desc}{ctrl_badge} | ЛКМ — замерить шаг до другого отверстия или отступ до грани"
+                    msg = f"Отверстие: {snap_desc}{ctrl_badge} | ЛКМ — замерить шаг до другого отверстия или отступ до грани"
                 elif cur_target.is_edge:
-                    msg = f"📏 {snap_desc}{ctrl_badge} ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}) | ЛКМ — первая точка"
+                    msg = f"{snap_desc}{ctrl_badge} ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}) | ЛКМ — первая точка"
                 elif cur_target.is_face:
-                    msg = f"▭ {snap_desc} | ЛКМ — кликните 2 грани для замера В СВЕТУ (если параллельны) или УГЛА"
+                    msg = f"Грань: {snap_desc} | ЛКМ — кликните 2 грани для замера в свету или угла"
                 elif is_magnetic:
-                    msg = f"🧲 Привязка [{snap_desc}]{ctrl_badge} ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}) | ЛКМ — первая точка"
+                    msg = f"Привязка [{snap_desc}]{ctrl_badge} ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}) | ЛКМ — первая точка"
                 else:
-                    msg = f"📏 Рулетка: [{snap_desc}] ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}) | Зажмите [Ctrl] для магнитного захвата углов/рёбер/отверстий"
+                    msg = f"Рулетка: [{snap_desc}] ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}) | Зажмите [Ctrl] для магнитного захвата углов/рёбер/отверстий"
                 self.measurement_updated.emit(msg)
         else:
             # Общий режим (рулетка выключена): примагничивание по нажатию Ctrl без выделения панели
@@ -2931,10 +3710,12 @@ class Viewport3D(QOpenGLWidget):
         glEnable(GL_DEPTH_TEST)
 
     def _draw_dimensions_overlay(self, painter: QPainter):
-        """Отрисовывает 2D маркеры, текстовые бейджи размеров и подсказки привязки."""
+        """Отрисовывает 2D маркеры и бейджи размеров в стиле темы программы."""
         dpr = float(self.devicePixelRatioF())
         vp = self._vp_size
         mvp = self._mvp
+        bg, border, text_col, text_dim, theme_accent, theme_warning = self._overlay_palette()
+        fixed_dim_accent = QColor(217, 119, 6)
 
         # --- 1. Отрисовка бейджей линейных размеров ---
         all_dims = []
@@ -2959,13 +3740,14 @@ class Viewport3D(QOpenGLWidget):
             except Exception:
                 continue
 
+            stripe_col = theme_accent if is_active else fixed_dim_accent
             for pt in (dim.pt1, dim.pt2):
                 try:
                     px, py, pz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
                     if 0.0 <= pz <= 1.0:
                         psx, psy = int(px / dpr), int((vp[3] - py) / dpr)
-                        painter.setPen(QPen(QColor(255, 255, 255), 2))
-                        painter.setBrush(QColor(245, 115, 20) if not is_active else QColor(14, 165, 233))
+                        painter.setPen(QPen(bg, 1.5))
+                        painter.setBrush(stripe_col)
                         painter.drawEllipse(QPoint(psx, psy), 4, 4)
                 except Exception as exc:
                     _log.debug("Ошибка отрисовки маркера размерной точки: %s", exc)
@@ -2973,7 +3755,7 @@ class Viewport3D(QOpenGLWidget):
             main_text = dim.main_badge_text()
             sub_text = dim.sub_badge_text()
 
-            font_main = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            font_main = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
             font_sub = QFont("Segoe UI", 7, QFont.Weight.Normal)
 
             painter.setFont(font_main)
@@ -2986,26 +3768,34 @@ class Viewport3D(QOpenGLWidget):
             w2 = fm_sub.horizontalAdvance(sub_text)
             h2 = fm_sub.height()
 
-            box_w = max(w1, w2) + 20
-            box_h = h1 + h2 + 8
+            stripe_w = 3
+            box_w = max(w1, w2) + 16 + stripe_w
+            box_h = h1 + h2 + 6
             rect_x = sx - box_w // 2
             rect_y = sy - box_h // 2
 
             badge_rect = QRect(rect_x, rect_y, box_w, box_h)
-            bg_col = QColor(15, 23, 42, 230) if not is_active else QColor(12, 74, 110, 240)
-            border_col = QColor(245, 115, 20) if not is_active else QColor(56, 189, 248)
+            painter.setPen(QPen(theme_accent if is_active else border, 1.0))
+            painter.setBrush(bg)
+            painter.drawRoundedRect(badge_rect, 3, 3)
+            painter.fillRect(QRect(rect_x + 1, rect_y + 2, 2, max(1, box_h - 4)), stripe_col)
 
-            painter.setPen(QPen(border_col, 1.5))
-            painter.setBrush(bg_col)
-            painter.drawRoundedRect(badge_rect, 6, 6)
-
+            text_rect_w = box_w - stripe_w
             painter.setFont(font_main)
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(QRect(rect_x, rect_y + 4, box_w, h1), Qt.AlignmentFlag.AlignCenter, main_text)
+            painter.setPen(text_col)
+            painter.drawText(
+                QRect(rect_x + stripe_w, rect_y + 3, text_rect_w, h1),
+                Qt.AlignmentFlag.AlignCenter,
+                main_text,
+            )
 
             painter.setFont(font_sub)
-            painter.setPen(QColor(203, 213, 225))
-            painter.drawText(QRect(rect_x, rect_y + 6 + h1, box_w, h2), Qt.AlignmentFlag.AlignCenter, sub_text)
+            painter.setPen(text_dim)
+            painter.drawText(
+                QRect(rect_x + stripe_w, rect_y + 4 + h1, text_rect_w, h2),
+                Qt.AlignmentFlag.AlignCenter,
+                sub_text,
+            )
 
         # --- 2. Отрисовка бейджей углов (DimensionAngle) ---
         all_angles_list = []
@@ -3028,13 +3818,14 @@ class Viewport3D(QOpenGLWidget):
             except Exception:
                 continue
 
+            ang_stripe = theme_accent if is_active else theme_warning
             try:
                 vx, vy, vz = glmath.project(ang.vertex[0], ang.vertex[1], ang.vertex[2], mvp, vp)
                 if 0.0 <= vz <= 1.0:
                     vsx, vsy = int(vx / dpr), int((vp[3] - vy) / dpr)
-                    painter.setPen(QPen(QColor(255, 255, 255), 2))
-                    painter.setBrush(QColor(251, 191, 36) if not is_active else QColor(56, 189, 248))
-                    painter.drawEllipse(QPoint(vsx, vsy), 5, 5)
+                    painter.setPen(QPen(bg, 1.5))
+                    painter.setBrush(ang_stripe)
+                    painter.drawEllipse(QPoint(vsx, vsy), 4, 4)
             except Exception as exc:
                 _log.debug("Ошибка отрисовки маркера вершины угла: %s", exc)
 
@@ -3045,7 +3836,7 @@ class Viewport3D(QOpenGLWidget):
 
             angle_sub = f"L1: {ang.distance1:.0f}  L2: {ang.distance2:.0f} мм"
 
-            font_angle = QFont("Segoe UI", 10, QFont.Weight.Bold)
+            font_angle = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
             font_ang_sub = QFont("Segoe UI", 7, QFont.Weight.Normal)
 
             painter.setFont(font_angle)
@@ -3058,30 +3849,38 @@ class Viewport3D(QOpenGLWidget):
             w_ang_sub = fm_ang_sub.horizontalAdvance(angle_sub)
             h_ang_sub = fm_ang_sub.height()
 
-            abox_w = max(w_ang, w_ang_sub) + 20
-            abox_h = h_ang + h_ang_sub + 8
+            stripe_w = 3
+            abox_w = max(w_ang, w_ang_sub) + 16 + stripe_w
+            abox_h = h_ang + h_ang_sub + 6
             arect_x = asx - abox_w // 2
             arect_y = asy - abox_h // 2
 
             abadge_rect = QRect(arect_x, arect_y, abox_w, abox_h)
-            abg_col = QColor(15, 23, 42, 235) if not is_active else QColor(12, 74, 110, 245)
-            aborder_col = QColor(251, 191, 36) if not is_active else QColor(56, 189, 248)
+            painter.setPen(QPen(theme_accent if is_active else border, 1.0))
+            painter.setBrush(bg)
+            painter.drawRoundedRect(abadge_rect, 3, 3)
+            painter.fillRect(QRect(arect_x + 1, arect_y + 2, 2, max(1, abox_h - 4)), ang_stripe)
 
-            painter.setPen(QPen(aborder_col, 2))
-            painter.setBrush(abg_col)
-            painter.drawRoundedRect(abadge_rect, 6, 6)
-
+            atext_w = abox_w - stripe_w
             painter.setFont(font_angle)
-            painter.setPen(QColor(251, 191, 36) if not is_active else QColor(255, 255, 255))
-            painter.drawText(QRect(arect_x, arect_y + 4, abox_w, h_ang), Qt.AlignmentFlag.AlignCenter, angle_title)
+            painter.setPen(text_col)
+            painter.drawText(
+                QRect(arect_x + stripe_w, arect_y + 3, atext_w, h_ang),
+                Qt.AlignmentFlag.AlignCenter,
+                angle_title,
+            )
 
             painter.setFont(font_ang_sub)
-            painter.setPen(QColor(203, 213, 225))
-            painter.drawText(QRect(arect_x, arect_y + 6 + h_ang, abox_w, h_ang_sub), Qt.AlignmentFlag.AlignCenter, angle_sub)
+            painter.setPen(text_dim)
+            painter.drawText(
+                QRect(arect_x + stripe_w, arect_y + 4 + h_ang, atext_w, h_ang_sub),
+                Qt.AlignmentFlag.AlignCenter,
+                angle_sub,
+            )
 
-        # --- 3. Отрисовка маркера привязки, силового луча [Ctrl] и смарт-бейджа цели под курсором ---
+        # --- 3. Отрисовка маркера привязки, силового луча [Ctrl] и компактной подсказки цели ---
         if (self.measure_mode or getattr(self, "ctrl_held", False)) and self.measure_snap_info is not None:
-            snap_pt, snap_desc = self.measure_snap_info
+            snap_pt, _snap_desc = self.measure_snap_info
             is_mag = getattr(self, "measure_is_magnetic", False)
             is_ctrl = getattr(self, "ctrl_held", False)
             mouse_pos = getattr(self, "measure_mouse_pos", None)
@@ -3127,60 +3926,30 @@ class Viewport3D(QOpenGLWidget):
                     painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawEllipse(QPoint(sx, sy), 3, 3)
 
-                # Плавающий смарт-паспорт элемента под курсором (отверстие Ø/глубина/отступ, длина ребра, грань)
+                # Компактная подсказка элемента под курсором в стиле системной темы
                 cur_t = self.measure_current_target
                 if self.measure_mode and cur_t is not None and (cur_t.is_hole or cur_t.is_edge or cur_t.is_face):
                     info_text = cur_t.format_hover_summary()
-                    font_tip = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
+                    font_tip = QFont("Segoe UI", 8)
                     painter.setFont(font_tip)
                     fm_tip = painter.fontMetrics()
-                    tw = fm_tip.horizontalAdvance(info_text) + 16
-                    th = fm_tip.height() + 8
+                    stripe_w = 3
+                    pad_x, pad_y = 7, 3
+                    tw = fm_tip.horizontalAdvance(info_text) + pad_x * 2 + stripe_w
+                    th = fm_tip.height() + pad_y * 2
                     tx = min(max(8, sx + 14), max(8, self.width() - tw - 8))
-                    ty = max(48, sy - th - 10)
-                    painter.setPen(QPen(QColor(56, 189, 248, 210), 1.2))
-                    painter.setBrush(QColor(15, 23, 42, 225))
-                    painter.drawRoundedRect(QRect(tx, ty, tw, th), 5, 5)
-                    painter.setPen(QColor(241, 245, 249))
-                    painter.drawText(QRect(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, info_text)
-
-        # --- 4. Верхний плавающий HUD-баннер ТОЛЬКО в активном режиме рулетки ---
-        if self.measure_mode:
-            banner_w = min(740, self.width() - 40)
-            banner_h = 32
-            bx = (self.width() - banner_w) // 2
-            by = 12
-
-            is_ctrl = getattr(self, "ctrl_held", False)
-            banner_border = QColor(249, 115, 22) if is_ctrl else QColor(100, 116, 139)
-            painter.setPen(QPen(banner_border, 1.5))
-            painter.setBrush(QColor(15, 23, 42, 230))
-            painter.drawRoundedRect(QRect(bx, by, banner_w, banner_h), 6, 6)
-
-            if self.measure_pt1 is None:
-                hud_msg = (
-                    "📏 Умная 3D-линейка: кликните грань, отверстие, ребро или точку | "
-                    "2 грани → в свету / угол | [Ctrl] — магнит | Esc — выход"
-                )
-            elif self.measure_pt2 is None:
-                if self.measure_preview_dim is not None:
-                    dist_str = self.measure_preview_dim.main_badge_text()
-                elif self.measure_current_pt is not None:
-                    dist_str = f"{np.linalg.norm(self.measure_current_pt - self.measure_pt1):.1f} мм"
-                else:
-                    dist_str = ""
-                hud_msg = f"📏 Укажите 2-й объект [{dist_str}] | [Ctrl] — магнит | Esc — сбросить"
-            else:
-                deg_str = ""
-                if self.measure_current_pt is not None:
-                    ang_tmp = DimensionAngle(self.measure_pt1, self.measure_pt2, self.measure_current_pt)
-                    right_tag = " [Прямой 90°]" if ang_tmp.is_right_angle else ""
-                    deg_str = f" [Угол: {ang_tmp.angle_deg:.1f}°{right_tag}]"
-                hud_msg = f"📐 Кликните точку 3 для фиксации УГЛА{deg_str} | Esc — оставить отрезок"
-
-            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(QRect(bx, by, banner_w, banner_h), Qt.AlignmentFlag.AlignCenter, hud_msg)
+                    ty = max(8, sy - th - 10)
+                    tip_rect = QRect(tx, ty, tw, th)
+                    painter.setPen(QPen(border, 1.0))
+                    painter.setBrush(bg)
+                    painter.drawRoundedRect(tip_rect, 3, 3)
+                    painter.fillRect(QRect(tx + 1, ty + 2, 2, max(1, th - 4)), theme_accent)
+                    painter.setPen(text_col)
+                    painter.drawText(
+                        tip_rect.adjusted(pad_x + stripe_w, 0, -pad_x, 0),
+                        Qt.AlignmentFlag.AlignVCenter,
+                        info_text,
+                    )
 
     def _mouse_ray(self, mx: int, my: int):
         """Луч из камеры в мир (origin, direction)."""
@@ -3209,7 +3978,7 @@ class Viewport3D(QOpenGLWidget):
             panel = self.get_selected_panel()
 
         if panel is None:
-            self.fastener_message.emit("🎯 Перемещение (G): сначала выберите деталь (кликните ЛКМ), затем нажмите 'G'")
+            self.fastener_message.emit("Перемещение (G): сначала выберите деталь (ЛКМ), затем нажмите G")
             return
 
         self.stop_measure_mode()
@@ -3230,7 +3999,7 @@ class Viewport3D(QOpenGLWidget):
         my = self.last_mouse_pos.y() if hasattr(self, "last_mouse_pos") and not self.last_mouse_pos.isNull() else self.height() // 2
         self.drag_hover_point, self.drag_hover_desc = self._find_base_snap_point(mx, my)
 
-        msg = f"🎯 [G] Кликните ЛКМ по точке за которую будете тащить [{panel.name}] (угол, торец, ребро, центр) | Esc — отмена"
+        msg = f"[G] Выберите базовую точку [{panel.name}] (ЛКМ) | Esc — отмена"
         self.fastener_message.emit(msg)
         self.update()
 
@@ -3566,7 +4335,7 @@ class Viewport3D(QOpenGLWidget):
 
 
     def _draw_drag_overlay(self, painter: QPainter):
-        """Отрисовывает 2D HUD, маркеры и бейджи для интерактивного перемещения мышкой."""
+        """Отрисовывает только компактные 2D-маркеры базовой и целевой точек при перемещении (G)."""
         if not self.drag_mode:
             return
 
@@ -3574,23 +4343,7 @@ class Viewport3D(QOpenGLWidget):
         vp = self._vp_size
         mvp = self._mvp
 
-        banner_w = min(680, self.width() - 40)
-        banner_h = 34
-        bx = (self.width() - banner_w) // 2
-        by = 12
-
-        painter.setPen(QPen(QColor(6, 182, 212), 1.8))
-        painter.setBrush(QColor(15, 23, 42, 240))
-        painter.drawRoundedRect(QRect(bx, by, banner_w, banner_h), 6, 6)
-
-        panel_name = self.drag_panel.name if self.drag_panel else "детали"
-
         if self.drag_stage == 1:
-            hud_msg = f"🎯 [G] Кликните ЛКМ по точке за которую будете тащить [{panel_name}] | Esc — отмена"
-            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(QRect(bx, by, banner_w, banner_h), Qt.AlignmentFlag.AlignCenter, hud_msg)
-
             # Маркер точки зацепа под курсором на выбранной детали
             if self.drag_hover_point is not None:
                 pt = self.drag_hover_point
@@ -3600,7 +4353,6 @@ class Viewport3D(QOpenGLWidget):
                         sx = int(wx / dpr)
                         sy = int((vp[3] - wy) / dpr)
 
-                        # Оранжевый ромбик без заливки
                         painter.setPen(QPen(QColor(249, 115, 22), 2.0))
                         painter.setBrush(Qt.BrushStyle.NoBrush)
                         poly = [QPoint(sx, sy - 8), QPoint(sx + 8, sy), QPoint(sx, sy + 8), QPoint(sx - 8, sy)]
@@ -3608,11 +4360,6 @@ class Viewport3D(QOpenGLWidget):
                 except Exception as exc:
                     _log.debug("Ошибка отрисовки маркера зацепа (drag stage 1): %s", exc)
         elif self.drag_stage == 2:
-            hud_msg = f"📦 [{panel_name}] следует за курсором (без зажатия ЛКМ) | Клик ЛКМ — зафиксировать | [Ctrl] — магнит | Esc — отмена"
-            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(QRect(bx, by, banner_w, banner_h), Qt.AlignmentFlag.AlignCenter, hud_msg)
-
             # Маркер исходной базовой точки
             if self.drag_base_point is not None:
                 bpt = self.drag_base_point
@@ -3623,63 +4370,27 @@ class Viewport3D(QOpenGLWidget):
                         bsy = int((vp[3] - wy) / dpr)
                         painter.setPen(QPen(QColor(245, 115, 20), 2))
                         painter.setBrush(QColor(245, 115, 20, 60))
-                        painter.drawEllipse(QPoint(bsx, bsy), 7, 7)
+                        painter.drawEllipse(QPoint(bsx, bsy), 6, 6)
                         painter.setBrush(QColor(255, 255, 255))
                         painter.drawEllipse(QPoint(bsx, bsy), 2, 2)
                 except Exception as exc:
                     _log.debug("Ошибка отрисовки базовой точки (drag stage 2): %s", exc)
 
-            # Маркер целевой точки и информационный бейдж
-            if self.drag_target_point is not None and self.drag_base_point is not None:
+            # Маркер целевой точки (перекрестие без всплывающей плашки)
+            if self.drag_target_point is not None:
                 tpt = self.drag_target_point
                 try:
                     wx, wy, wz = glmath.project(tpt[0], tpt[1], tpt[2], mvp, vp)
                     if 0.0 <= wz <= 1.0:
                         tsx = int(wx / dpr)
                         tsy = int((vp[3] - wy) / dpr)
-
-                        painter.setPen(QPen(QColor(6, 182, 212), 2))
-                        painter.setBrush(QColor(6, 182, 212, 80))
-                        painter.drawEllipse(QPoint(tsx, tsy), 9, 9)
-                        painter.drawLine(tsx - 14, tsy, tsx + 14, tsy)
-                        painter.drawLine(tsx, tsy - 14, tsx, tsy + 14)
-
-                        delta = self.drag_target_point - self.drag_base_point
-                        dist = float(np.linalg.norm(delta))
-
-                        title = f"🎯 {self.drag_target_desc}"
-                        sub = f"ΔX: {delta[0]:+.1f}  ΔY: {delta[1]:+.1f}  ΔZ: {delta[2]:+.1f}  |  L: {dist:.1f} мм"
-
-                        f_title = QFont("Segoe UI", 9, QFont.Weight.Bold)
-                        f_sub = QFont("Segoe UI", 7, QFont.Weight.Normal)
-
-                        painter.setFont(f_title)
-                        w_t = painter.fontMetrics().horizontalAdvance(title)
-                        h_t = painter.fontMetrics().height()
-
-                        painter.setFont(f_sub)
-                        w_s = painter.fontMetrics().horizontalAdvance(sub)
-                        h_s = painter.fontMetrics().height()
-
-                        bw = max(w_t, w_s) + 20
-                        bh = h_t + h_s + 10
-                        rx = tsx + 16
-                        ry = tsy - bh // 2
-
-                        card_rect = QRect(rx, ry, bw, bh)
-                        painter.setPen(QPen(QColor(6, 182, 212), 1.8))
-                        painter.setBrush(QColor(15, 23, 42, 235))
-                        painter.drawRoundedRect(card_rect, 6, 6)
-
-                        painter.setFont(f_title)
-                        painter.setPen(QColor(6, 182, 212))
-                        painter.drawText(QRect(rx, ry + 4, bw, h_t), Qt.AlignmentFlag.AlignCenter, title)
-
-                        painter.setFont(f_sub)
-                        painter.setPen(QColor(226, 232, 240))
-                        painter.drawText(QRect(rx, ry + 6 + h_t, bw, h_s), Qt.AlignmentFlag.AlignCenter, sub)
+                        painter.setPen(QPen(QColor(0, 120, 212), 1.8))
+                        painter.setBrush(QColor(0, 120, 212, 55))
+                        painter.drawEllipse(QPoint(tsx, tsy), 7, 7)
+                        painter.drawLine(tsx - 11, tsy, tsx + 11, tsy)
+                        painter.drawLine(tsx, tsy - 11, tsx, tsy + 11)
                 except Exception as exc:
-                    _log.debug("Ошибка отрисовки целевого бейджа перетаскивания: %s", exc)
+                    _log.debug("Ошибка отрисовки целевого маркера перетаскивания: %s", exc)
 
     def _update_fastener_preview(self, mx: int, my: int):
         if not self.fastener_mode or self.fastener_joint is None:
@@ -4612,6 +5323,10 @@ class Viewport3D(QOpenGLWidget):
             self._middle_press_pos = QPoint(event.pos())
             self._middle_did_drag = False
 
+        if event.button() == Qt.MouseButton.RightButton:
+            self._right_press_pos = QPoint(event.pos())
+            self._right_did_drag = False
+
         if event.button() == Qt.MouseButton.LeftButton:
             # ViewCube: захват для клика (грань/ребро/угол/Home) или вращения перетаскиванием куба
             if self._begin_viewcube_interaction(event.pos().x(), event.pos().y()):
@@ -4723,6 +5438,10 @@ class Viewport3D(QOpenGLWidget):
             if abs(dx) > 2 or abs(dy) > 2:
                 self._middle_did_drag = True
 
+        if event.buttons() & Qt.MouseButton.RightButton:
+            if abs(dx) > 2 or abs(dy) > 2:
+                self._right_did_drag = True
+
         if self.resize_mode and self.resize_panel is not None:
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self.is_dragging = True
@@ -4778,6 +5497,10 @@ class Viewport3D(QOpenGLWidget):
                     self.resize_panel = new_panel
                 self.update()
 
+        # Hover 3D-отверстий (для подсветки группы стыка/ассоциации и навигации)
+        if not event.buttons():
+            self._update_hole_hover(event.pos().x(), event.pos().y())
+
         if self.paste_mode and self.clipboard is not None and self.clipboard.anchor is not None:
             raw, desc = self._find_target_snap_point(event.pos().x(), event.pos().y())
             if raw is None:
@@ -4802,7 +5525,7 @@ class Viewport3D(QOpenGLWidget):
         if self.drag_mode:
             if self.drag_stage == 1:
                 self.drag_hover_point, self.drag_hover_desc = self._find_base_snap_point(event.pos().x(), event.pos().y())
-                msg = f"🎯 Точка зацепа: [{self.drag_hover_desc}] ({self.drag_hover_point[0]:.1f}, {self.drag_hover_point[1]:.1f}, {self.drag_hover_point[2]:.1f}) | Кликните ЛКМ — начать перемещение, Esc — отмена"
+                msg = f"Точка зацепа: [{self.drag_hover_desc}] ({self.drag_hover_point[0]:.1f}, {self.drag_hover_point[1]:.1f}, {self.drag_hover_point[2]:.1f}) | ЛКМ — начать, Esc — отмена"
                 self.fastener_message.emit(msg)
                 self.update()
             elif self.drag_stage == 2:
@@ -5004,7 +5727,7 @@ class Viewport3D(QOpenGLWidget):
                             target_pivot=piv,
                         )
                         self.fastener_message.emit(
-                            f"🎯 Фокус на точку ({piv[0]:.0f}, {piv[1]:.0f}, {piv[2]:.0f}) мм"
+                            f"Фокус на точку ({piv[0]:.0f}, {piv[1]:.0f}, {piv[2]:.0f}) мм"
                         )
                     except Exception as exc:
                         _log.debug("Middle-click focus failed: %s", exc)
@@ -5015,7 +5738,29 @@ class Viewport3D(QOpenGLWidget):
             if self.drag_mode:
                 self.cancel_drag_mode()
                 self.is_dragging = False
+                self._right_press_pos = None
+                self._right_did_drag = False
                 return
+            # Короткий ПКМ без перетаскивания по отверстию -> контекстное меню навигации
+            if (
+                self._right_press_pos is not None
+                and not self._right_did_drag
+                and self._can_pick_hole_in_current_mode()
+            ):
+                rdist = math.hypot(
+                    event.pos().x() - self._right_press_pos.x(),
+                    event.pos().y() - self._right_press_pos.y(),
+                )
+                if rdist < 6.0:
+                    hit = self.pick_hole_at_screen(event.pos().x(), event.pos().y())
+                    if hit is not None:
+                        self._right_press_pos = None
+                        self._right_did_drag = False
+                        self.is_dragging = False
+                        self._show_hole_context_menu(hit, event.globalPosition().toPoint())
+                        return
+            self._right_press_pos = None
+            self._right_did_drag = False
 
         if event.button() == Qt.MouseButton.LeftButton:
             click_dist = math.hypot(event.pos().x() - self.press_pos.x(), event.pos().y() - self.press_pos.y())
@@ -5063,7 +5808,7 @@ class Viewport3D(QOpenGLWidget):
                     self.drag_target_desc = "Начальное положение"
                     self.drag_stage = 2  # ПОСЛЕ ОДНОКРАТНОГО КЛИКА ПАНЕЛЬ СРАЗУ СЛЕДУЕТ ЗА КУРСОРОМ!
 
-                    msg = f"📦 [{self.drag_panel.name}] следует за курсором (зацеп: {self.drag_base_desc}) | Клик ЛКМ — зафиксировать | [Ctrl] — магнит | Esc/ПКМ — отмена"
+                    msg = f"[{self.drag_panel.name}] перемещение (зацеп: {self.drag_base_desc}) | ЛКМ — зафиксировать | [Ctrl] — магнит | Esc/ПКМ — отмена"
                     self.fastener_message.emit(msg)
                     self.update()
                     self.is_dragging = False
@@ -5136,6 +5881,18 @@ class Viewport3D(QOpenGLWidget):
 
             # is_click: даже если is_dragging=True из-за дрожания мыши — выделяем кликом
             if is_click or not self.is_dragging or self.fastener_pick_second:
+                # Alt+клик ЛКМ по отверстию — мгновенный переход к стыку / ассоциации
+                if (
+                    is_click
+                    and bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+                    and self._can_pick_hole_in_current_mode()
+                ):
+                    hit = self.pick_hole_at_screen(event.pos().x(), event.pos().y())
+                    if hit is not None:
+                        self._navigate_to_hole_hit(hit)
+                        self.is_dragging = False
+                        return
+
                 self._sync_viewport_matrices()
                 clicked_panel = self._pick_panel_raycast(event.pos().x(), event.pos().y())
 
@@ -5158,6 +5915,7 @@ class Viewport3D(QOpenGLWidget):
                     self.is_dragging = False
                     return
 
+                self._active_hole_owner = None
                 shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
 
                 if not shift:
@@ -5178,6 +5936,19 @@ class Viewport3D(QOpenGLWidget):
 
         self.is_dragging = False
 
+    def mouseDoubleClickEvent(self, event):
+        """Двойной клик ЛКМ по отверстию в 3D — переход к породившему стыку или ассоциации."""
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._can_pick_hole_in_current_mode()
+            and self._viewcube_hover is None
+        ):
+            hit = self.pick_hole_at_screen(event.pos().x(), event.pos().y())
+            if hit is not None:
+                self._navigate_to_hole_hit(hit)
+                return
+        super().mouseDoubleClickEvent(event)
+
     def paintEvent(self, event):
         super().paintEvent(event)
         has_rect = (
@@ -5189,14 +5960,10 @@ class Viewport3D(QOpenGLWidget):
         has_drag = self.drag_mode
         has_snap = bool(getattr(self, "ctrl_held", False) and getattr(self, "measure_snap_info", None) is not None)
         has_handles = bool(self.get_selected_panels()) and not self.drag_mode
-        has_collisions = bool(self.live_collision_mode and self._live_collision_hits)
         # ViewCube всегда рисуем
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-
-        if has_collisions:
-            self._draw_live_collisions_overlay(painter)
 
         if has_dims or has_snap:
             self._draw_dimensions_overlay(painter)
@@ -5206,6 +5973,9 @@ class Viewport3D(QOpenGLWidget):
 
         if has_handles:
             self._draw_resize_handles(painter)
+
+        if self._hovered_hole is not None and self._can_pick_hole_in_current_mode():
+            self._draw_hole_hover_overlay(painter)
 
         try:
             from ui.viewcube import draw_viewcube
@@ -5414,7 +6184,7 @@ class Viewport3D(QOpenGLWidget):
                     self.measure_target1 = None
                     self.measure_preview_dim = None
                     self.measure_preview_angle = None
-                    msg = "📏 Линейный размер сохранен. Выберите точку для нового замера."
+                    msg = "Линейный размер сохранен. Выберите точку для нового замера."
                     self.measurement_updated.emit(msg)
                     self.fastener_message.emit(msg)
                     self.update()
@@ -5425,7 +6195,7 @@ class Viewport3D(QOpenGLWidget):
                     self.measure_target1 = None
                     self.measure_preview_dim = None
                     self.measure_preview_angle = None
-                    msg = "📏 Рулетка: измерение сброшено. Выберите первую точку."
+                    msg = "Рулетка: измерение сброшено. Выберите первую точку."
                     self.measurement_updated.emit(msg)
                     self.fastener_message.emit(msg)
                     self.update()
@@ -5443,7 +6213,7 @@ class Viewport3D(QOpenGLWidget):
                 self.measure_target1 = None
                 self.measure_preview_dim = None
                 self.measure_preview_angle = None
-                msg = "📏 Линейный размер зафиксирован. Выберите точку для нового замера."
+                msg = "Линейный размер зафиксирован. Выберите точку для нового замера."
                 self.measurement_updated.emit(msg)
                 self.fastener_message.emit(msg)
                 self.update()

@@ -48,7 +48,8 @@ def _install_bare_numpy_stub():
                 r_idx, c_idx = idx
                 rows = super().__getitem__(r_idx) if isinstance(r_idx, slice) else [super().__getitem__(r_idx)]
                 return _Vec([row[c_idx] for row in rows])
-            return super().__getitem__(idx)
+            res = super().__getitem__(idx)
+            return _Vec(res) if isinstance(idx, slice) else res
 
         def __setitem__(self, idx, val):
             if isinstance(idx, tuple) and len(idx) == 2:
