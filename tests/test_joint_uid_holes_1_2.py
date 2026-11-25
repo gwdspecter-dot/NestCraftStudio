@@ -15,7 +15,7 @@ from core.version import FORMAT_VERSION
 
 
 def test_format_version_is_current():
-    assert FORMAT_VERSION == "0.0.10"
+    assert FORMAT_VERSION == "0.0.11"
 
 
 def test_tag_and_extract_by_uid():

@@ -20,13 +20,14 @@ class StructureDock(QDockWidget):
         self.setWidget(self.tree)
         self.blocks_ref: list[Block] = []
 
-    def load_structure(self, model_name: str, blocks: list[Block]):
+    def load_structure(self, model_name: str, blocks: list[Block], order_number: str = ""):
         """Заполняет дерево реальными блоками и панелями из 3D-сцены"""
         self.blocks_ref = blocks
         self.tree.blockSignals(True)  # <-- Блокируем лишние сигналы при перестройке
         self.tree.clear()
 
-        root = QTreeWidgetItem(self.tree, [model_name, "", "00.00"])
+        root_code = str(order_number or "").strip() or "00.00"
+        root = QTreeWidgetItem(self.tree, [model_name, "", root_code])
         root.setData(0, Qt.ItemDataRole.UserRole, None)
 
         for block in blocks:

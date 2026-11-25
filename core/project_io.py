@@ -9,9 +9,11 @@ import shutil
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from models.bounding_frame import BoundingFrame
 from models.panel import Panel, Block, ParametricCabinet, new_uid
 from core.logging_setup import get_logger, user_data_dir
 from core.version import FORMAT_VERSION, MIN_SUPPORTED_VERSION
@@ -252,6 +254,27 @@ def _migrate_to_0_0_9(data: dict) -> dict:
     return data
 
 
+def _migrate_to_0_0_11(data: dict) -> dict:
+    """v0.0.10 -> v0.0.11: номер заказа `order_number` и габаритная рамка изделия `bounding_frame`.
+
+    Старые проекты без габаритной рамки открываются безопасно (`bounding_frame=None`)
+    без изменения существующих панелей.
+    """
+    raw_order = data.get("order_number")
+    data["order_number"] = str(raw_order).strip() if raw_order is not None else ""
+    raw_bf = data.get("bounding_frame")
+    if isinstance(raw_bf, dict):
+        try:
+            bf = BoundingFrame.from_dict(raw_bf)
+            data["bounding_frame"] = bf.to_dict() if bf is not None else None
+        except ValueError:
+            _log.warning("Некорректные данные bounding_frame при миграции — рамка сброшена")
+            data["bounding_frame"] = None
+    else:
+        data["bounding_frame"] = None
+    return data
+
+
 MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.1", "0.0.2", _migrate_to_0_0_2),
     ("0.0.2", "0.0.3", _migrate_to_0_0_3),
@@ -262,6 +285,7 @@ MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.7", "0.0.8", _migrate_to_0_0_8),
     ("0.0.8", "0.0.9", _migrate_to_0_0_9),
     ("0.0.9", "0.0.10", _migrate_to_0_0_10),
+    ("0.0.10", "0.0.11", _migrate_to_0_0_11),
 ]
 
 
@@ -457,11 +481,30 @@ def _block_from_dict(d: dict) -> Block:
     return block
 
 
-def scene_to_dict(blocks: list, project_name: str = "project") -> dict:
+def _serialize_bounding_frame(bounding_frame: BoundingFrame | dict | None) -> dict | None:
+    if bounding_frame is None:
+        return None
+    if isinstance(bounding_frame, BoundingFrame):
+        return bounding_frame.to_dict()
+    if isinstance(bounding_frame, dict):
+        bf = BoundingFrame.from_dict(bounding_frame)
+        return bf.to_dict() if bf is not None else None
+    return None
+
+
+def scene_to_dict(
+    blocks: list,
+    project_name: str = "project",
+    *,
+    order_number: str = "",
+    bounding_frame: BoundingFrame | dict | None = None,
+) -> dict:
     return {
         "format": "NestCraft",
         "version": FORMAT_VERSION,
         "name": project_name,
+        "order_number": str(order_number or "").strip(),
+        "bounding_frame": _serialize_bounding_frame(bounding_frame),
         "blocks": [_block_to_dict(b) for b in blocks],
     }
 
@@ -558,10 +601,22 @@ def _atomic_write_text(path: Path, payload: str) -> None:
         raise
 
 
-def save_project(path: str | Path, blocks: list, project_name: str = "project") -> None:
+def save_project(
+    path: str | Path,
+    blocks: list,
+    project_name: str = "project",
+    *,
+    order_number: str = "",
+    bounding_frame: BoundingFrame | dict | None = None,
+) -> None:
     """Атомарная запись: temp-файл в той же папке + os.replace."""
     path = Path(path)
-    data = scene_to_dict(blocks, project_name)
+    data = scene_to_dict(
+        blocks,
+        project_name,
+        order_number=order_number,
+        bounding_frame=bounding_frame,
+    )
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     try:
         _atomic_write_text(path, payload)
@@ -601,6 +656,8 @@ class ProjectLoadResult:
         warnings: list[str] | None = None,
         migrations: list[str] | None = None,
         path: str | Path | None = None,
+        order_number: str = "",
+        bounding_frame: BoundingFrame | None = None,
     ):
         self.name = name
         self.blocks = blocks
@@ -608,6 +665,12 @@ class ProjectLoadResult:
         self.warnings = list(warnings or [])
         self.migrations = list(migrations or [])
         self.path = str(path) if path is not None else ""
+        self.order_number = str(order_number or "").strip()
+        self.bounding_frame = (
+            bounding_frame.clone()
+            if isinstance(bounding_frame, BoundingFrame)
+            else BoundingFrame.from_dict(bounding_frame)
+        )
 
 
 def read_project_snapshot(
@@ -688,6 +751,17 @@ def materialize_project_snapshot(
             "Проверьте кромкооблицовку деталей или добавьте кромки в каталог."
         )
 
+    raw_bf = snapshot.migrated_dict.get("bounding_frame")
+    bounding_frame: BoundingFrame | None = None
+    if raw_bf is not None:
+        try:
+            bounding_frame = BoundingFrame.from_dict(raw_bf)
+        except ValueError as exc:
+            warnings.append(f"Некорректные параметры габаритной рамки в файле: {exc}")
+            bounding_frame = None
+
+    order_number = str(snapshot.migrated_dict.get("order_number") or "").strip()
+
     return ProjectLoadResult(
         name=snapshot.name,
         blocks=blocks,
@@ -695,6 +769,8 @@ def materialize_project_snapshot(
         warnings=warnings,
         migrations=list(snapshot.migrations),
         path=snapshot.path,
+        order_number=order_number,
+        bounding_frame=bounding_frame,
     )
 
 
@@ -801,6 +877,56 @@ def clear_recent_files(*, storage_path: str | Path | None = None) -> None:
     """Очищает список недавних файлов."""
     sf = Path(storage_path) if storage_path is not None else recent_files_path()
     _save_recent_files_list([], sf)
+
+
+@dataclass(frozen=True)
+class RecentFileEntry:
+    """Элемент списка «Последние файлы» для домашней страницы и меню."""
+
+    path: str
+    name: str
+    directory: str
+    exists: bool = True
+
+
+def build_recent_file_entries(
+    paths: list[str] | None = None,
+    *,
+    storage_path: str | Path | None = None,
+    only_existing: bool = True,
+) -> list[RecentFileEntry]:
+    """Формирует упорядоченный список записей «Последние файлы» (от последних открытых к более ранним)."""
+    raw_paths = (
+        load_recent_files(storage_path=storage_path, only_existing=only_existing)
+        if paths is None
+        else paths
+    )
+    entries: list[RecentFileEntry] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        p_str = str(raw or "").strip()
+        if not p_str:
+            continue
+        abs_path = os.path.abspath(p_str)
+        norm = os.path.normcase(abs_path)
+        if norm in seen:
+            continue
+        p = Path(abs_path)
+        exists = p.is_file()
+        if only_existing and not exists:
+            continue
+        seen.add(norm)
+        entries.append(
+            RecentFileEntry(
+                path=abs_path,
+                name=p.name or abs_path,
+                directory=str(p.parent),
+                exists=exists,
+            )
+        )
+        if len(entries) >= MAX_RECENT_FILES:
+            break
+    return entries
 
 
 # ── Автосохранение и восстановление после сбоя (план §2.8, ревизия 2 п. 1.11 и 2.4) ────
@@ -1049,6 +1175,8 @@ def create_autosave_snapshot(
     project_name: str = "Новый проект.b3d",
     original_path: str | Path | None = None,
     *,
+    order_number: str = "",
+    bounding_frame: BoundingFrame | dict | None = None,
     autosave_path: str | Path | None = None,
     base_dir: str | Path | None = None,
     pid: int | None = None,
@@ -1060,7 +1188,12 @@ def create_autosave_snapshot(
         if autosave_path is not None
         else autosave_file_path(base_dir, pid=actual_pid)
     )
-    data = scene_to_dict(blocks, project_name)
+    data = scene_to_dict(
+        blocks,
+        project_name,
+        order_number=order_number,
+        bounding_frame=bounding_frame,
+    )
     start = process_start_time(actual_pid)
     if start is None:
         # свой процесс: фиксируем момент снимка как якорь (для чужого PID сверим через OS)
@@ -1068,6 +1201,7 @@ def create_autosave_snapshot(
     data["autosave_meta"] = {
         "original_path": os.path.abspath(str(original_path)) if original_path else "",
         "project_name": str(project_name or "Новый проект.b3d"),
+        "order_number": str(order_number or "").strip(),
         "timestamp": time.time(),
         "pid": actual_pid,
         "process_start": float(start),
@@ -1095,6 +1229,8 @@ def write_autosave(
     project_name: str = "Новый проект.b3d",
     original_path: str | Path | None = None,
     *,
+    order_number: str = "",
+    bounding_frame: BoundingFrame | dict | None = None,
     autosave_path: str | Path | None = None,
     base_dir: str | Path | None = None,
     pid: int | None = None,
@@ -1104,6 +1240,8 @@ def write_autosave(
         blocks,
         project_name=project_name,
         original_path=original_path,
+        order_number=order_number,
+        bounding_frame=bounding_frame,
         autosave_path=autosave_path,
         base_dir=base_dir,
         pid=pid,

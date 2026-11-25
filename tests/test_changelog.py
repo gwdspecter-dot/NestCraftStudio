@@ -42,7 +42,7 @@ def test_load_real_changelog():
     from core.changelog import load_changelog
     entries = load_changelog()
     assert entries
-    assert entries[0].version == "0.0.22"
+    assert entries[0].version == "0.0.23"
 
 
 def test_load_real_release_notes_and_merge():

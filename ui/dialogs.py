@@ -60,7 +60,16 @@ class SmartDoubleSpinBox(QDoubleSpinBox):
 class CreatePanelDialog(QDialog):
     """Окно ввода размеров и координат новой панели."""
 
-    def __init__(self, panel_type: str, default_x=0.0, default_y=0.0, default_z=0.0, parent=None):
+    def __init__(
+        self,
+        panel_type: str,
+        default_x=0.0,
+        default_y=0.0,
+        default_z=0.0,
+        parent=None,
+        *,
+        bounding_frame=None,
+    ):
         super().__init__(parent)
         self.panel_type = panel_type
 
@@ -92,8 +101,18 @@ class CreatePanelDialog(QDialog):
         self.thick_spin.setReadOnly(True)
         self.thick_spin.setEnabled(False)
         self.thick_spin.setToolTip("Толщина задаётся материалом из каталога")
-        self.dim1_spin = self._make_spin(720.0)
-        self.dim2_spin = self._make_spin(560.0)
+
+        def_dim1 = 720.0
+        def_dim2 = 560.0
+        max_dim = 10000.0
+        if bounding_frame is not None and hasattr(bounding_frame, "default_panel_geometry"):
+            geom = bounding_frame.default_panel_geometry(panel_type, default_t)
+            def_dim1 = float(geom["dim1"])
+            def_dim2 = float(geom["dim2"])
+            max_dim = max(max_dim, def_dim1 * 2.0, def_dim2 * 2.0)
+
+        self.dim1_spin = self._make_spin(def_dim1, max_val=max_dim)
+        self.dim2_spin = self._make_spin(def_dim2, max_val=max_dim)
 
         if panel_type == "vertical":
             form.addRow("Толщина (по оси X), мм — из материала:", self.thick_spin)

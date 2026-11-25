@@ -1156,3 +1156,48 @@ class AddMultiplePanelsCommand(Command):
         if self._block_was_missing and self.block in self.blocks and not self.block.panels:
             self.blocks.remove(self.block)
 
+
+def _clone_product_state(state: dict) -> dict:
+    """Глубокая копия параметров изделия (наименование, номер заказа, габаритная рамка)."""
+    from models.bounding_frame import BoundingFrame
+
+    out = {
+        "name": str(state.get("name", "") or ""),
+        "order_number": str(state.get("order_number", "") or ""),
+    }
+    bf = state.get("bounding_frame")
+    if isinstance(bf, BoundingFrame):
+        out["bounding_frame"] = bf.clone()
+    elif isinstance(bf, dict):
+        out["bounding_frame"] = BoundingFrame.from_dict(bf)
+    else:
+        out["bounding_frame"] = None
+    return out
+
+
+class EditProductParamsCommand(Command):
+    """Изменение параметров изделия (наименование, номер заказа, габаритная рамка).
+
+    Гарантирует инвариант: существующие панели и блоки сцены НЕ перемещаются,
+    НЕ масштабируются и НЕ перестраиваются.
+    """
+
+    def __init__(
+        self,
+        old_state: dict,
+        new_state: dict,
+        apply_fn: Callable[[dict], None],
+        description: str = "Параметры изделия",
+    ):
+        super().__init__(description)
+        self._old_state = _clone_product_state(old_state)
+        self._new_state = _clone_product_state(new_state)
+        self._apply_fn = apply_fn
+
+    def redo(self) -> None:
+        self._apply_fn(_clone_product_state(self._new_state))
+
+    def undo(self) -> None:
+        self._apply_fn(_clone_product_state(self._old_state))
+
+

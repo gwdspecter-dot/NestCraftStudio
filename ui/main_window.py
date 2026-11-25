@@ -5,13 +5,17 @@ from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QStatusBar, QLabel, QLineEdit,
     QComboBox, QMessageBox, QFileDialog, QApplication,
     QAbstractSpinBox, QTextEdit, QPlainTextEdit, QSlider, QToolButton,
+    QStackedWidget,
 )
 from PyQt6.QtGui import QAction, QKeySequence, QIcon
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QRunnable, pyqtSignal
 
+from models.bounding_frame import BoundingFrame
 from models.panel import Panel, Block, ParametricCabinet
+from ui.home_page import HomePage
 from ui.viewport import CentralWorkspace
 from ui.dialogs import CreatePanelDialog, HoleDialog, LinearArrayDialog, MirrorPanelDialog
+from ui.product_dialogs import CreateModelDialog, ProductParamsDialog
 from ui.fastener_constructor_dialog import FastenerConstructorDialog
 from ui.panels.structure_panel import StructureDock
 from ui.panels.properties_panel import PropertiesDock
@@ -27,6 +31,7 @@ from core.undo import (
     DeleteJointCommand,
     EditAssocRefCommand,
     EditJointCommand,
+    EditProductParamsCommand,
     EditPropertyCommand,
     ReplaceBlocksCommand,
     SetHolesCommand,
@@ -99,6 +104,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.project_path: str | None = None
         self.project_name = "Новый проект.b3d"
+        self.order_number: str = ""
         self.is_modified = False
         self.setWindowTitle(f"NestCraft Studio - [{self.project_name}]")
         self.resize(1450, 860)
@@ -106,8 +112,17 @@ class MainWindow(QMainWindow):
         if logo.is_file():
             self.setWindowIcon(QIcon(str(logo)))
 
-        self.workspace = CentralWorkspace()
-        self.setCentralWidget(self.workspace)
+        self._is_home_mode: bool = True
+        self._saved_chrome_visibility: dict[object, bool] | None = None
+        self._editor_toolbars: list[QToolBar] = []
+        self._editor_docks: list = []
+
+        self._central_stack = QStackedWidget(self)
+        self.home_page = HomePage(self)
+        self.workspace = CentralWorkspace(create_initial_tab=False)
+        self._central_stack.addWidget(self.home_page)
+        self._central_stack.addWidget(self.workspace)
+        self.setCentralWidget(self._central_stack)
 
         self._create_menu_bar()
         self._create_toolbars()
@@ -133,10 +148,18 @@ class MainWindow(QMainWindow):
         self._autosave_timer.start()
 
         self._connect_signals()
-        self._refresh_structure()
+        self.show_home_page()
         QTimer.singleShot(400, self._check_autosave_recovery)
 
     def _connect_signals(self):
+        self.home_page.create_model_requested.connect(self._on_home_create_model)
+        self.home_page.open_model_requested.connect(self.open_project)
+        self.home_page.create_fastener_requested.connect(self._on_home_create_fastener)
+        self.home_page.create_module_requested.connect(self._on_home_create_module)
+        self.home_page.recent_file_requested.connect(self.open_project_from_path)
+        self.home_page.remove_recent_requested.connect(self._on_remove_recent_file)
+        self.home_page.clear_recent_requested.connect(self._on_clear_recent_files)
+
         self.structure_dock.object_selected.connect(self._on_object_selected)
         self.properties_dock.property_changed.connect(self._on_property_changed)
         self.properties_dock.property_applied.connect(self._on_property_applied)
@@ -157,6 +180,226 @@ class MainWindow(QMainWindow):
         # Сигналы вкладок: при смене/создании переподключаем viewport
         self.workspace.currentChanged.connect(self._on_tab_changed)
         self._bind_viewport_signals(self.workspace.current_viewport())
+
+    def refresh_theme(self) -> None:
+        """Обновляет оформление зависимых от темы виджетов (вызывается из ui.theme.apply_theme)."""
+        if hasattr(self, "home_page") and self.home_page is not None:
+            self.home_page.refresh_theme()
+
+    def is_home_page_visible(self) -> bool:
+        """True, если сейчас открыта домашняя страница."""
+        return bool(getattr(self, "_is_home_mode", False))
+
+    def show_home_page(self) -> None:
+        """Переключает главное окно на домашнюю страницу, скрывая панели редактора."""
+        was_workspace = not getattr(self, "_is_home_mode", True)
+        if was_workspace and self.workspace.count() > 0:
+            self._saved_chrome_visibility = {
+                w: w.isVisible() for w in (*self._editor_toolbars, *self._editor_docks)
+            }
+        for w in (*self._editor_toolbars, *self._editor_docks):
+            w.setVisible(False)
+        self._central_stack.setCurrentWidget(self.home_page)
+        self._is_home_mode = True
+        self.home_page.refresh_recent_files()
+        if hasattr(self, "act_home_page"):
+            self.act_home_page.blockSignals(True)
+            self.act_home_page.setChecked(True)
+            self.act_home_page.blockSignals(False)
+        self._update_window_title()
+        self.statusBar().showMessage("Домашняя страница — выберите действие или откройте недавний файл")
+
+    def show_workspace(self) -> None:
+        """Переключает главное окно в режим 3D-редактора и восстанавливает панели."""
+        self._central_stack.setCurrentWidget(self.workspace)
+        self._is_home_mode = False
+        saved = self._saved_chrome_visibility
+        for w in (*self._editor_toolbars, *self._editor_docks):
+            w.setVisible(saved.get(w, True) if saved is not None else True)
+        if hasattr(self, "act_home_page"):
+            self.act_home_page.blockSignals(True)
+            self.act_home_page.setChecked(False)
+            self.act_home_page.blockSignals(False)
+        self._update_window_title()
+
+    def _toggle_home_page(self, checked: bool) -> None:
+        if checked or self.workspace.count() == 0:
+            self.show_home_page()
+        else:
+            self.show_workspace()
+
+    def _ensure_workspace_viewport(self, title: str = "Новый проект.b3d"):
+        """Гарантирует наличие открытого 3D-вьюпорта и переключает окно в рабочую область."""
+        vp = self.workspace.current_viewport()
+        if vp is None:
+            vp = self.workspace.add_new_model(title)
+            self._bind_viewport_signals(vp)
+        self.show_workspace()
+        return vp
+
+    def _on_home_create_model(self) -> None:
+        """Создать модель: открывает окно настроек изделия и габаритной рамки."""
+        dlg = CreateModelDialog(self)
+        if not dlg.exec():
+            return
+        if self.workspace.count() > 0 and not self._confirm_discard_changes("создать новую модель"):
+            return
+        settings = dlg.get_model_settings()
+        self._create_model_with_settings(
+            name=settings["name"],
+            order_number=settings["order_number"],
+            bounding_frame=settings["bounding_frame"],
+        )
+
+    def _create_model_with_settings(
+        self,
+        *,
+        name: str,
+        order_number: str = "",
+        bounding_frame: BoundingFrame | None = None,
+    ) -> None:
+        """Создаёт пустую модель изделия с заданными метаданными и габаритной рамкой."""
+        model_name = (name or "Новое изделие").strip() or "Новое изделие"
+        order_num = str(order_number or "").strip()
+        frame = bounding_frame.clone() if bounding_frame is not None else None
+
+        vp = self._ensure_workspace_viewport(model_name)
+        if not vp:
+            return
+        if hasattr(vp, "_free_all_panel_gpu"):
+            vp._free_all_panel_gpu()
+        vp.blocks[:] = [Block(model_name, "1", "01.00")]
+        vp.bounding_frame = frame
+        vp.order_number = order_num
+        vp.undo_stack.clear()
+        vp.undo_stack.mark_clean()
+
+        self.project_path = None
+        self.project_name = model_name
+        self.order_number = order_num
+        self.mark_modified(False)
+        clear_autosave()
+        self._sync_bounding_frame_action(vp)
+        self._update_window_title()
+        self._refresh_structure()
+        self._refresh_history_dock()
+        self.properties_dock.show_object_properties(None)
+        if hasattr(vp, "go_home_view"):
+            vp.go_home_view(animate=False)
+        vp.update()
+
+        dims_part = (
+            f" · рамка {frame.width:g}×{frame.height:g}×{frame.depth:g} мм"
+            if frame is not None
+            else ""
+        )
+        order_part = f" · заказ {order_num}" if order_num else ""
+        self.statusBar().showMessage(
+            f"Создана модель «{model_name}»{order_part}{dims_part}",
+            6000,
+        )
+
+    def _sync_bounding_frame_action(self, vp=None) -> None:
+        if not hasattr(self, "act_bounding_frame_visible"):
+            return
+        if vp is None:
+            vp = self.workspace.current_viewport()
+        bf = getattr(vp, "bounding_frame", None) if vp is not None else None
+        self.act_bounding_frame_visible.blockSignals(True)
+        self.act_bounding_frame_visible.setChecked(bool(bf is not None and bf.visible))
+        self.act_bounding_frame_visible.blockSignals(False)
+
+    def _apply_product_params_state(self, vp, state: dict) -> None:
+        """Применяет параметры изделия (имя, номер заказа, габаритная рамка) без изменения панелей."""
+        if vp is None:
+            return
+        new_name = str(state.get("name") or "Новое изделие").strip() or "Новое изделие"
+        new_order = str(state.get("order_number") or "").strip()
+        bf = state.get("bounding_frame")
+        vp.bounding_frame = bf.clone() if isinstance(bf, BoundingFrame) else BoundingFrame.from_dict(bf)
+        vp.order_number = new_order
+        self.project_name = new_name
+        self.order_number = new_order
+        self._sync_bounding_frame_action(vp)
+        self._update_window_title()
+        self._refresh_structure()
+        vp.update()
+
+    def open_product_params_dialog(self) -> None:
+        """Открывает диалог «Изделие → Параметры изделия…» с поддержкой Undo/Redo."""
+        vp = self.workspace.current_viewport()
+        if vp is None:
+            QMessageBox.information(
+                self,
+                "Параметры изделия",
+                "Сначала создайте или откройте модель изделия.",
+            )
+            return
+
+        current_name = self.project_name
+        if self.project_path and current_name.lower().endswith((".b3d", ".json")):
+            current_name = Path(current_name).stem
+
+        dlg = ProductParamsDialog(
+            name=current_name,
+            order_number=self.order_number,
+            bounding_frame=getattr(vp, "bounding_frame", None),
+            parent=self,
+        )
+        if not dlg.exec():
+            return
+
+        old_bf = getattr(vp, "bounding_frame", None)
+        old_state = {
+            "name": self.project_name,
+            "order_number": self.order_number,
+            "bounding_frame": old_bf.clone() if old_bf is not None else None,
+        }
+        new_state = dlg.get_product_params()
+
+        cmd = EditProductParamsCommand(
+            old_state,
+            new_state,
+            apply_fn=lambda st, target_vp=vp: self._apply_product_params_state(target_vp, st),
+            description="Параметры изделия",
+        )
+        vp.undo_stack.push(cmd, execute=True)
+        bf = new_state.get("bounding_frame")
+        if bf is not None:
+            self.statusBar().showMessage(
+                f"Параметры изделия обновлены · габаритная рамка {bf.width:g}×{bf.height:g}×{bf.depth:g} мм",
+                5000,
+            )
+
+    def _toggle_bounding_frame_visible(self, checked: bool) -> None:
+        """Скрывает или показывает габаритную рамку в 3D без удаления объекта."""
+        vp = self.workspace.current_viewport()
+        if vp is None or getattr(vp, "bounding_frame", None) is None:
+            self._sync_bounding_frame_action(vp)
+            self.statusBar().showMessage(
+                "Габаритная рамка не задана — настройте её в «Изделие → Параметры изделия…»",
+                5000,
+            )
+            return
+        visible = vp.set_bounding_frame_visible(bool(checked))
+        self._sync_bounding_frame_action(vp)
+        self.mark_modified(True)
+        self.statusBar().showMessage(
+            "Габаритная рамка показана" if visible else "Габаритная рамка скрыта",
+            3000,
+        )
+
+    def _on_home_create_fastener(self) -> None:
+        """Создать фурнитуру (заглушка)."""
+        self.statusBar().showMessage("Функция «Создать фурнитуру» пока в разработке", 3000)
+
+    def _on_home_create_module(self) -> None:
+        """Создать модуль (заглушка)."""
+        self.statusBar().showMessage("Функция «Создать модуль» пока в разработке", 3000)
+
+    def _on_remove_recent_file(self, path: str) -> None:
+        remove_recent_file(path)
+        self._rebuild_recent_files_menu()
 
     def _bind_viewport_signals(self, vp):
         """Подключает сигналы текущего 3D-вьюпорта (безопасно при смене вкладок)."""
@@ -210,11 +453,14 @@ class MainWindow(QMainWindow):
             self.act_face_snap.blockSignals(True)
             self.act_face_snap.setChecked(bool(getattr(vp, "face_snap_enabled", True)))
             self.act_face_snap.blockSignals(False)
+        self._sync_bounding_frame_action(vp)
         self._bind_undo_listener(vp)
         self._refresh_history_dock()
 
     def _on_tab_changed(self, index: int):
         vp = self.workspace.current_viewport()
+        if vp is not None:
+            self.order_number = str(getattr(vp, "order_number", "") or "").strip()
         self._bind_viewport_signals(vp)
         self._refresh_structure()
         self._refresh_history_dock()
@@ -301,7 +547,9 @@ class MainWindow(QMainWindow):
         if vp:
             if hasattr(vp, "_rebuild_scene_gpu_ids"):
                 vp._rebuild_scene_gpu_ids()
-            self.structure_dock.load_structure(vp.title, vp.blocks)
+            self.structure_dock.load_structure(
+                vp.title, vp.blocks, order_number=self.order_number
+            )
             if hasattr(self, "joints_dock") and self.joints_dock is not None:
                 self.joints_dock.load_joints(vp.blocks)
             if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
@@ -581,13 +829,18 @@ class MainWindow(QMainWindow):
         if not vp:
             return
 
-        # Если сейчас выделена какая-то деталь, предлагаем ставить новую рядом с ней!
+        # Если сейчас выделена какая-то деталь, предлагаем ставить новую рядом с ней;
+        # иначе ориентируемся на начало координат габаритной рамки изделия (если задана).
         sel = vp.get_selected_panel()
-        def_x = sel.x + sel.width if (sel and panel_type != "vertical") else (sel.x if sel else 0.0)
-        def_y = sel.y if sel else 0.0
-        def_z = sel.z if sel else 0.0
+        bf = getattr(vp, "bounding_frame", None)
+        base_x = float(bf.x) if bf is not None else 0.0
+        base_y = float(bf.y) if bf is not None else 0.0
+        base_z = float(bf.z) if bf is not None else 0.0
+        def_x = sel.x + sel.width if (sel and panel_type != "vertical") else (sel.x if sel else base_x)
+        def_y = sel.y if sel else base_y
+        def_z = sel.z if sel else base_z
 
-        dlg = CreatePanelDialog(panel_type, def_x, def_y, def_z, self)
+        dlg = CreatePanelDialog(panel_type, def_x, def_y, def_z, self, bounding_frame=bf)
         if dlg.exec():
             data = dlg.get_panel_data()
             
@@ -1139,12 +1392,16 @@ class MainWindow(QMainWindow):
 
 
     def _update_window_title(self):
+        if getattr(self, "_is_home_mode", False):
+            self.setWindowTitle("NestCraft Studio — Домашняя страница")
+            return
         name = self.project_name
-        if self.project_path:
-            from pathlib import Path
+        if not name and self.project_path:
             name = Path(self.project_path).name
+        order_num = str(getattr(self, "order_number", "") or "").strip()
+        label = f"{name} | Заказ {order_num}" if order_num else name
         dirty = " *" if getattr(self, "is_modified", False) else ""
-        self.setWindowTitle(f"NestCraft Studio - [{name}]{dirty}")
+        self.setWindowTitle(f"NestCraft Studio - [{label}]{dirty}")
         vp = self.workspace.current_viewport()
         if vp:
             vp.title = name
@@ -1173,6 +1430,8 @@ class MainWindow(QMainWindow):
                 vp.blocks,
                 project_name=self.project_name or "Новый проект.b3d",
                 original_path=self.project_path,
+                order_number=self.order_number,
+                bounding_frame=getattr(vp, "bounding_frame", None),
             )
             self.bg_tasks.submit_autosave(snapshot, sync=not async_run)
         except Exception:
@@ -1207,16 +1466,21 @@ class MainWindow(QMainWindow):
             clear_autosave()
             return False
 
-        vp = self.workspace.current_viewport()
+        vp = self._ensure_workspace_viewport(proj_label)
         if not vp:
             return False
         if hasattr(vp, "_free_all_panel_gpu"):
             vp._free_all_panel_gpu()
         vp.blocks[:] = list(res.blocks)
+        vp.bounding_frame = res.bounding_frame.clone() if res.bounding_frame is not None else None
+        order_num = str(res.order_number or meta.get("order_number") or "").strip()
+        vp.order_number = order_num
         vp.undo_stack.clear()
         self.project_path = orig_path if orig_path else None
         self.project_name = proj_label
+        self.order_number = order_num
         self.is_modified = True
+        self._sync_bounding_frame_action(vp)
         self._update_window_title()
         self._refresh_structure()
         self._refresh_history_dock()
@@ -1258,14 +1522,20 @@ class MainWindow(QMainWindow):
     def new_project(self):
         if not self._confirm_discard_changes("создать новый проект"):
             return
+        self._ensure_workspace_viewport("Новый проект.b3d")
         self.clear_scene()
         self.project_path = None
         self.project_name = "Новый проект.b3d"
+        self.order_number = ""
         vp = self.workspace.current_viewport()
         if vp:
+            vp.bounding_frame = None
+            vp.order_number = ""
             vp.undo_stack.clear()  # clear → _clean_top=None → is_clean True
             vp.undo_stack.mark_clean()
+            self._sync_bounding_frame_action(vp)
             self._refresh_history_dock()
+            vp.update()
         self.mark_modified(False)
         clear_autosave()
         self._update_window_title()
@@ -1281,10 +1551,14 @@ class MainWindow(QMainWindow):
     def _apply_loaded_project_result(self, p_obj: Path, result: ProjectLoadResult | tuple) -> bool:
         if isinstance(result, ProjectLoadResult):
             name, blocks, warnings = result.name, result.blocks, result.warnings
+            order_number = result.order_number
+            bounding_frame = result.bounding_frame
         else:
             name, blocks = result
             warnings = []
-        vp = self.workspace.current_viewport()
+            order_number = ""
+            bounding_frame = None
+        vp = self._ensure_workspace_viewport(name or p_obj.name)
         if not vp:
             return False
         # Замена сцены без записи в undo: иначе Ctrl+Z вернёт старую сцену
@@ -1292,14 +1566,18 @@ class MainWindow(QMainWindow):
         if hasattr(vp, "_free_all_panel_gpu"):
             vp._free_all_panel_gpu()
         vp.blocks[:] = list(blocks)
+        vp.bounding_frame = bounding_frame.clone() if bounding_frame is not None else None
+        vp.order_number = str(order_number or "").strip()
         vp.undo_stack.clear()
         vp.undo_stack.mark_clean()
         self.project_path = str(p_obj.resolve())
         self.project_name = name or p_obj.name
+        self.order_number = vp.order_number
         self.mark_modified(False)
         clear_autosave()
         add_recent_file(self.project_path)
         self._rebuild_recent_files_menu()
+        self._sync_bounding_frame_action(vp)
         self._update_window_title()
         self._refresh_structure()
         self._refresh_history_dock()
@@ -1364,12 +1642,16 @@ class MainWindow(QMainWindow):
             )
 
     def save_project_action(self):
+        if self.workspace.current_viewport() is None:
+            return
         if self.project_path:
             self._write_project(self.project_path)
         else:
             self.save_project_as()
 
     def save_project_as(self):
+        if self.workspace.current_viewport() is None:
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить проект", self.project_name or "project.b3d", FILE_FILTER
         )
@@ -1383,15 +1665,23 @@ class MainWindow(QMainWindow):
         vp = self.workspace.current_viewport()
         if not vp:
             return
-        from pathlib import Path
+        saved_name = self.project_name
+        if not saved_name or saved_name == "Новый проект.b3d":
+            saved_name = Path(path).stem
         try:
-            save_project(path, vp.blocks, Path(path).stem)
+            save_project(
+                path,
+                vp.blocks,
+                saved_name,
+                order_number=self.order_number,
+                bounding_frame=getattr(vp, "bounding_frame", None),
+            )
         except Exception as e:
             _log.exception("save_project failed path=%s", path)
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
             return
         self.project_path = str(Path(path).resolve())
-        self.project_name = Path(path).name
+        self.project_name = saved_name
         if vp and hasattr(vp, "undo_stack"):
             vp.undo_stack.mark_clean()
         self.mark_modified(False)
@@ -1402,7 +1692,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Сохранено: {path}", 4000)
 
     def _rebuild_recent_files_menu(self) -> None:
-        """Обновляет подменю «Недавние файлы» в меню «Файл» (план §2.8)."""
+        """Обновляет подменю «Недавние файлы» в меню «Файл» и список на домашней странице (план §2.8)."""
+        if hasattr(self, "home_page") and self.home_page is not None:
+            self.home_page.refresh_recent_files()
         menu = getattr(self, "recent_menu", None)
         if menu is None:
             return
@@ -1724,6 +2016,13 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         
         file_menu = menubar.addMenu("Файл")
+        self.act_home_page = QAction("Домашняя страница", self)
+        self.act_home_page.setCheckable(True)
+        self.act_home_page.setChecked(True)
+        self.act_home_page.triggered.connect(self._toggle_home_page)
+        file_menu.addAction(self.act_home_page)
+        file_menu.addSeparator()
+
         act_new = QAction("Новый пустой проект", self)
         act_new.setShortcut(QKeySequence.StandardKey.New)
         act_new.triggered.connect(self.new_project)
@@ -1856,6 +2155,16 @@ class MainWindow(QMainWindow):
         self.act_live_collisions.triggered.connect(self._toggle_live_collisions)
         view_menu.addAction(self.act_live_collisions)
 
+        view_menu.addSeparator()
+        self.act_bounding_frame_visible = QAction("Показать габаритную рамку", self)
+        self.act_bounding_frame_visible.setCheckable(True)
+        self.act_bounding_frame_visible.setChecked(False)
+        self.act_bounding_frame_visible.setToolTip(
+            "Показать или скрыть габаритную рамку изделия в 3D без её удаления"
+        )
+        self.act_bounding_frame_visible.triggered.connect(self._toggle_bounding_frame_visible)
+        view_menu.addAction(self.act_bounding_frame_visible)
+
         tools_menu = menubar.addMenu("Инструменты")
         self.act_measure = QAction(QIcon(str(_ICONS_DIR / "tool_measure.svg")), "Рулетка / Измерения", self)
         self.act_measure.setCheckable(True)
@@ -1894,8 +2203,17 @@ class MainWindow(QMainWindow):
         act_catalog.triggered.connect(self.open_catalog_browser)
         tools_menu.addAction(act_catalog)
 
-        for menu_name in ["Изделие", "Скрипты"]:
-            menubar.addMenu(menu_name)
+        product_menu = menubar.addMenu("Изделие")
+        self.act_product_params = QAction("Параметры изделия…", self)
+        self.act_product_params.setToolTip(
+            "Наименование, номер заказа и габаритная рамка изделия (Ширина, Высота, Глубина)"
+        )
+        self.act_product_params.triggered.connect(self.open_product_params_dialog)
+        product_menu.addAction(self.act_product_params)
+        product_menu.addSeparator()
+        product_menu.addAction(self.act_bounding_frame_visible)
+
+        menubar.addMenu("Скрипты")
 
         help_menu = menubar.addMenu("Справка")
         act_whats_new = QAction("Что нового…", self)
@@ -1912,6 +2230,7 @@ class MainWindow(QMainWindow):
         # Верхняя панель 1: Проект + Переключатель видов (2D / 3D) + Режим каркаса + Рулетка
         top_tb1 = QToolBar("Основная панель и Виды")
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, top_tb1)
+        self._editor_toolbars = [top_tb1]
 
         act_clear = QAction("🧹 Сцена с нуля", self)
         act_clear.triggered.connect(self.clear_scene)
@@ -2002,6 +2321,7 @@ class MainWindow(QMainWindow):
         # Верхняя панель 2: Координаты X, Y, Z и Шаг перемещения стрелками
         top_tb2 = QToolBar("Координаты и Шаг")
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, top_tb2)
+        self._editor_toolbars.append(top_tb2)
         
         self.coord_edits = {}
         for coord, val in [("X", "0.0"), ("Y", "0.0"), ("Z", "0.0")]:
@@ -2072,6 +2392,7 @@ class MainWindow(QMainWindow):
         left_tb.setIconSize(QSize(32, 32))
         left_tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, left_tb)
+        self._editor_toolbars.append(left_tb)
 
         icon_vert = QIcon(str(_ICONS_DIR / "vertical_panel.svg"))
         act_vert = QAction(icon_vert, "Вертикальная панель", self)
@@ -2329,6 +2650,15 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self.joints_dock, self.assoc_dock, Qt.Orientation.Vertical)
         self.splitDockWidget(self.assoc_dock, self.analysis_dock, Qt.Orientation.Vertical)
         self.splitDockWidget(self.analysis_dock, self.history_dock, Qt.Orientation.Vertical)
+        self._editor_docks = [
+            self.structure_dock,
+            self.properties_dock,
+            self.browser_dock,
+            self.joints_dock,
+            self.assoc_dock,
+            self.analysis_dock,
+            self.history_dock,
+        ]
 
 
     def _open_log_folder(self) -> None:

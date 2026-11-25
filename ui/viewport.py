@@ -106,6 +106,7 @@ from OpenGL.GL import (
 import numpy as np
 import ctypes
 import math
+from models.bounding_frame import BoundingFrame
 from models.panel import Panel, Block, ParametricCabinet
 from core.undo import UndoStack, DeleteItemsCommand, MovePanelCommand, PlaceJointFastenerCommand, ResizePanelCommand, PasteBlocksCommand
 from core.clipboard import (
@@ -361,6 +362,8 @@ class Viewport3D(QOpenGLWidget):
 
         self.title = title
         self.blocks: list[Block] = []
+        self.bounding_frame: BoundingFrame | None = None
+        self.order_number: str = ""
 
         # Параметры камеры
         self.rot_x = 25.0
@@ -698,6 +701,28 @@ class Viewport3D(QOpenGLWidget):
                     except Exception as exc:
                         _log.debug("Ошибка проекции точки магнитной привязки: %s", exc)
 
+        bf = getattr(self, "bounding_frame", None)
+        if bf is not None and getattr(bf, "visible", True):
+            for item in bf.snap_points():
+                pt, desc = item[0], item[1]
+                if plane is not None and not glmath.point_passes_clip_plane(
+                    float(pt[0]), float(pt[1]), float(pt[2]), plane
+                ):
+                    continue
+                try:
+                    wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
+                    if wz < 0.0 or wz > 1.0:
+                        continue
+                    sx = wx / dpr
+                    sy = (vp[3] - wy) / dpr
+                    dist = math.hypot(sx - mx, sy - my)
+                    if dist < min_d:
+                        min_d = dist
+                        best_pt = np.asarray(pt, dtype=float).copy()
+                        best_desc = desc
+                except Exception as exc:
+                    _log.debug("Ошибка проекции точки привязки габаритной рамки: %s", exc)
+
         if best_pt is not None:
             prefix = "🧲 [Ctrl] " if is_ctrl else "🧲 "
             return best_pt, f"{prefix}{best_desc}"
@@ -937,6 +962,16 @@ class Viewport3D(QOpenGLWidget):
                 max_x = max(max_x, x0, x1)
                 max_y = max(max_y, y0, y1)
                 max_z = max(max_z, z0, z1)
+        bf = getattr(self, "bounding_frame", None)
+        if bf is not None and getattr(bf, "visible", True):
+            (bx0, by0, bz0), (bx1, by1, bz1) = bf.world_aabb()
+            found = True
+            min_x = min(min_x, bx0, bx1)
+            min_y = min(min_y, by0, by1)
+            min_z = min(min_z, bz0, bz1)
+            max_x = max(max_x, bx0, bx1)
+            max_y = max(max_y, by0, by1)
+            max_z = max(max_z, bz0, bz1)
         if not found:
             return 300.0, 350.0, 280.0, 800.0
         cx = 0.5 * (min_x + max_x)
@@ -1241,7 +1276,9 @@ class Viewport3D(QOpenGLWidget):
     def _scene_bounding_radius(self) -> float:
         """Оценка радиуса охвата сцены вокруг опорной точки камеры для z_near / z_far."""
         blocks = getattr(self, "blocks", None)
-        if not blocks:
+        bf = getattr(self, "bounding_frame", None)
+        has_bf = bf is not None and getattr(bf, "visible", True)
+        if not blocks and not has_bf:
             return 2000.0
         # Опорная точка на оси взгляда в мировых координатах: R^T @ (-pan_x, -pan_y, 0)
         R3 = self._rotation_matrix()[:3, :3]
@@ -1250,7 +1287,7 @@ class Viewport3D(QOpenGLWidget):
         cy = float(R3[0, 1]) * px + float(R3[1, 1]) * py
         cz = float(R3[0, 2]) * px + float(R3[1, 2]) * py
         max_r = 0.0
-        for b in blocks:
+        for b in blocks or ():
             for p in getattr(b, "panels", ()):
                 if not getattr(p, "visible", True):
                     continue
@@ -1274,6 +1311,18 @@ class Viewport3D(QOpenGLWidget):
                 r = (dx * dx + dy * dy + dz * dz) ** 0.5 + half_diag
                 if r > max_r:
                     max_r = r
+        if has_bf and bf is not None:
+            mn, mx = bf.world_aabb()
+            bcx = 0.5 * (mn[0] + mx[0])
+            bcy = 0.5 * (mn[1] + mx[1])
+            bcz = 0.5 * (mn[2] + mx[2])
+            b_half_diag = 0.5 * (
+                (mx[0] - mn[0]) ** 2 + (mx[1] - mn[1]) ** 2 + (mx[2] - mn[2]) ** 2
+            ) ** 0.5
+            bdx, bdy, bdz = bcx - cx, bcy - cy, bcz - cz
+            br = (bdx * bdx + bdy * bdy + bdz * bdz) ** 0.5 + b_half_diag
+            if br > max_r:
+                max_r = br
         return max(1000.0, max_r) if max_r > 0.0 else 2000.0
 
     def _scene_view_depth_bounds(
@@ -1283,15 +1332,15 @@ class Viewport3D(QOpenGLWidget):
     ) -> tuple[float, float] | None:
         """Точный интервал глубин `[d_min, d_max]` видимой сцены (и активных превью) вдоль оси взгляда."""
         blocks = getattr(self, "blocks", None)
-        if not blocks:
-            return None
+        bf = getattr(self, "bounding_frame", None)
+        has_bf = bf is not None and getattr(bf, "visible", True)
         panels = [
             p
-            for b in blocks
+            for b in (blocks or ())
             for p in getattr(b, "panels", ()) or ()
             if getattr(p, "visible", True)
         ]
-        if not panels:
+        if not panels and not has_bf:
             return None
 
         extra_aabbs: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
@@ -1319,6 +1368,16 @@ class Viewport3D(QOpenGLWidget):
                 sy1 = mx_y
             if mx_z > sz1:
                 sz1 = mx_z
+
+        if has_bf and bf is not None:
+            bmn, bmx = bf.world_aabb()
+            extra_aabbs.append((bmn, bmx))
+            sx0 = min(sx0, bmn[0])
+            sy0 = min(sy0, bmn[1])
+            sz0 = min(sz0, bmn[2])
+            sx1 = max(sx1, bmx[0])
+            sy1 = max(sy1, bmx[1])
+            sz1 = max(sz1, bmx[2])
 
         # Включаем мировые 3D-оси [0..300]^3, если они в пределах 3 м от сцены
         dx_ax = max(0.0, sx0 - 300.0, -sx1)
@@ -1593,9 +1652,12 @@ class Viewport3D(QOpenGLWidget):
                 self._flush_line_batch()
             glDepthFunc(GL_LESS)
 
-        # Отключаем клиппинг для вспомогательных гизмо, превью крепежа и размерных линий
+        # Отключаем клиппинг для вспомогательных гизмо, габаритной рамки, превью крепежа и размерных линий
         glDisable(GL_CLIP_DISTANCE0)
         self._clip_plane_active = False
+
+        if self.bounding_frame is not None and self.bounding_frame.visible:
+            self._draw_bounding_frame()
 
         if self.section_enabled:
             self._draw_section_plane_gizmo()
@@ -1687,6 +1749,40 @@ class Viewport3D(QOpenGLWidget):
             self._line_batches.setdefault(ckey, []).append(arr)
             return
         self._draw_lines_immediate(arr, color)
+
+    def set_bounding_frame(self, frame: BoundingFrame | None) -> None:
+        """Устанавливает или снимает габаритную рамку изделия без изменения панелей."""
+        self.bounding_frame = frame.clone() if frame is not None else None
+        self.update()
+
+    def set_bounding_frame_visible(self, visible: bool) -> bool:
+        """Переключает видимость габаритной рамки без её удаления."""
+        if self.bounding_frame is None:
+            return False
+        self.bounding_frame.visible = bool(visible)
+        self.update()
+        return self.bounding_frame.visible
+
+    def _draw_bounding_frame(self) -> None:
+        """Рисует тонкий контур габаритной рамки изделия без влияния на освещение и выделение."""
+        bf = getattr(self, "bounding_frame", None)
+        if bf is None or not getattr(bf, "visible", True):
+            return
+        verts: list[tuple[float, float, float]] = []
+        for a, b in bf.edge_segments():
+            verts.append(a)
+            verts.append(b)
+        if len(verts) < 2:
+            return
+        arr = np.asarray(verts, dtype=np.float32)
+        glDepthFunc(GL_LEQUAL)
+        glDepthMask(GL_FALSE)
+        try:
+            # Спокойный бирюзово-синий контур, отчётливо отличающийся от рёбер панелей и выделения
+            self._draw_lines(arr, (0.04, 0.54, 0.72))
+        finally:
+            glDepthMask(GL_TRUE)
+            glDepthFunc(GL_LESS)
 
     def draw_axes(self):
         pts = np.array([
@@ -3356,6 +3452,18 @@ class Viewport3D(QOpenGLWidget):
                         if glmath.point_passes_clip_plane(float(item[0][0]), float(item[0][1]), float(item[0][2]), plane)
                     ]
                 candidates.extend(pts)
+        bf = getattr(self, "bounding_frame", None)
+        if bf is not None and getattr(bf, "visible", True):
+            bf_pts = [
+                (np.asarray(pt, dtype=float), desc, kind, owner, meta)
+                for pt, desc, kind, owner, meta in bf.snap_points()
+            ]
+            if plane is not None:
+                bf_pts = [
+                    item for item in bf_pts
+                    if glmath.point_passes_clip_plane(float(item[0][0]), float(item[0][1]), float(item[0][2]), plane)
+                ]
+            candidates.extend(bf_pts)
         return candidates
 
     def _find_nearest_snap_point(self, mx: int, my: int, max_dist_px: float = 24.0, ctrl_boost: bool = False):
@@ -6426,7 +6534,7 @@ class Viewport3D(QOpenGLWidget):
 
 
 class CentralWorkspace(QTabWidget):
-    def __init__(self):
+    def __init__(self, *, create_initial_tab: bool = True):
         super().__init__()
         self.setTabsClosable(True)
         self.setMovable(True)
@@ -6434,7 +6542,8 @@ class CentralWorkspace(QTabWidget):
         self.tabBar().setExpanding(False)
         self.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
         self.tabCloseRequested.connect(self.close_tab)
-        self.add_new_model("Новый проект.b3d")
+        if create_initial_tab:
+            self.add_new_model("Новый проект.b3d")
 
     def add_new_model(self, name: str):
         viewport = Viewport3D(name)
