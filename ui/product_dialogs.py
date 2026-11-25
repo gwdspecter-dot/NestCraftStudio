@@ -399,3 +399,100 @@ class ProductParamsDialog(QDialog):
             "order_number": self.order_edit.text().strip(),
             "bounding_frame": bf.clone(),
         }
+
+
+class CreateBlockDialog(QDialog):
+    """Диалог «Создать блок…»: название блока и признак сборочной единицы."""
+
+    def __init__(
+        self,
+        *,
+        default_name: str = "Блок 1",
+        panel_count: int = 0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Создать блок")
+        self.setMinimumWidth(380)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(8)
+
+        self.name_edit = QLineEdit(default_name or "Блок 1", self)
+        self.name_edit.setPlaceholderText("Например, Корпус тумбы")
+        form.addRow("Название блока:", self.name_edit)
+
+        self.assembly_cb = QCheckBox("Сборочная единица", self)
+        self.assembly_cb.setChecked(False)
+        form.addRow("", self.assembly_cb)
+
+        root.addLayout(form)
+
+        count_hint = (
+            f"Выбрано элементов: {int(panel_count)}.\n"
+            if int(panel_count) > 0
+            else ""
+        )
+        self._hint_label = QLabel(
+            f"{count_hint}"
+            "Если отмечена «Сборочная единица», блоку и входящим в него деталям "
+            "будут расставлены позиции. Если галочка снята — позиции не назначаются.",
+            self,
+        )
+        self._hint_label.setWordWrap(True)
+        root.addWidget(self._hint_label)
+
+        self._error_label = QLabel("", self)
+        self._error_label.setWordWrap(True)
+        self._error_label.setVisible(False)
+        root.addWidget(self._error_label)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        ok_btn = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = self.button_box.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_btn is not None:
+            ok_btn.setText("ОК")
+        if cancel_btn is not None:
+            cancel_btn.setText("Отмена")
+        self.button_box.accepted.connect(self._on_accept)
+        self.button_box.rejected.connect(self.reject)
+        root.addWidget(self.button_box)
+
+        self.refresh_theme()
+        self.name_edit.selectAll()
+        self.name_edit.setFocus()
+
+    def refresh_theme(self) -> None:
+        t = current_theme()
+        self._hint_label.setStyleSheet(f"color: {t.text_dim}; font-size: 11px;")
+        self._error_label.setStyleSheet(
+            f"color: {t.error}; font-size: 12px; font-weight: 500;"
+        )
+
+    def _on_accept(self) -> None:
+        name = self.name_edit.text().strip()
+        if not name:
+            self._error_label.setText("Укажите название блока.")
+            self._error_label.setVisible(True)
+            self.name_edit.setFocus()
+            return
+        self._error_label.setVisible(False)
+        self.accept()
+
+    def get_block_params(self) -> dict:
+        """Возвращает подтверждённые параметры создаваемого блока."""
+        return {
+            "name": self.name_edit.text().strip() or "Блок",
+            "is_assembly": bool(self.assembly_cb.isChecked()),
+        }
+

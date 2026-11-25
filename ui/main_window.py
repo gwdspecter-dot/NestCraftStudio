@@ -11,22 +11,28 @@ from PyQt6.QtGui import QAction, QKeySequence, QIcon
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QRunnable, pyqtSignal
 
 from models.bounding_frame import BoundingFrame
-from models.panel import Panel, Block, ParametricCabinet
+from models.panel import (
+    Block,
+    Panel,
+    ParametricCabinet,
+    bind_scene_blocks,
+    ensure_root_block,
+    next_assembly_pos_num,
+)
 from ui.home_page import HomePage
 from ui.viewport import CentralWorkspace
 from ui.dialogs import CreatePanelDialog, HoleDialog, LinearArrayDialog, MirrorPanelDialog
-from ui.product_dialogs import CreateModelDialog, ProductParamsDialog
+from ui.product_dialogs import CreateBlockDialog, CreateModelDialog, ProductParamsDialog
 from ui.fastener_constructor_dialog import FastenerConstructorDialog
 from ui.panels.structure_panel import StructureDock
 from ui.panels.properties_panel import PropertiesDock
 from ui.panels.browser_panel import BrowserDock
 from ui.panels.history_panel import AnalysisDock, HistoryDock
-from ui.panels.joints_panel import JointsDock
-from ui.panels.assoc_panel import AssocDock
 from core.undo import (
     AddAssocRefCommand,
     AddMultiplePanelsCommand,
     AddPanelCommand,
+    CreateBlockCommand,
     DeleteAssocRefCommand,
     DeleteJointCommand,
     EditAssocRefCommand,
@@ -161,21 +167,27 @@ class MainWindow(QMainWindow):
         self.home_page.clear_recent_requested.connect(self._on_clear_recent_files)
 
         self.structure_dock.object_selected.connect(self._on_object_selected)
+        self.structure_dock.joint_selected.connect(self._on_structure_joint_selected)
+        self.structure_dock.assoc_selected.connect(self._on_structure_assoc_selected)
+        self.structure_dock.create_block_requested.connect(self._on_create_block_requested)
+        self.structure_dock.multi_panels_selected.connect(self._on_multi_panels_selected)
+
         self.properties_dock.property_changed.connect(self._on_property_changed)
         self.properties_dock.property_applied.connect(self._on_property_applied)
         self.properties_dock.validation_failed.connect(self._on_validation_failed)
+        self.properties_dock.joints_panel.joint_selected.connect(self._on_joint_selected)
+        self.properties_dock.joints_panel.joint_modified.connect(self._on_joint_modified)
+        self.properties_dock.joints_panel.joint_deleted.connect(self._on_joint_deleted)
+        self.properties_dock.joints_panel.add_joint_requested.connect(self.add_hole_to_selected)
+        self.properties_dock.assoc_panel.assoc_selected.connect(self._on_assoc_selected)
+        self.properties_dock.assoc_panel.assoc_modified.connect(self._on_assoc_modified)
+        self.properties_dock.assoc_panel.assoc_deleted.connect(self._on_assoc_deleted)
+        self.properties_dock.assoc_panel.add_assoc_requested.connect(self.add_assoc_ref_dialog)
+        self.properties_dock.assoc_panel.edit_assoc_requested.connect(self._on_assoc_edit_dialog)
+
         self.browser_dock.template_double_clicked.connect(self.add_cabinet_from_template)
         self.analysis_dock.run_analysis_requested.connect(self.run_collision_analysis)
         self.analysis_dock.issue_activated.connect(self.select_panel_by_uid)
-        self.joints_dock.joint_selected.connect(self._on_joint_selected)
-        self.joints_dock.joint_modified.connect(self._on_joint_modified)
-        self.joints_dock.joint_deleted.connect(self._on_joint_deleted)
-        self.joints_dock.add_joint_requested.connect(self.add_hole_to_selected)
-        self.assoc_dock.assoc_selected.connect(self._on_assoc_selected)
-        self.assoc_dock.assoc_modified.connect(self._on_assoc_modified)
-        self.assoc_dock.assoc_deleted.connect(self._on_assoc_deleted)
-        self.assoc_dock.add_assoc_requested.connect(self.add_assoc_ref_dialog)
-        self.assoc_dock.edit_assoc_requested.connect(self._on_assoc_edit_dialog)
 
         # Сигналы вкладок: при смене/создании переподключаем viewport
         self.workspace.currentChanged.connect(self._on_tab_changed)
@@ -185,6 +197,10 @@ class MainWindow(QMainWindow):
         """Обновляет оформление зависимых от темы виджетов (вызывается из ui.theme.apply_theme)."""
         if hasattr(self, "home_page") and self.home_page is not None:
             self.home_page.refresh_theme()
+        if hasattr(self, "structure_dock") and self.structure_dock is not None:
+            self.structure_dock.refresh_theme()
+        if hasattr(self, "properties_dock") and self.properties_dock is not None:
+            self.properties_dock.refresh_theme()
 
     def is_home_page_visible(self) -> bool:
         """True, если сейчас открыта домашняя страница."""
@@ -268,7 +284,8 @@ class MainWindow(QMainWindow):
             return
         if hasattr(vp, "_free_all_panel_gpu"):
             vp._free_all_panel_gpu()
-        vp.blocks[:] = [Block(model_name, "1", "01.00")]
+        vp.blocks[:] = [Block(model_name, "", "", is_assembly=False, is_root=True)]
+        bind_scene_blocks(vp.blocks)
         vp.bounding_frame = frame
         vp.order_number = order_num
         vp.undo_stack.clear()
@@ -545,16 +562,74 @@ class MainWindow(QMainWindow):
     def _refresh_structure(self):
         vp = self.workspace.current_viewport()
         if vp:
+            bind_scene_blocks(vp.blocks)
             if hasattr(vp, "_rebuild_scene_gpu_ids"):
                 vp._rebuild_scene_gpu_ids()
             self.structure_dock.load_structure(
                 vp.title, vp.blocks, order_number=self.order_number
             )
-            if hasattr(self, "joints_dock") and self.joints_dock is not None:
-                self.joints_dock.load_joints(vp.blocks)
-            if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
-                self.assoc_dock.load_assocs(vp.blocks)
+            self.properties_dock.joints_panel.load_joints(vp.blocks)
+            self.properties_dock.assoc_panel.load_assocs(vp.blocks)
             self._refresh_issues_only()
+
+    def _on_structure_joint_selected(self, block, joint_uid: str) -> None:
+        """Клик по стыку или одиночной фурнитуре в структуре открывает панель стыков в «Свойствах»."""
+        vp = self.workspace.current_viewport()
+        if not vp or block is None or not joint_uid:
+            return
+        self.properties_dock.show()
+        self.properties_dock.raise_()
+        self.properties_dock.show_joints_panel(vp.blocks, joint_uid)
+        self._on_joint_selected(block, joint_uid)
+
+    def _on_structure_assoc_selected(self, block, assoc_uid: str) -> None:
+        """Клик по ассоциации в структуре открывает панель ассоциаций в «Свойствах»."""
+        vp = self.workspace.current_viewport()
+        if not vp or block is None or not assoc_uid:
+            return
+        self.properties_dock.show()
+        self.properties_dock.raise_()
+        self.properties_dock.show_assoc_panel(vp.blocks, assoc_uid)
+        self._on_assoc_selected(block, assoc_uid)
+
+    def _on_multi_panels_selected(self, _panels: list) -> None:
+        vp = self.workspace.current_viewport()
+        if vp:
+            vp.update()
+
+    def _on_create_block_requested(self, panels: list) -> None:
+        """ПКМ в структуре модели → «Создать блок…»: диалог имени и признака сборочной единицы."""
+        vp = self.workspace.current_viewport()
+        if not vp or not panels:
+            return
+        user_blocks_count = sum(
+            1 for b in vp.blocks if not getattr(b, "is_root", False)
+        )
+        dlg = CreateBlockDialog(
+            default_name=f"Блок {user_blocks_count + 1}",
+            panel_count=len(panels),
+            parent=self,
+        )
+        if not dlg.exec():
+            return
+        params = dlg.get_block_params()
+        cmd = CreateBlockCommand(
+            vp.blocks,
+            panels,
+            params["name"],
+            is_assembly=params["is_assembly"],
+        )
+        vp.undo_stack.push(cmd, execute=True)
+        self._refresh_structure()
+        if cmd.new_block is not None:
+            self.structure_dock.highlight_object(cmd.new_block)
+            self.properties_dock.show_object_properties(cmd.new_block)
+        vp.update()
+        asm_txt = "сборочная единица" if params["is_assembly"] else "без позиций"
+        self.statusBar().showMessage(
+            f"Создан блок «{params['name']}» ({len(panels)} эл., {asm_txt})",
+            5000,
+        )
 
     def _on_joint_selected(self, block, joint_uid: str) -> None:
         vp = self.workspace.current_viewport()
@@ -573,6 +648,7 @@ class MainWindow(QMainWindow):
             vp.set_assoc_preview_point(None)
         if hasattr(vp, "set_active_hole_owner"):
             vp.set_active_hole_owner(block, "joint", joint_uid)
+        self.structure_dock.highlight_joint(joint_uid)
         vp.update()
 
     def _on_joint_modified(self, block, joint_uid: str, old_state: dict, new_state: dict) -> None:
@@ -582,9 +658,9 @@ class MainWindow(QMainWindow):
         cmd = EditJointCommand(block, joint_uid, old_state, new_state, "Параметры стыка")
         vp.undo_stack.push(cmd, execute=True, merge=True)
         self._refresh_structure()
-        sel = vp.get_selected_panel()
-        if sel is not None:
-            self.properties_dock.show_object_properties(sel)
+        if self.properties_dock.active_mode() == "joints":
+            self.properties_dock.show_joints_panel(vp.blocks, joint_uid)
+            self.structure_dock.highlight_joint(joint_uid)
         vp.update()
 
     def _on_joint_deleted(self, block, joint_uid: str) -> None:
@@ -596,9 +672,8 @@ class MainWindow(QMainWindow):
         self._refresh_structure()
         if hasattr(vp, "set_active_hole_owner"):
             vp.set_active_hole_owner(None)
-        sel = vp.get_selected_panel()
-        if sel is not None:
-            self.properties_dock.show_object_properties(sel)
+        if self.properties_dock.active_mode() == "joints":
+            self.properties_dock.show_joints_panel(vp.blocks)
         vp.update()
 
     def _on_assoc_selected(self, block, assoc_uid: str) -> None:
@@ -624,9 +699,12 @@ class MainWindow(QMainWindow):
             for p in getattr(b, "panels", []):
                 p.selected = str(getattr(p, "uid", "")) in {t_uid, s_uid}
         if hasattr(vp, "set_assoc_preview_point"):
-            vp.set_assoc_preview_point(resolve_assoc_world_point(block, ref))
+            vp.set_assoc_preview_point(
+                resolve_assoc_world_point(block, ref, all_blocks=vp.blocks)
+            )
         if hasattr(vp, "set_active_hole_owner"):
             vp.set_active_hole_owner(block, "assoc", assoc_uid)
+        self.structure_dock.highlight_assoc(assoc_uid)
         vp.update()
 
     def _on_assoc_modified(self, block, assoc_uid: str, old_state: dict, new_state: dict) -> None:
@@ -636,11 +714,9 @@ class MainWindow(QMainWindow):
         cmd = EditAssocRefCommand(block, assoc_uid, old_state, new_state, "Параметры ассоциации")
         vp.undo_stack.push(cmd, execute=True, merge=True)
         self._refresh_structure()
-        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
-            self.assoc_dock.load_assocs(vp.blocks)
-        sel = vp.get_selected_panel()
-        if sel is not None:
-            self.properties_dock.show_object_properties(sel)
+        if self.properties_dock.active_mode() == "assoc":
+            self.properties_dock.show_assoc_panel(vp.blocks, assoc_uid)
+            self.structure_dock.highlight_assoc(assoc_uid)
         vp.update()
 
     def _on_assoc_deleted(self, block, assoc_uid: str) -> None:
@@ -650,19 +726,16 @@ class MainWindow(QMainWindow):
         cmd = DeleteAssocRefCommand(block, assoc_uid, "Удаление ассоциации")
         vp.undo_stack.push(cmd, execute=True)
         self._refresh_structure()
-        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
-            self.assoc_dock.load_assocs(vp.blocks)
         if hasattr(vp, "set_assoc_preview_point"):
             vp.set_assoc_preview_point(None)
         if hasattr(vp, "set_active_hole_owner"):
             vp.set_active_hole_owner(None)
-        sel = vp.get_selected_panel()
-        if sel is not None:
-            self.properties_dock.show_object_properties(sel)
+        if self.properties_dock.active_mode() == "assoc":
+            self.properties_dock.show_assoc_panel(vp.blocks)
         vp.update()
 
     def navigate_to_hole_owner(self, block, kind: str, owner_uid: str, panel=None) -> bool:
-        """Переходит от 3D-отверстия к его владельцу в док-панелях «Стыки», «Ассоциации» или «Свойства»."""
+        """Переходит от 3D-отверстия к его владельцу в дереве «Структура модели» и панели «Свойства»."""
         vp = self.workspace.current_viewport()
         if vp is None:
             return False
@@ -670,30 +743,26 @@ class MainWindow(QMainWindow):
         norm_kind = str(kind or "").strip()
         uid = str(owner_uid or "").strip()
 
-        if norm_kind == "joint" and uid and hasattr(self, "joints_dock") and self.joints_dock is not None:
-            self.joints_dock.show()
-            self.joints_dock.raise_()
-            found = self.joints_dock.select_joint_by_uid(uid)
-            if not found:
-                self.joints_dock.load_joints(vp.blocks)
-                found = self.joints_dock.select_joint_by_uid(uid)
+        if norm_kind == "joint" and uid:
+            self.properties_dock.show()
+            self.properties_dock.raise_()
+            self.properties_dock.show_joints_panel(vp.blocks, uid)
+            found = self.properties_dock.joints_panel.select_joint_by_uid(uid)
             if found:
                 self._on_joint_selected(block, uid)
                 if hasattr(self, "statusBar") and self.statusBar() is not None:
-                    self.statusBar().showMessage("🔩 Переход к стыку в панели «Стыки»", 4000)
+                    self.statusBar().showMessage("🔩 Переход к стыку в панели «Свойства»", 4000)
                 return True
 
-        if norm_kind == "assoc" and uid and hasattr(self, "assoc_dock") and self.assoc_dock is not None:
-            self.assoc_dock.show()
-            self.assoc_dock.raise_()
-            found = self.assoc_dock.select_assoc_by_uid(uid)
-            if not found:
-                self.assoc_dock.load_assocs(vp.blocks)
-                found = self.assoc_dock.select_assoc_by_uid(uid)
+        if norm_kind == "assoc" and uid:
+            self.properties_dock.show()
+            self.properties_dock.raise_()
+            self.properties_dock.show_assoc_panel(vp.blocks, uid)
+            found = self.properties_dock.assoc_panel.select_assoc_by_uid(uid)
             if found:
                 self._on_assoc_selected(block, uid)
                 if hasattr(self, "statusBar") and self.statusBar() is not None:
-                    self.statusBar().showMessage("🔗 Переход к ассоциации в панели «Ассоциации»", 4000)
+                    self.statusBar().showMessage("🔗 Переход к ассоциации в панели «Свойства»", 4000)
                 return True
 
         if panel is not None:
@@ -743,16 +812,26 @@ class MainWindow(QMainWindow):
         if ref is None:
             return
 
+        target_panel = None
+        for b in vp.blocks:
+            for p in getattr(b, "panels", []) or []:
+                if str(getattr(p, "uid", "")) == str(ref.target_uid):
+                    target_panel = p
+                    break
+            if target_panel is not None:
+                break
+
         def _preview(pt):
             if hasattr(vp, "set_assoc_preview_point"):
                 vp.set_assoc_preview_point(pt)
 
         dlg = AssocRefDialog(
             block,
-            target_panel=block.get_panel_by_uid(ref.target_uid) if hasattr(block, "get_panel_by_uid") else None,
+            target_panel=target_panel,
             parent=self,
             existing_ref=ref,
             preview_callback=_preview,
+            all_blocks=vp.blocks,
         )
         if not dlg.exec():
             return
@@ -771,8 +850,8 @@ class MainWindow(QMainWindow):
         )
         self.mark_modified()
         self._refresh_structure()
-        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
-            self.assoc_dock.load_assocs(vp.blocks)
+        self.properties_dock.show_assoc_panel(vp.blocks, assoc_uid)
+        self.structure_dock.highlight_assoc(assoc_uid)
         vp.update()
 
     def _on_object_selected(self, obj):
@@ -781,6 +860,10 @@ class MainWindow(QMainWindow):
             self._update_coord_boxes(obj.x, obj.y, obj.z)
         vp = self.workspace.current_viewport()
         if vp:
+            if hasattr(vp, "set_active_hole_owner"):
+                vp.set_active_hole_owner(None)
+            if hasattr(vp, "set_assoc_preview_point"):
+                vp.set_assoc_preview_point(None)
             vp.update()
 
     def _on_viewport_clicked(self, obj):
@@ -843,18 +926,14 @@ class MainWindow(QMainWindow):
         dlg = CreatePanelDialog(panel_type, def_x, def_y, def_z, self, bounding_frame=bf)
         if dlg.exec():
             data = dlg.get_panel_data()
-            
-            # Гарантируем, что есть блок для добавления
-            if not vp.blocks:
-                vp.blocks.append(Block("Корпус 1", "1", "01.00"))
-            
-            target_block = vp.blocks[-1]
-            idx = len(target_block.panels) + 1
+
+            # Новые панели добавляются напрямую в структуру модели без создания блока
+            target_block = ensure_root_block(vp.blocks, name=self.project_name or "Изделие")
 
             p = Panel(
                 data["name"], data["x"], data["y"], data["z"],
                 data["width"], data["height"], data["depth"],
-                f"{target_block.pos_num}.{idx}"
+                "",
             )
             # Ось толщины по типу панели
             if panel_type == "vertical":
@@ -928,9 +1007,7 @@ class MainWindow(QMainWindow):
                 target_block = b
                 break
         if target_block is None:
-            if not vp.blocks:
-                vp.blocks.append(Block("Изделие 1", "1", "01.00"))
-            target_block = vp.blocks[-1]
+            target_block = ensure_root_block(vp.blocks, name=self.project_name or "Изделие")
 
         # Сдвиг: вертикальные — по X, горизонтальные — по Y
         offset_x = vp.move_step if sel.width <= sel.height else 0.0
@@ -942,7 +1019,10 @@ class MainWindow(QMainWindow):
             for p in getattr(b, "panels", [])
         }
         new_name = self._next_copy_name(sel.name, existing_names)
-        new_pos = self._next_pos_num(target_block, str(getattr(target_block, "pos_num", "") or "1"))
+        if getattr(target_block, "is_root", False) or not getattr(target_block, "is_assembly", True):
+            new_pos = ""
+        else:
+            new_pos = self._next_pos_num(target_block, str(getattr(target_block, "pos_num", "") or "1"))
 
         clone = sel.clone(
             name=new_name,
@@ -979,9 +1059,7 @@ class MainWindow(QMainWindow):
                 target_block = b
                 break
         if target_block is None:
-            if not vp.blocks:
-                vp.blocks.append(Block("Изделие 1", "1", "01.00"))
-            target_block = vp.blocks[-1]
+            target_block = ensure_root_block(vp.blocks, name=self.project_name or "Изделие")
 
         dlg = MirrorPanelDialog(sel, target_block, self)
         if not dlg.exec():
@@ -993,7 +1071,10 @@ class MainWindow(QMainWindow):
             for b in vp.blocks
             for p in getattr(b, "panels", [])
         }
-        new_pos = self._next_pos_num(target_block, str(getattr(target_block, "pos_num", "") or "1"))
+        if getattr(target_block, "is_root", False) or not getattr(target_block, "is_assembly", True):
+            new_pos = ""
+        else:
+            new_pos = self._next_pos_num(target_block, str(getattr(target_block, "pos_num", "") or "1"))
         plane_c = compute_mirror_plane_coord(
             sel,
             axis=params["axis"],
@@ -1043,9 +1124,7 @@ class MainWindow(QMainWindow):
                 target_block = b
                 break
         if target_block is None:
-            if not vp.blocks:
-                vp.blocks.append(Block("Изделие 1", "1", "01.00"))
-            target_block = vp.blocks[-1]
+            target_block = ensure_root_block(vp.blocks, name=self.project_name or "Изделие")
 
         dlg = LinearArrayDialog(sel, self)
         if not dlg.exec():
@@ -1057,6 +1136,10 @@ class MainWindow(QMainWindow):
             for b in vp.blocks
             for p in getattr(b, "panels", [])
         }
+        assign_pos = (
+            not getattr(target_block, "is_root", False)
+            and bool(getattr(target_block, "is_assembly", True))
+        )
         prefix = str(getattr(target_block, "pos_num", "") or "1")
         clones = build_linear_array_panels(
             sel,
@@ -1070,6 +1153,9 @@ class MainWindow(QMainWindow):
         )
         if not clones:
             return
+        if not assign_pos:
+            for c in clones:
+                c.pos_num = ""
 
         sel.selected = False
         for c in clones:
@@ -1100,7 +1186,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(vp, "_free_all_panel_gpu"):
             vp._free_all_panel_gpu()
-        empty = [Block("Изделие 1", "1", "01.00")]
+        empty = [Block("Изделие", "", "", is_assembly=False, is_root=True)]
         vp.undo_stack.push(
             ReplaceBlocksCommand(vp.blocks, empty, "Очистка сцены"),
             execute=True,
@@ -1114,8 +1200,8 @@ class MainWindow(QMainWindow):
         if not vp:
             return
 
-        idx = len(vp.blocks) + 1
-        pos_str = str(idx)
+        pos_str = next_assembly_pos_num(vp.blocks)
+        idx = int(pos_str)
         code_str = f"{idx:02d}.00"
 
         next_x_base = max([b.x + b.width for b in vp.blocks if isinstance(b, ParametricCabinet) and b.y < 1000], default=0.0)
@@ -1855,12 +1941,13 @@ class MainWindow(QMainWindow):
         vp.update()
 
     def add_assoc_ref_dialog(self):
-        """Диалог: отверстие на панели, привязанное к грани соседней панели в том же блоке."""
+        """Диалог: отверстие на панели, привязанное к грани любой другой панели в модели."""
         from ui.assoc_dialog import AssocRefDialog
 
         vp = self.workspace.current_viewport()
         if not vp:
             return
+        bind_scene_blocks(vp.blocks)
         sel = vp.get_selected_panel()
         if not sel:
             QMessageBox.information(
@@ -1869,23 +1956,35 @@ class MainWindow(QMainWindow):
                 "Сначала выберите панель, на которой нужно отверстие (target).",
             )
             return
-        block = getattr(sel, "_block", None)
-        panels = list(getattr(block, "panels", []) or []) if block is not None else []
-        if block is None or len(panels) < 2:
+        all_panels = [
+            p
+            for b in vp.blocks
+            for p in (getattr(b, "panels", []) or [])
+            if str(getattr(p, "uid", "") or "")
+        ]
+        if len(all_panels) < 2:
             QMessageBox.warning(
                 self,
                 "Ассоциативное отверстие",
-                "Нужны минимум две панели в одном блоке или корпусе.\n"
-                "Выберите панель внутри корпуса / блока и повторите.",
+                "Нужны минимум две панели в модели.\n"
+                "Добавьте ещё одну панель и повторите.",
             )
             return
+        block = getattr(sel, "_block", None)
+        if block is None:
+            block = ensure_root_block(vp.blocks, name=self.project_name or "Изделие")
+            bind_scene_blocks(vp.blocks)
 
         def _preview(pt):
             if hasattr(vp, "set_assoc_preview_point"):
                 vp.set_assoc_preview_point(pt)
 
         dlg = AssocRefDialog(
-            block, target_panel=sel, parent=self, preview_callback=_preview
+            block,
+            target_panel=sel,
+            parent=self,
+            preview_callback=_preview,
+            all_blocks=vp.blocks,
         )
         if not dlg.exec():
             return
@@ -1900,9 +1999,9 @@ class MainWindow(QMainWindow):
             execute=True,
         )
         self.mark_modified()
-        self.properties_dock.show_object_properties(sel)
-        if hasattr(self, "assoc_dock") and self.assoc_dock is not None:
-            self.assoc_dock.load_assocs(vp.blocks)
+        self._refresh_structure()
+        self.properties_dock.show_assoc_panel(vp.blocks, ref.uid)
+        self.structure_dock.highlight_assoc(ref.uid)
         vp.update()
         self.statusBar().showMessage(
             f"Ассоциативное отверстие: {ref.source_face} → {getattr(sel, 'name', '')}",
@@ -2637,25 +2736,17 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self.structure_dock, self.properties_dock, Qt.Orientation.Vertical)
 
         self.browser_dock = BrowserDock(self)
-        self.joints_dock = JointsDock(self)
-        self.assoc_dock = AssocDock(self)
         self.analysis_dock = AnalysisDock(self)
         self.history_dock = HistoryDock(self)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.browser_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.joints_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.assoc_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.analysis_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.history_dock)
-        self.splitDockWidget(self.browser_dock, self.joints_dock, Qt.Orientation.Vertical)
-        self.splitDockWidget(self.joints_dock, self.assoc_dock, Qt.Orientation.Vertical)
-        self.splitDockWidget(self.assoc_dock, self.analysis_dock, Qt.Orientation.Vertical)
+        self.splitDockWidget(self.browser_dock, self.analysis_dock, Qt.Orientation.Vertical)
         self.splitDockWidget(self.analysis_dock, self.history_dock, Qt.Orientation.Vertical)
         self._editor_docks = [
             self.structure_dock,
             self.properties_dock,
             self.browser_dock,
-            self.joints_dock,
-            self.assoc_dock,
             self.analysis_dock,
             self.history_dock,
         ]

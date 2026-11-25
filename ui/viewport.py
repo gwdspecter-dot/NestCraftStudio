@@ -107,7 +107,13 @@ import numpy as np
 import ctypes
 import math
 from models.bounding_frame import BoundingFrame
-from models.panel import Panel, Block, ParametricCabinet
+from models.panel import (
+    Block,
+    Panel,
+    ParametricCabinet,
+    bind_scene_blocks,
+    ensure_root_block,
+)
 from core.undo import UndoStack, DeleteItemsCommand, MovePanelCommand, PlaceJointFastenerCommand, ResizePanelCommand, PasteBlocksCommand
 from core.clipboard import (
     capture_selection,
@@ -753,8 +759,9 @@ class Viewport3D(QOpenGLWidget):
             shelves_count=1, has_facade=False, is_upper=False,
             pos_num="1", code="01.00"
         )
-        custom_block = Block("Пользовательские панели", "2", "02.00")
-        self.blocks.extend([b1, custom_block])
+        root_block = Block("Изделие", "", "", is_assembly=False, is_root=True)
+        self.blocks.extend([b1, root_block])
+        bind_scene_blocks(self.blocks)
         cx, cy, cz, _r = self._scene_center_and_radius()
         self._focus_pivot = (cx, cy, cz)
         self.pan_x, self.pan_y = pan_for_pivot(self.rot_x, self.rot_y, self._focus_pivot)
@@ -2902,11 +2909,11 @@ class Viewport3D(QOpenGLWidget):
             glDisable(GL_DEPTH_TEST)
             drawn: set[tuple[int, tuple]] = set()
 
-            # 1. Группа отверстий активного владельца (выбранного в доке «Стыки» / «Ассоциации»)
+            # 1. Группа отверстий активного владельца (выбранного в структуре / свойствах)
             if self._active_hole_owner is not None:
                 blk, kind, uid = self._active_hole_owner
                 color = (0.12, 0.62, 1.0) if kind == "assoc" else (1.0, 0.56, 0.06)
-                for panel, hole in collect_owner_holes(blk, kind, uid):
+                for panel, hole in collect_owner_holes(blk, kind, uid, blocks=self.blocks):
                     key = (id(panel), hole[:6])
                     if key in drawn:
                         continue
@@ -2922,7 +2929,9 @@ class Viewport3D(QOpenGLWidget):
             if hit is not None:
                 if hit.has_owner:
                     grp_color = (0.18, 0.78, 1.0) if hit.kind == "assoc" else (1.0, 0.72, 0.12)
-                    for panel, hole in collect_owner_holes(hit.block, hit.kind, hit.owner_uid):
+                    for panel, hole in collect_owner_holes(
+                        hit.block, hit.kind, hit.owner_uid, blocks=self.blocks
+                    ):
                         hx, hy, hz, radius, length, axis = hole[:6]
                         self._draw_panel_hole_wire(
                             panel, hx, hy, hz, radius, length, axis,
@@ -2949,7 +2958,7 @@ class Viewport3D(QOpenGLWidget):
         hit = self._hovered_hole
         if hit is None or hit.screen_mid is None:
             return
-        text = describe_hole_hit(hit, include_hint=False, compact=True)
+        text = describe_hole_hit(hit, include_hint=False, compact=True, blocks=self.blocks)
         font = QFont("Segoe UI", 8)
         painter.setFont(font)
         fm = painter.fontMetrics()
@@ -3118,16 +3127,18 @@ class Viewport3D(QOpenGLWidget):
     def _show_hole_context_menu(self, hit: HoleHit, global_pos) -> None:
         """Контекстное меню по короткому ПКМ на 3D-отверстии."""
         menu = QMenu(self)
-        title_act = menu.addAction(describe_hole_hit(hit, include_hint=False, compact=False))
+        title_act = menu.addAction(
+            describe_hole_hit(hit, include_hint=False, compact=False, blocks=self.blocks)
+        )
         title_act.setEnabled(False)
         menu.addSeparator()
 
         act_nav = None
         act_edit = None
         if hit.kind == "joint":
-            act_nav = menu.addAction("Перейти к стыку в панели «Стыки»")
+            act_nav = menu.addAction("Перейти к стыку в панели «Свойства»")
         elif hit.kind == "assoc":
-            act_nav = menu.addAction("Перейти к ассоциации в панели «Ассоциации»")
+            act_nav = menu.addAction("Перейти к ассоциации в панели «Свойства»")
             act_edit = menu.addAction("Правка ассоциации…")
         else:
             act_nav = menu.addAction("Выбрать деталь и открыть «Свойства»")
@@ -4533,12 +4544,15 @@ class Viewport3D(QOpenGLWidget):
         if not pts:
             return False
 
-        target_block = getattr(j.panel_a, "_block", None) or getattr(j.panel_b, "_block", None)
-        if target_block is None:
+        bind_scene_blocks(self.blocks)
+        block_a = getattr(j.panel_a, "_block", None)
+        block_b = getattr(j.panel_b, "_block", None)
+        if block_a is None or block_b is None:
             for b in self.blocks:
-                if j.panel_a in b.panels or j.panel_b in b.panels:
-                    target_block = b
-                    break
+                if block_a is None and j.panel_a in b.panels:
+                    block_a = b
+                if block_b is None and j.panel_b in b.panels:
+                    block_b = b
 
         preset_id = getattr(self, "fastener_preset_id", "") or "confirmat_3"
         preset = get_fastener_preset(preset_id)
@@ -4554,13 +4568,30 @@ class Viewport3D(QOpenGLWidget):
         pa_uid = str(getattr(j.panel_a, "uid", "") or "")
         pb_uid = str(getattr(j.panel_b, "uid", "") or "")
         existing_uid = ""
-        if target_block is not None:
-            for existing in getattr(target_block, "joints", None) or []:
-                ea = str(getattr(existing, "panel_a_uid", ""))
-                eb = str(getattr(existing, "panel_b_uid", ""))
-                if {ea, eb} == {pa_uid, pb_uid} and pa_uid and pb_uid:
-                    existing_uid = str(getattr(existing, "uid", ""))
+        existing_block = None
+        if pa_uid and pb_uid:
+            for b in self.blocks:
+                for existing in getattr(b, "joints", None) or []:
+                    ea = str(getattr(existing, "panel_a_uid", ""))
+                    eb = str(getattr(existing, "panel_b_uid", ""))
+                    if {ea, eb} == {pa_uid, pb_uid}:
+                        existing_uid = str(getattr(existing, "uid", ""))
+                        existing_block = b
+                        break
+                if existing_block is not None:
                     break
+
+        if existing_block is not None:
+            target_block = existing_block
+        elif (
+            block_a is not None
+            and block_a is block_b
+            and not getattr(block_a, "is_root", False)
+        ):
+            target_block = block_a
+        else:
+            target_block = ensure_root_block(self.blocks, name=getattr(self, "title", "Изделие"))
+            bind_scene_blocks(self.blocks)
 
         custom = getattr(self, "_last_fastener_params", None)
         use_custom = isinstance(custom, dict) and not str(preset_id).startswith("dowel")

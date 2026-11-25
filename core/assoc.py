@@ -795,32 +795,47 @@ def evaluate_assoc_ref_panels(target, source, ref: AssocRef) -> AssocAttachmentS
     )
 
 
-def evaluate_assoc_ref(block, ref: AssocRef) -> AssocAttachmentStatus:
-    """Оценивает здоровье ``ref`` внутри ``block`` (единый источник истины для UI и issues.py)."""
-    if block is None or ref is None:
+def _resolve_assoc_scene_blocks(block, all_blocks=None) -> list:
+    """Возвращает список блоков сцены для поиска панелей ассоциативных ссылок."""
+    if isinstance(all_blocks, (list, tuple)) and all_blocks:
+        seq = [b for b in all_blocks if b is not None]
+        if block is not None and block not in seq:
+            seq.append(block)
+        return seq
+    scene_blocks = getattr(block, "_scene_blocks", None) if block is not None else None
+    if isinstance(scene_blocks, list) and scene_blocks and (block is None or block in scene_blocks):
+        return [b for b in scene_blocks if b is not None]
+    return [block] if block is not None else []
+
+
+def _assoc_panels_by_uid(block, all_blocks=None) -> dict[str, Any]:
+    by_uid: dict[str, Any] = {}
+    for blk in _resolve_assoc_scene_blocks(block, all_blocks=all_blocks):
+        for p in getattr(blk, "panels", None) or []:
+            uid = str(getattr(p, "uid", "") or "")
+            if uid:
+                by_uid[uid] = p
+    return by_uid
+
+
+def evaluate_assoc_ref(block, ref: AssocRef, *, all_blocks=None) -> AssocAttachmentStatus:
+    """Оценивает здоровье ``ref`` внутри блока или всей сцены (единый источник истины для UI и issues.py)."""
+    if (block is None and not all_blocks) or ref is None:
         return evaluate_assoc_ref_panels(None, None, ref)
-    by_uid = {
-        str(getattr(p, "uid", "") or ""): p
-        for p in (getattr(block, "panels", None) or [])
-        if str(getattr(p, "uid", "") or "")
-    }
+    by_uid = _assoc_panels_by_uid(block, all_blocks=all_blocks)
     target = by_uid.get(str(ref.target_uid or ""))
     source = by_uid.get(str(ref.source_uid or ""))
     return evaluate_assoc_ref_panels(target, source, ref)
 
 
-def resolve_assoc_world_point(block, ref: AssocRef) -> tuple[float, float, float] | None:
+def resolve_assoc_world_point(block, ref: AssocRef, *, all_blocks=None) -> tuple[float, float, float] | None:
     """Мировая 3D-точка превью для живой или замороженной (fixed=True) ассоциации."""
-    st = evaluate_assoc_ref(block, ref)
+    st = evaluate_assoc_ref(block, ref, all_blocks=all_blocks)
     if st.world_point is not None:
         return st.world_point
-    if block is None or ref is None or ref.fixed:
+    if (block is None and not all_blocks) or ref is None or ref.fixed:
         return None
-    by_uid = {
-        str(getattr(p, "uid", "") or ""): p
-        for p in (getattr(block, "panels", None) or [])
-        if str(getattr(p, "uid", "") or "")
-    }
+    by_uid = _assoc_panels_by_uid(block, all_blocks=all_blocks)
     source = by_uid.get(str(ref.source_uid or ""))
     if source is None:
         return None
@@ -838,19 +853,15 @@ def resolve_assoc_world_point(block, ref: AssocRef) -> tuple[float, float, float
         return None
 
 
-def freeze_assoc_ref_state(block, ref: AssocRef) -> dict[str, Any] | None:
+def freeze_assoc_ref_state(block, ref: AssocRef, *, all_blocks=None) -> dict[str, Any] | None:
     """Готовит новое состояние ``AssocRef`` в режиме ``fixed=True`` на текущей позиции отверстия.
 
     Даже если панель ``source`` уже удалена, пытается спасти последние координаты отверстия
     из ``target.holes`` / ``target.assoc_hole_map`` (паттерн ``fixed:true``).
     """
-    if block is None or ref is None:
+    if (block is None and not all_blocks) or ref is None:
         return None
-    by_uid = {
-        str(getattr(p, "uid", "") or ""): p
-        for p in (getattr(block, "panels", None) or [])
-        if str(getattr(p, "uid", "") or "")
-    }
+    by_uid = _assoc_panels_by_uid(block, all_blocks=all_blocks)
     target = by_uid.get(str(ref.target_uid or ""))
     source = by_uid.get(str(ref.source_uid or ""))
     if target is None:
@@ -873,15 +884,11 @@ def freeze_assoc_ref_state(block, ref: AssocRef) -> dict[str, Any] | None:
     return frozen.to_dict()
 
 
-def unfreeze_assoc_ref_state(block, ref: AssocRef) -> dict[str, Any] | None:
+def unfreeze_assoc_ref_state(block, ref: AssocRef, *, all_blocks=None) -> dict[str, Any] | None:
     """Снимает заморозку ``fixed=False``, проецируя зафиксированную точку на ``source_face`` без скачка."""
-    if block is None or ref is None:
+    if (block is None and not all_blocks) or ref is None:
         return None
-    by_uid = {
-        str(getattr(p, "uid", "") or ""): p
-        for p in (getattr(block, "panels", None) or [])
-        if str(getattr(p, "uid", "") or "")
-    }
+    by_uid = _assoc_panels_by_uid(block, all_blocks=all_blocks)
     target = by_uid.get(str(ref.target_uid or ""))
     source = by_uid.get(str(ref.source_uid or ""))
     if target is None or source is None:
@@ -915,6 +922,8 @@ def rebind_assoc_ref_state(
     block,
     ref: AssocRef,
     new_face: str | None = None,
+    *,
+    all_blocks=None,
 ) -> dict[str, Any] | None:
     """Перепривязывает ``AssocRef`` к актуальной грани ``source`` и обновляет ``face_hint``.
 
@@ -922,13 +931,9 @@ def rebind_assoc_ref_state(
     ``(u, v, inset)`` проекцией центра ``target`` (с обрезкой по грани ``source``),
     чтобы отверстие сразу легло в рабочую зону детали.
     """
-    if block is None or ref is None:
+    if (block is None and not all_blocks) or ref is None:
         return None
-    by_uid = {
-        str(getattr(p, "uid", "") or ""): p
-        for p in (getattr(block, "panels", None) or [])
-        if str(getattr(p, "uid", "") or "")
-    }
+    by_uid = _assoc_panels_by_uid(block, all_blocks=all_blocks)
     target = by_uid.get(str(ref.target_uid or ""))
     source = by_uid.get(str(ref.source_uid or ""))
     if target is None or source is None:
@@ -972,14 +977,10 @@ def rebind_assoc_ref_state(
     return rebound.to_dict()
 
 
-def apply_assoc_refs(block, *, rebuild_geometry: bool = True) -> list:
-    """Пересчитывает отверстия из ``block.assoc_refs``.
-
-    - Ручные отверстия и отверстия JointRecord сохраняются.
-    - Старые assoc-отверстия снимаются и создаются заново.
-    - Возвращает список замечаний (строки для диагностики нездоровых привязок).
-    """
-    if block is None:
+def apply_assoc_refs_in_blocks(blocks, *, rebuild_geometry: bool = True) -> list:
+    """Пересчитывает ассоциативные отверстия по всем блокам сцены (включая межблочные)."""
+    scene_blocks = [b for b in (blocks or []) if b is not None]
+    if not scene_blocks:
         return []
 
     from core.joint import (
@@ -989,22 +990,33 @@ def apply_assoc_refs(block, *, rebuild_geometry: bool = True) -> list:
         holes_equal,
     )
 
-    panels = list(getattr(block, "panels", []) or [])
-    raw_refs = list(getattr(block, "assoc_refs", []) or [])
-    norm_refs: list[AssocRef] = []
-    for item in raw_refs:
-        if isinstance(item, AssocRef):
-            norm_refs.append(item)
-        elif isinstance(item, dict):
-            norm_refs.append(AssocRef.from_dict(item))
-    block.assoc_refs = norm_refs
+    panels: list = []
+    seen_panel_ids: set[int] = set()
+    all_refs: list[AssocRef] = []
+
+    for blk in scene_blocks:
+        raw_refs = list(getattr(blk, "assoc_refs", []) or [])
+        norm_refs: list[AssocRef] = []
+        for item in raw_refs:
+            if isinstance(item, AssocRef):
+                norm_refs.append(item)
+            elif isinstance(item, dict):
+                norm_refs.append(AssocRef.from_dict(item))
+        blk.assoc_refs = norm_refs
+        all_refs.extend(norm_refs)
+
+        for p in list(getattr(blk, "panels", []) or []):
+            if id(p) in seen_panel_ids:
+                continue
+            seen_panel_ids.add(id(p))
+            try:
+                p._block = blk
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("Could not bind _block on panel: %s", exc)
+            panels.append(p)
 
     old_holes_by_id: dict[int, list[tuple]] = {}
     for p in panels:
-        try:
-            p._block = block
-        except Exception as exc:  # noqa: BLE001
-            _log.debug("Could not bind _block on panel: %s", exc)
         old_holes_by_id[id(p)] = [
             hole_geometry(h) for h in (getattr(p, "holes", []) or []) if len(h) >= 6
         ]
@@ -1033,7 +1045,7 @@ def apply_assoc_refs(block, *, rebuild_geometry: bool = True) -> list:
     }
 
     notes: list = []
-    for ref in norm_refs:
+    for ref in all_refs:
         target = by_uid.get(ref.target_uid)
         source = by_uid.get(ref.source_uid)
         st = evaluate_assoc_ref_panels(target, source, ref)
@@ -1059,3 +1071,12 @@ def apply_assoc_refs(block, *, rebuild_geometry: bool = True) -> list:
                     p.rebuild_geometry()
 
     return notes
+
+
+def apply_assoc_refs(block, *, rebuild_geometry: bool = True, all_blocks=None) -> list:
+    """Пересчитывает отверстия из ``block.assoc_refs`` (с поддержкой межблочных ссылок)."""
+    if block is None and not all_blocks:
+        return []
+    scene_blocks = _resolve_assoc_scene_blocks(block, all_blocks=all_blocks)
+    return apply_assoc_refs_in_blocks(scene_blocks, rebuild_geometry=rebuild_geometry)
+

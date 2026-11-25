@@ -11,25 +11,27 @@ _log = get_logger("undo")
 
 
 def _reapply_panel_block_joints(panel) -> None:
-    """Пересчитывает зависимые features блока после сдвига/resize панели.
+    """Пересчитывает зависимые features сцены после сдвига/resize панели.
 
-    - при наличии joints вызывает apply_joints (он же тянет assoc_refs);
-    - иначе, если есть только assoc_refs — apply_assoc_refs.
+    - при наличии стыков в сцене вызывает apply_joints_in_blocks (он же тянет assoc_refs);
+    - иначе, если есть только assoc_refs — apply_assoc_refs_in_blocks.
     """
     block = getattr(panel, "_block", None)
     if block is None:
         return
-    has_joints = bool(getattr(block, "joints", None))
-    has_assoc = bool(getattr(block, "assoc_refs", None))
+    scene_blocks = getattr(block, "_scene_blocks", None)
+    blocks_scope = [b for b in scene_blocks if b is not None] if scene_blocks else [block]
+    has_joints = any(bool(getattr(b, "joints", None)) for b in blocks_scope)
+    has_assoc = any(bool(getattr(b, "assoc_refs", None)) for b in blocks_scope)
     if has_joints:
-        from core.joint import apply_joints
+        from core.joint import apply_joints_in_blocks
 
-        apply_joints(block)
+        apply_joints_in_blocks(blocks_scope)
         return
     if has_assoc:
-        from core.assoc import apply_assoc_refs
+        from core.assoc import apply_assoc_refs_in_blocks
 
-        apply_assoc_refs(block)
+        apply_assoc_refs_in_blocks(blocks_scope)
 
 
 class Command:
@@ -143,26 +145,32 @@ class AddPanelCommand(Command):
         self._block_was_missing = False
 
     def redo(self) -> None:
+        from models.panel import bind_scene_blocks
+
         if self.block not in self.blocks:
             self.blocks.append(self.block)
             self._block_was_missing = True
         self.panel._block = self.block
         if self.panel not in self.block.panels:
             self.block.panels.append(self.panel)
-        if getattr(self.block, "joints", None):
-            from core.joint import apply_joints
+        bind_scene_blocks(self.blocks)
+        if any(getattr(b, "joints", None) for b in self.blocks):
+            from core.joint import apply_joints_in_blocks
 
-            apply_joints(self.block)
+            apply_joints_in_blocks(self.blocks)
 
     def undo(self) -> None:
+        from models.panel import bind_scene_blocks
+
         if self.panel in self.block.panels:
             self.block.panels.remove(self.panel)
-        if getattr(self.block, "joints", None):
-            from core.joint import apply_joints
-
-            apply_joints(self.block)
         if self._block_was_missing and self.block in self.blocks and not self.block.panels:
             self.blocks.remove(self.block)
+        bind_scene_blocks(self.blocks)
+        if any(getattr(b, "joints", None) for b in self.blocks):
+            from core.joint import apply_joints_in_blocks
+
+            apply_joints_in_blocks(self.blocks)
 
 
 class DeleteItemsCommand(Command):
@@ -183,71 +191,77 @@ class DeleteItemsCommand(Command):
         self.removed_blocks.clear()
         self.removed_panels.clear()
         self.removed_joints.clear()
+        removed_uids: set[str] = set()
         for i, b in enumerate(self.blocks):
-            if b.selected:
+            # Корневой контейнер свободных панелей не удаляется целиком — только выделенные панели в нём
+            if b.selected and not getattr(b, "is_root", False):
                 self.removed_blocks.append((i, b))
+                for p in getattr(b, "panels", []) or []:
+                    uid = str(getattr(p, "uid", "") or "")
+                    if uid:
+                        removed_uids.add(uid)
             else:
-                removed_uids: set[str] = set()
                 for j, p in enumerate(b.panels):
                     if p.selected:
                         self.removed_panels.append((b, j, p))
                         uid = str(getattr(p, "uid", "") or "")
                         if uid:
                             removed_uids.add(uid)
-                if removed_uids and getattr(b, "joints", None):
-                    for k, jr in enumerate(b.joints):
-                        if (
-                            str(getattr(jr, "panel_a_uid", "")) in removed_uids
-                            or str(getattr(jr, "panel_b_uid", "")) in removed_uids
-                        ):
-                            self.removed_joints.append((b, k, jr))
+        if removed_uids:
+            removed_block_objs = {b for _i, b in self.removed_blocks}
+            for b in self.blocks:
+                if b in removed_block_objs:
+                    continue
+                for k, jr in enumerate(getattr(b, "joints", None) or []):
+                    if (
+                        str(getattr(jr, "panel_a_uid", "")) in removed_uids
+                        or str(getattr(jr, "panel_b_uid", "")) in removed_uids
+                    ):
+                        self.removed_joints.append((b, k, jr))
         return bool(self.removed_blocks or self.removed_panels)
 
     def redo(self) -> None:
-        affected_blocks: list = []
+        from models.panel import bind_scene_blocks
+
+        had_joints = bool(self.removed_joints) or any(
+            getattr(b, "joints", None) for b in self.blocks
+        )
         for b, _k, jr in reversed(self.removed_joints):
             if jr in getattr(b, "joints", []):
                 b.joints.remove(jr)
-            if b not in affected_blocks:
-                affected_blocks.append(b)
         for b, _j, p in reversed(self.removed_panels):
             if p in b.panels:
                 b.panels.remove(p)
-            if b not in affected_blocks:
-                affected_blocks.append(b)
         for _i, b in reversed(self.removed_blocks):
             if b in self.blocks:
                 self.blocks.remove(b)
-        from core.joint import apply_joints
+        bind_scene_blocks(self.blocks)
+        if had_joints and self.blocks:
+            from core.joint import apply_joints_in_blocks
 
-        for b in affected_blocks:
-            if b in self.blocks:
-                apply_joints(b)
+            apply_joints_in_blocks(self.blocks)
 
     def undo(self) -> None:
+        from models.panel import bind_scene_blocks
+
         for i, b in sorted(self.removed_blocks, key=lambda t: t[0]):
             if b not in self.blocks:
                 self.blocks.insert(min(i, len(self.blocks)), b)
-        affected_blocks: list = []
         # restore panels in original order by index
         for b, j, p in sorted(self.removed_panels, key=lambda t: t[1]):
             p._block = b
             if p not in b.panels:
                 b.panels.insert(min(j, len(b.panels)), p)
-            if b not in affected_blocks:
-                affected_blocks.append(b)
         for b, k, jr in sorted(self.removed_joints, key=lambda t: t[1]):
             if not hasattr(b, "joints"):
                 b.joints = []
             if jr not in b.joints:
                 b.joints.insert(min(k, len(b.joints)), jr)
-            if b not in affected_blocks:
-                affected_blocks.append(b)
-        from core.joint import apply_joints
+        bind_scene_blocks(self.blocks)
+        if any(getattr(b, "joints", None) for b in self.blocks):
+            from core.joint import apply_joints_in_blocks
 
-        for b in affected_blocks:
-            if getattr(b, "joints", None):
-                apply_joints(b)
+            apply_joints_in_blocks(self.blocks)
 
 
 class MovePanelCommand(Command):
@@ -403,6 +417,18 @@ class EditPropertyCommand(Command):
         self._new_color = None
         # Словари удалённых при структурном rebuild() панелей (role -> dict) для восстановления при Undo (план §1.8)
         self._removed_panels_by_role: dict[str, dict] = {}
+        # Для переключения флага «Сборочная единица» сохраняем исходные позиции блока и панелей
+        self._old_block_pos_num: str = (
+            str(getattr(obj, "pos_num", "") or "") if attr_name == "is_assembly" else ""
+        )
+        self._old_panel_pos_nums: list[tuple[object, str]] = (
+            [
+                (p, str(getattr(p, "pos_num", "") or ""))
+                for p in (getattr(obj, "panels", None) or [])
+            ]
+            if attr_name == "is_assembly"
+            else []
+        )
         if attr_name == "material":
             self._resolve_material_side_effects(new_val)
 
@@ -495,6 +521,8 @@ class EditPropertyCommand(Command):
             if n < 0 or n > 50:
                 return None
             return n
+        if attr_name == "is_assembly":
+            return bool(value)
         return value
 
     def _apply_value(self, value) -> None:
@@ -575,6 +603,19 @@ class EditPropertyCommand(Command):
 
         # 1. Метаданные — только setattr, ничего больше
         if attr in self.METADATA_ATTRS:
+            return
+
+        # 1.5. Флаг «Сборочная единица» блока — управляет расстановкой позиций
+        if attr == "is_assembly":
+            if is_redo:
+                from models.panel import assign_block_positions
+
+                assign_block_positions(self.obj, getattr(self.obj, "_scene_blocks", None))
+            else:
+                if hasattr(self.obj, "pos_num"):
+                    self.obj.pos_num = self._old_block_pos_num
+                for p, old_pos in self._old_panel_pos_nums:
+                    p.pos_num = old_pos
             return
 
         # 2. Кромки — set_edge уже применён; геометрия панели (пильный размер) может
@@ -710,10 +751,16 @@ class ReplaceBlocksCommand(Command):
         self.new_blocks = list(new_blocks)
 
     def redo(self) -> None:
+        from models.panel import bind_scene_blocks
+
         self.blocks_ref[:] = list(self.new_blocks)
+        bind_scene_blocks(self.blocks_ref)
 
     def undo(self) -> None:
+        from models.panel import bind_scene_blocks
+
         self.blocks_ref[:] = list(self.old_blocks)
+        bind_scene_blocks(self.blocks_ref)
 
 
 class SetHolesCommand(Command):
@@ -1091,29 +1138,214 @@ class DeleteAssocRefCommand(Command):
 
 
 class PasteBlocksCommand(Command):
-    """Вставка клонированных блоков (Ctrl+V)."""
+    """Вставка клонированных блоков и свободных панелей (Ctrl+V).
+
+    Свободные панели (контейнеры с ``is_root=True``) вставляются напрямую в
+    корневой блок сцены без создания отдельного видимого блока «Копия».
+    Явные пользовательские блоки (``is_root=False``) добавляются как блоки.
+    """
 
     def __init__(self, blocks: list, new_blocks: list, description: str = "Вставка"):
         super().__init__(description)
         self.blocks = blocks
         self.new_blocks = list(new_blocks)
+        self._appended_blocks: list = []
+        self._merged_root_block = None
+        self._created_root_block: bool = False
+        self._merged_panels: list = []
+        self._merged_joints: list = []
+        self._merged_assocs: list = []
 
     def redo(self) -> None:
+        from models.panel import bind_scene_blocks, ensure_root_block
+
+        self._appended_blocks.clear()
+        self._merged_panels.clear()
+        self._merged_joints.clear()
+        self._merged_assocs.clear()
+        self._merged_root_block = None
+        self._created_root_block = False
+
         for b in self.new_blocks:
-            if b not in self.blocks:
-                self.blocks.append(b)
-            for p in getattr(b, "panels", []) or []:
-                p._block = b
-                p.selected = True
-            b.selected = True
+            if getattr(b, "is_root", False):
+                existing_root = next(
+                    (x for x in self.blocks if getattr(x, "is_root", False)),
+                    None,
+                )
+                if existing_root is None:
+                    root = ensure_root_block(self.blocks)
+                    self._created_root_block = True
+                else:
+                    root = existing_root
+                self._merged_root_block = root
+
+                for p in list(getattr(b, "panels", []) or []):
+                    p._block = root
+                    p.pos_num = ""
+                    p.selected = True
+                    if p not in root.panels:
+                        root.panels.append(p)
+                    self._merged_panels.append(p)
+                for jr in list(getattr(b, "joints", []) or []):
+                    if jr not in root.joints:
+                        root.joints.append(jr)
+                    self._merged_joints.append(jr)
+                for ar in list(getattr(b, "assoc_refs", []) or []):
+                    if ar not in root.assoc_refs:
+                        root.assoc_refs.append(ar)
+                    self._merged_assocs.append(ar)
+            else:
+                if b not in self.blocks:
+                    self.blocks.append(b)
+                self._appended_blocks.append(b)
+                for p in getattr(b, "panels", []) or []:
+                    p._block = b
+                    p.selected = True
+                b.selected = True
+
+        bind_scene_blocks(self.blocks)
+        if any(getattr(b, "joints", None) for b in self.blocks):
+            from core.joint import apply_joints_in_blocks
+
+            apply_joints_in_blocks(self.blocks)
+        elif any(getattr(b, "assoc_refs", None) for b in self.blocks):
+            from core.assoc import apply_assoc_refs_in_blocks
+
+            apply_assoc_refs_in_blocks(self.blocks)
 
     def undo(self) -> None:
-        for b in self.new_blocks:
+        from models.panel import bind_scene_blocks
+
+        for b in self._appended_blocks:
             if b in self.blocks:
                 self.blocks.remove(b)
             b.selected = False
             for p in getattr(b, "panels", []) or []:
                 p.selected = False
+
+        root = self._merged_root_block
+        if root is not None:
+            for p in self._merged_panels:
+                p.selected = False
+                if p in root.panels:
+                    root.panels.remove(p)
+            for jr in self._merged_joints:
+                if jr in getattr(root, "joints", []):
+                    root.joints.remove(jr)
+            for ar in self._merged_assocs:
+                if ar in getattr(root, "assoc_refs", []):
+                    root.assoc_refs.remove(ar)
+            if (
+                self._created_root_block
+                and root in self.blocks
+                and not root.panels
+                and not getattr(root, "joints", None)
+                and not getattr(root, "assoc_refs", None)
+            ):
+                self.blocks.remove(root)
+
+        bind_scene_blocks(self.blocks)
+
+
+class CreateBlockCommand(Command):
+    """Объединение выбранных панелей в новый пользовательский блок с Undo/Redo."""
+
+    def __init__(
+        self,
+        blocks: list,
+        panels: list,
+        name: str,
+        *,
+        is_assembly: bool = False,
+        description: str | None = None,
+    ):
+        clean_name = (name or "Новый блок").strip() or "Новый блок"
+        super().__init__(description or f"Создать блок: {clean_name}")
+        self.blocks = blocks
+        self.name = clean_name
+        self.is_assembly = bool(is_assembly)
+        self.new_block = None
+
+        # Фиксируем исходное положение каждой панели (блок, индекс, pos_num)
+        self._records: list[tuple[object, int, object, str]] = []
+        seen_ids: set[int] = set()
+        for p in panels or []:
+            if p is None or id(p) in seen_ids:
+                continue
+            owner = None
+            idx = -1
+            for b in self.blocks:
+                b_panels = getattr(b, "panels", []) or []
+                if p in b_panels:
+                    owner = b
+                    idx = b_panels.index(p)
+                    break
+            if owner is not None:
+                seen_ids.add(id(p))
+                self._records.append((owner, idx, p, str(getattr(p, "pos_num", "") or "")))
+
+    def redo(self) -> None:
+        from models.panel import Block, assign_block_positions, bind_scene_blocks
+
+        if not self._records:
+            return
+        if self.new_block is None:
+            self.new_block = Block(
+                self.name,
+                pos_num="",
+                code="",
+                is_assembly=self.is_assembly,
+                is_root=False,
+            )
+        else:
+            self.new_block.panels.clear()
+            self.new_block.is_assembly = self.is_assembly
+
+        for b in self.blocks:
+            b.selected = False
+            for existing in getattr(b, "panels", []) or []:
+                existing.selected = False
+
+        for owner, _idx, p, _old_pos in self._records:
+            if p in owner.panels:
+                owner.panels.remove(p)
+            p._block = self.new_block
+            p.selected = False
+            self.new_block.panels.append(p)
+
+        if self.new_block not in self.blocks:
+            self.blocks.append(self.new_block)
+
+        assign_block_positions(self.new_block, self.blocks)
+        self.new_block.selected = True
+        bind_scene_blocks(self.blocks)
+
+    def undo(self) -> None:
+        from models.panel import bind_scene_blocks
+
+        if self.new_block is None or not self._records:
+            return
+        self.new_block.selected = False
+        if self.new_block in self.blocks:
+            self.blocks.remove(self.new_block)
+        self.new_block.panels.clear()
+
+        for b in self.blocks:
+            b.selected = False
+            for existing in getattr(b, "panels", []) or []:
+                existing.selected = False
+
+        # Возвращаем панели в исходные блоки в порядке исходных индексов
+        for owner, idx, p, old_pos in sorted(self._records, key=lambda rec: rec[1]):
+            if owner not in self.blocks:
+                self.blocks.append(owner)
+            p._block = owner
+            p.pos_num = old_pos
+            p.selected = True
+            if p not in owner.panels:
+                owner.panels.insert(min(max(0, idx), len(owner.panels)), p)
+
+        bind_scene_blocks(self.blocks)
 
 
 class AddMultiplePanelsCommand(Command):
@@ -1127,6 +1359,8 @@ class AddMultiplePanelsCommand(Command):
         self._block_was_missing = False
 
     def redo(self) -> None:
+        from models.panel import bind_scene_blocks
+
         if self.block not in self.blocks:
             self.blocks.append(self.block)
             self._block_was_missing = True
@@ -1139,22 +1373,26 @@ class AddMultiplePanelsCommand(Command):
             if p not in self.block.panels:
                 self.block.panels.append(p)
             p.selected = True
-        if getattr(self.block, "joints", None):
-            from core.joint import apply_joints
+        bind_scene_blocks(self.blocks)
+        if any(getattr(b, "joints", None) for b in self.blocks):
+            from core.joint import apply_joints_in_blocks
 
-            apply_joints(self.block)
+            apply_joints_in_blocks(self.blocks)
 
     def undo(self) -> None:
+        from models.panel import bind_scene_blocks
+
         for p in self.panels:
             p.selected = False
             if p in self.block.panels:
                 self.block.panels.remove(p)
-        if getattr(self.block, "joints", None):
-            from core.joint import apply_joints
-
-            apply_joints(self.block)
         if self._block_was_missing and self.block in self.blocks and not self.block.panels:
             self.blocks.remove(self.block)
+        bind_scene_blocks(self.blocks)
+        if any(getattr(b, "joints", None) for b in self.blocks):
+            from core.joint import apply_joints_in_blocks
+
+            apply_joints_in_blocks(self.blocks)
 
 
 def _clone_product_state(state: dict) -> dict:

@@ -560,18 +560,20 @@ def check_collisions_in_blocks(blocks, min_volume: float = 0.1) -> list[Issue]:
 def check_broken_joints_in_blocks(blocks) -> list[Issue]:
     """Стыки, у которых панели пропали или больше не касаются (ревизия 3 §1.3).
 
-    ``apply_joints`` в этом случае молча не ставит присадку — без замечания
-    технолог видит «полку без крепежа» и не понимает причину.
+    Панели ищутся по всей сцене (включая межблочные стыки и корневой контейнер).
     """
     from core.joint import find_joint
 
+    scene_blocks = [b for b in (blocks or []) if b is not None]
+    by_uid = {
+        str(getattr(p, "uid", "") or ""): p
+        for blk in scene_blocks
+        for p in (getattr(blk, "panels", None) or [])
+        if str(getattr(p, "uid", "") or "")
+    }
+
     issues: list[Issue] = []
-    for b in blocks or []:
-        by_uid = {
-            str(getattr(p, "uid", "") or ""): p
-            for p in (getattr(b, "panels", None) or [])
-            if str(getattr(p, "uid", "") or "")
-        }
+    for b in scene_blocks:
         for jr in getattr(b, "joints", None) or []:
             a_uid = str(getattr(jr, "panel_a_uid", "") or "")
             b_uid = str(getattr(jr, "panel_b_uid", "") or "")
@@ -622,11 +624,12 @@ def check_broken_assocs_in_blocks(blocks) -> list[Issue]:
     """Ассоциативные ссылки с ошибками, дрейфом грани или выходом за габариты (face-attachments.md)."""
     from core.assoc import AssocRef, evaluate_assoc_ref
 
+    scene_blocks = [b for b in (blocks or []) if b is not None]
     issues: list[Issue] = []
-    for b in blocks or []:
+    for b in scene_blocks:
         for raw in getattr(b, "assoc_refs", None) or []:
             ref = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
-            st = evaluate_assoc_ref(b, ref)
+            st = evaluate_assoc_ref(b, ref, all_blocks=scene_blocks)
             if st.severity == "ok":
                 continue
             panel_uid = str(ref.target_uid or ref.source_uid or getattr(b, "uid", "") or "")

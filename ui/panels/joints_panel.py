@@ -259,24 +259,22 @@ except ImportError:  # Headless / тестовый режим без PyQt6
 from core.joint import FASTENER_PRESET_ORDER, JointRecord, get_fastener_preset
 
 
-class JointsDock(QDockWidget):
-    """Док-панель «Стыки»: список параметрических стыков, смена пресета, шага, отступов и удаление."""
+class JointsPanelWidget(QWidget):
+    """Встраиваемый виджет «Стыки»: список параметрических стыков, пресет, шаг, отступы и удаление."""
 
     joint_selected = pyqtSignal(object, str)  # (block, joint_uid)
     joint_modified = pyqtSignal(object, str, dict, dict)  # (block, joint_uid, old_state, new_state)
     joint_deleted = pyqtSignal(object, str)  # (block, joint_uid)
     add_joint_requested = pyqtSignal()
+    title_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
-        super().__init__("Стыки", parent)
-        self.setAllowedAreas(
-            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
-        )
+        super().__init__(parent)
         self.blocks_ref: list = []
         self._updating_ui = False
+        self._title: str = "Стыки"
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
@@ -336,7 +334,13 @@ class JointsDock(QDockWidget):
 
         layout.addWidget(form_widget)
         self._set_controls_enabled(False)
-        self.setWidget(container)
+
+    def panel_title(self) -> str:
+        return self._title
+
+    def _set_panel_title(self, title: str) -> None:
+        self._title = str(title)
+        self.title_changed.emit(self._title)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.preset_combo.setEnabled(enabled)
@@ -346,11 +350,21 @@ class JointsDock(QDockWidget):
         self.btn_delete.setEnabled(enabled)
 
     @staticmethod
-    def _format_joint_item(block, jr: JointRecord) -> str:
-        by_uid = {
-            str(getattr(p, "uid", "")): getattr(p, "name", "Панель")
-            for p in getattr(block, "panels", []) or []
-        }
+    def _format_joint_item(
+        block,
+        jr: JointRecord,
+        all_panels_by_uid: dict[str, Any] | None = None,
+    ) -> str:
+        if all_panels_by_uid is not None:
+            by_uid = {
+                uid: getattr(p, "name", "Панель")
+                for uid, p in all_panels_by_uid.items()
+            }
+        else:
+            by_uid = {
+                str(getattr(p, "uid", "")): getattr(p, "name", "Панель")
+                for p in getattr(block, "panels", []) or []
+            }
         name_a = by_uid.get(jr.panel_a_uid, jr.panel_a_uid[:8])
         name_b = by_uid.get(jr.panel_b_uid, jr.panel_b_uid[:8])
         preset = get_fastener_preset(jr.preset_id)
@@ -369,29 +383,33 @@ class JointsDock(QDockWidget):
         prev_block, prev_uid = self.current_joint_ref()
         self.blocks_ref = list(blocks or [])
 
+        # Единый словарь панелей по всей сцене — стыки между разными блоками работают без ложных ошибок
+        all_by_uid: dict[str, Any] = {}
+        for b in self.blocks_ref:
+            for p in getattr(b, "panels", []) or []:
+                puid = str(getattr(p, "uid", "") or "")
+                if puid:
+                    all_by_uid[puid] = p
+
         self._updating_ui = True
         try:
             self.list_widget.clear()
             total = 0
             selected_row = -1
             for b in self.blocks_ref:
-                by_uid = {
-                    str(getattr(p, "uid", "") or ""): p
-                    for p in getattr(b, "panels", []) or []
-                    if str(getattr(p, "uid", "") or "")
-                }
                 for jr in getattr(b, "joints", None) or []:
                     rec = jr if isinstance(jr, JointRecord) else JointRecord.from_dict(jr)
-                    txt = self._format_joint_item(b, rec)
+                    txt = self._format_joint_item(b, rec, all_panels_by_uid=all_by_uid)
                     broken = False
-                    pa = by_uid.get(str(rec.panel_a_uid or ""))
-                    pb = by_uid.get(str(rec.panel_b_uid or ""))
+                    pa = all_by_uid.get(str(rec.panel_a_uid or ""))
+                    pb = all_by_uid.get(str(rec.panel_b_uid or ""))
                     if pa is None or pb is None:
                         broken = True
                         txt = "⚠ " + txt + " [нет детали]"
                     else:
                         try:
                             from core.joint import find_joint
+
                             if find_joint(pa, pb) is None and find_joint(pa, pb, tol=3.0) is None:
                                 broken = True
                                 txt = "⚠ " + txt + " [не касаются]"
@@ -403,8 +421,10 @@ class JointsDock(QDockWidget):
                     item.setData(Qt.ItemDataRole.UserRole, (b, rec.uid))
                     if broken:
                         try:
-                            from PyQt6.QtGui import QColor, QBrush
-                            item.setForeground(QBrush(QColor(200, 40, 40)))
+                            from PyQt6.QtGui import QBrush, QColor
+                            from ui.theme import current_theme
+
+                            item.setForeground(QBrush(QColor(current_theme().error)))
                         except Exception as exc:
                             # headless / без QtGui — текст уже с ⚠
                             _ = exc
@@ -414,13 +434,13 @@ class JointsDock(QDockWidget):
                     total += 1
 
             if total > 0:
-                self.setWindowTitle(f"Стыки ({total})")
+                self._set_panel_title(f"Стыки ({total})")
                 if selected_row >= 0:
                     self.list_widget.setCurrentRow(selected_row)
                 elif self.list_widget.count() > 0:
                     self.list_widget.setCurrentRow(0)
             else:
-                self.setWindowTitle("Стыки")
+                self._set_panel_title("Стыки")
                 self._set_controls_enabled(False)
         finally:
             self._updating_ui = False
@@ -558,3 +578,68 @@ class JointsDock(QDockWidget):
         self.joint_deleted.emit(block, juid)
         self.load_joints(self.blocks_ref)
         return True
+
+
+class JointsDock(QDockWidget):
+    """Совместимая обёртка QDockWidget вокруг `JointsPanelWidget`."""
+
+    joint_selected = pyqtSignal(object, str)  # (block, joint_uid)
+    joint_modified = pyqtSignal(object, str, dict, dict)  # (block, joint_uid, old_state, new_state)
+    joint_deleted = pyqtSignal(object, str)  # (block, joint_uid)
+    add_joint_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__("Стыки", parent)
+        self.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.panel = JointsPanelWidget(self)
+        self.setWidget(self.panel)
+
+        # Пробрасываем ссылки на контролы для обратной совместимости
+        self.btn_add = self.panel.btn_add
+        self.btn_delete = self.panel.btn_delete
+        self.list_widget = self.panel.list_widget
+        self.preset_combo = self.panel.preset_combo
+        self.pitch_spin = self.panel.pitch_spin
+        self.margin_spin = self.panel.margin_spin
+        self.count_spin = self.panel.count_spin
+
+        self.panel.joint_selected.connect(self.joint_selected.emit)
+        self.panel.joint_modified.connect(self.joint_modified.emit)
+        self.panel.joint_deleted.connect(self.joint_deleted.emit)
+        self.panel.add_joint_requested.connect(self.add_joint_requested.emit)
+        self.panel.title_changed.connect(self.setWindowTitle)
+
+    @property
+    def blocks_ref(self) -> list:
+        return self.panel.blocks_ref
+
+    @blocks_ref.setter
+    def blocks_ref(self, value: list) -> None:
+        self.panel.blocks_ref = value
+
+    def load_joints(self, blocks: list) -> None:
+        self.panel.load_joints(blocks)
+
+    def current_joint_ref(self) -> tuple[object | None, str]:
+        return self.panel.current_joint_ref()
+
+    def select_joint_by_uid(self, joint_uid: str) -> bool:
+        return self.panel.select_joint_by_uid(joint_uid)
+
+    def change_selected_preset(self, preset_id: str) -> bool:
+        return self.panel.change_selected_preset(preset_id)
+
+    def change_selected_params(
+        self,
+        *,
+        pitch: float | None = -1.0,
+        margin: float | None = None,
+        count: int | None = None,
+    ) -> bool:
+        return self.panel.change_selected_params(pitch=pitch, margin=margin, count=count)
+
+    def delete_selected_joint(self) -> bool:
+        return self.panel.delete_selected_joint()
+

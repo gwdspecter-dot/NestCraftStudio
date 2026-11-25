@@ -275,6 +275,26 @@ def _migrate_to_0_0_11(data: dict) -> dict:
     return data
 
 
+def _migrate_to_0_0_12(data: dict) -> dict:
+    """v0.0.11 -> v0.0.12: флаги блока `is_assembly` (сборочная единица) и `is_root` (корневой контейнер).
+
+    Для старых проектов существующие блоки сохраняют прежнее поведение:
+    `is_assembly=True`, `is_root=False`.
+    """
+    for bd in data.get("blocks") or []:
+        if not isinstance(bd, dict):
+            continue
+        if "is_assembly" not in bd:
+            bd["is_assembly"] = True
+        else:
+            bd["is_assembly"] = bool(bd["is_assembly"])
+        if "is_root" not in bd:
+            bd["is_root"] = False
+        else:
+            bd["is_root"] = bool(bd["is_root"])
+    return data
+
+
 MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.1", "0.0.2", _migrate_to_0_0_2),
     ("0.0.2", "0.0.3", _migrate_to_0_0_3),
@@ -286,6 +306,7 @@ MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.8", "0.0.9", _migrate_to_0_0_9),
     ("0.0.9", "0.0.10", _migrate_to_0_0_10),
     ("0.0.10", "0.0.11", _migrate_to_0_0_11),
+    ("0.0.11", "0.0.12", _migrate_to_0_0_12),
 ]
 
 
@@ -384,6 +405,8 @@ def _block_to_dict(b: Block) -> dict:
         "name": b.name,
         "pos_num": b.pos_num,
         "code": b.code,
+        "is_assembly": bool(getattr(b, "is_assembly", True)),
+        "is_root": bool(getattr(b, "is_root", False)),
         "panels": [_panel_to_dict(p) for p in b.panels],
         "joints": [
             jr.to_dict() if hasattr(jr, "to_dict") else dict(jr)
@@ -411,12 +434,14 @@ def _block_to_dict(b: Block) -> dict:
     return data
 
 
-def _block_from_dict(d: dict) -> Block:
+def _block_from_dict(d: dict, *, apply_relations: bool = True) -> Block:
     from core.assoc import AssocRef, apply_assoc_refs
     from core.joint import JointRecord, apply_joints
 
     btype = d.get("type", "block")
     panels_data = d.get("panels", [])
+    is_assembly = bool(d.get("is_assembly", True))
+    is_root = bool(d.get("is_root", False))
     raw_joints = d.get("joints") or []
     joints = [
         jr if isinstance(jr, JointRecord) else JointRecord.from_dict(jr)
@@ -450,6 +475,7 @@ def _block_from_dict(d: dict) -> Block:
             uid=str(d.get("uid") or ""),
             joints=joints,
             rebuild_on_init=not bool(panels_data),
+            is_assembly=is_assembly,
         )
         cab.assoc_refs = assoc_refs
         # Восстанавливаем сохраненные панели из файла (с пазами/присадкой), если они есть
@@ -457,10 +483,11 @@ def _block_from_dict(d: dict) -> Block:
             cab.panels = [_panel_from_dict(pd) for pd in panels_data]
             for p in cab.panels:
                 p._block = cab
-            if cab.joints:
-                apply_joints(cab)
-            if cab.assoc_refs:
-                apply_assoc_refs(cab)
+            if apply_relations:
+                if cab.joints:
+                    apply_joints(cab)
+                if cab.assoc_refs:
+                    apply_assoc_refs(cab)
         return cab
 
     block = Block(
@@ -470,14 +497,17 @@ def _block_from_dict(d: dict) -> Block:
         uid=str(d.get("uid") or ""),
         joints=joints,
         assoc_refs=assoc_refs,
+        is_assembly=is_assembly,
+        is_root=is_root,
     )
     block.panels = [_panel_from_dict(pd) for pd in panels_data]
     for p in block.panels:
         p._block = block
-    if block.joints:
-        apply_joints(block)
-    if block.assoc_refs:
-        apply_assoc_refs(block)
+    if apply_relations:
+        if block.joints:
+            apply_joints(block)
+        if block.assoc_refs:
+            apply_assoc_refs(block)
     return block
 
 
@@ -510,11 +540,20 @@ def scene_to_dict(
 
 
 def scene_from_dict(data: dict) -> tuple[str, list]:
+    from core.assoc import apply_assoc_refs_in_blocks
+    from core.joint import apply_joints_in_blocks
+    from models.panel import bind_scene_blocks
+
     if not isinstance(data, dict):
         raise ValueError("Некорректный файл проекта")
     migrated, _steps = migrate_project_dict(data, in_place=False)
     name = migrated.get("name", "project")
-    blocks = [_block_from_dict(bd) for bd in migrated.get("blocks", [])]
+    blocks = [_block_from_dict(bd, apply_relations=False) for bd in migrated.get("blocks", [])]
+    bind_scene_blocks(blocks)
+    if any(getattr(b, "joints", None) for b in blocks):
+        apply_joints_in_blocks(blocks)
+    elif any(getattr(b, "assoc_refs", None) for b in blocks):
+        apply_assoc_refs_in_blocks(blocks)
     return name, blocks
 
 
@@ -724,13 +763,23 @@ def materialize_project_snapshot(
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> ProjectLoadResult:
     """Создаёт объекты `Block` и `Panel` из `ProjectDataSnapshot` и собирает предупреждения каталога."""
+    from core.assoc import apply_assoc_refs_in_blocks
+    from core.joint import apply_joints_in_blocks
+    from models.panel import bind_scene_blocks
+
     raw_blocks = snapshot.migrated_dict.get("blocks", []) or []
     total_blocks = len(raw_blocks)
     blocks: list = []
     for idx, bd in enumerate(raw_blocks, start=1):
-        blocks.append(_block_from_dict(bd))
+        blocks.append(_block_from_dict(bd, apply_relations=False))
         if progress_cb is not None:
             progress_cb(idx, max(1, total_blocks), f"Построение блоков: {idx}/{total_blocks}…")
+
+    bind_scene_blocks(blocks)
+    if any(getattr(b, "joints", None) for b in blocks):
+        apply_joints_in_blocks(blocks)
+    elif any(getattr(b, "assoc_refs", None) for b in blocks):
+        apply_assoc_refs_in_blocks(blocks)
 
     warnings = list(snapshot.warnings)
     missing_mats = collect_missing_materials(blocks)

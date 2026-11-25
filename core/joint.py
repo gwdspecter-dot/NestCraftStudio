@@ -1202,32 +1202,59 @@ def compute_joint_record_points(joint: Joint, record: JointRecord) -> list[np.nd
     )
 
 
-def apply_joints(block, *, rebuild_geometry: bool = True) -> list:
-    """Пересчитывает присадку из записей `block.joints` после любого изменения габаритов или `rebuild()` (п. 3.1).
+def _resolve_joint_scene_blocks(block, all_blocks=None) -> list:
+    """Возвращает список блоков сцены для межоперационного разрешения панелей стыков."""
+    if isinstance(all_blocks, (list, tuple)) and all_blocks:
+        seq = [b for b in all_blocks if b is not None]
+        if block is not None and block not in seq:
+            seq.append(block)
+        return seq
+    scene_blocks = getattr(block, "_scene_blocks", None) if block is not None else None
+    if isinstance(scene_blocks, list) and scene_blocks and (block is None or block in scene_blocks):
+        return [b for b in scene_blocks if b is not None]
+    return [block] if block is not None else []
 
-    - Отверстия, поставленные вручную (без записи `JointRecord`), сохраняются без изменений.
-    - При удалении записи из `block.joints` её отверстия автоматически снимаются с обеих деталей.
-    - Возвращает список замечаний `Issue`, возникших при проверке правил крепежа.
+
+def apply_joints_in_blocks(blocks, *, rebuild_geometry: bool = True) -> list:
+    """Пересчитывает параметрические стыки по всем блокам сцены (включая межблочные).
+
+    Снимает старые стыковые отверстия, сохраняя ручные и ассоциативные (``a:...``),
+    затем применяет все ``JointRecord`` из каждого блока по единому индексу ``panel.uid``.
     """
-    if block is None:
+    scene_blocks = [b for b in (blocks or []) if b is not None]
+    if not scene_blocks:
         return []
 
-    panels = list(getattr(block, "panels", []) or [])
-    raw_joints = list(getattr(block, "joints", []) or [])
-    norm_joints: list[JointRecord] = []
-    for item in raw_joints:
-        if isinstance(item, JointRecord):
-            norm_joints.append(item)
-        elif isinstance(item, dict):
-            norm_joints.append(JointRecord.from_dict(item))
-    block.joints = norm_joints
+    panels: list = []
+    seen_panel_ids: set[int] = set()
+    all_joints: list[JointRecord] = []
+    has_assocs = False
+
+    for blk in scene_blocks:
+        raw_joints = list(getattr(blk, "joints", []) or [])
+        norm_joints: list[JointRecord] = []
+        for item in raw_joints:
+            if isinstance(item, JointRecord):
+                norm_joints.append(item)
+            elif isinstance(item, dict):
+                norm_joints.append(JointRecord.from_dict(item))
+        blk.joints = norm_joints
+        all_joints.extend(norm_joints)
+        if getattr(blk, "assoc_refs", None):
+            has_assocs = True
+
+        for p in list(getattr(blk, "panels", []) or []):
+            if id(p) in seen_panel_ids:
+                continue
+            seen_panel_ids.add(id(p))
+            try:
+                p._block = blk
+            except Exception as exc:  # noqa: BLE001 — optional back-ref
+                _log.debug("Could not bind _block on panel: %s", exc)
+            panels.append(p)
 
     old_holes_by_id: dict[int, list[tuple]] = {}
     for p in panels:
-        try:
-            p._block = block
-        except Exception as exc:  # noqa: BLE001 — optional back-ref
-            _log.debug("Could not bind _block on panel: %s", exc)
         old_holes_by_id[id(p)] = [hole_geometry(h) for h in (getattr(p, "holes", []) or []) if len(h) >= 6]
         manual = extract_manual_holes(p)
         # Сохраняем ассоциативные отверстия (a:<uid>) — ими управляет apply_assoc_refs
@@ -1247,7 +1274,7 @@ def apply_joints(block, *, rebuild_geometry: bool = True) -> list:
     }
 
     all_issues: list = []
-    for jr in norm_joints:
+    for jr in all_joints:
         pa = by_uid.get(jr.panel_a_uid)
         pb = by_uid.get(jr.panel_b_uid)
         if pa is None or pb is None or pa is pb:
@@ -1318,13 +1345,95 @@ def apply_joints(block, *, rebuild_geometry: bool = True) -> list:
                     p.rebuild_geometry()
 
     # Ассоциативные отверстия пересчитываются после стыков (общая точка входа после rebuild).
-    if getattr(block, "assoc_refs", None):
+    if has_assocs:
         try:
-            from core.assoc import apply_assoc_refs
+            from core.assoc import apply_assoc_refs_in_blocks
 
-            apply_assoc_refs(block, rebuild_geometry=rebuild_geometry)
-        except Exception as exc:  # noqa: BLE001 — не ломаем стыки из‑за assoc
-            _log.exception("apply_assoc_refs after joints failed: %s", exc)
+            apply_assoc_refs_in_blocks(scene_blocks, rebuild_geometry=rebuild_geometry)
+        except Exception as exc:  # noqa: BLE001 — не ломаем стыки из-за assoc
+            _log.exception("apply_assoc_refs_in_blocks after joints failed: %s", exc)
 
     return all_issues
+
+
+def apply_joints(block, *, rebuild_geometry: bool = True, all_blocks=None) -> list:
+    """Пересчитывает параметрические стыки блока (или всей сцены, если блок привязан к сцене)."""
+    if block is None and not all_blocks:
+        return []
+    scene_blocks = _resolve_joint_scene_blocks(block, all_blocks=all_blocks)
+    return apply_joints_in_blocks(scene_blocks, rebuild_geometry=rebuild_geometry)
+
+
+def _fastener_display_name(jr: JointRecord) -> str:
+    """Человекочитаемое название одиночной фурнитуры для элемента стыка в структуре модели."""
+    params = jr.params if isinstance(jr.params, dict) else {}
+    custom_name = str(params.get("custom_name") or "").strip()
+    if custom_name:
+        return custom_name
+    preset = get_fastener_preset(jr.preset_id) if jr.preset_id else {}
+    fid = str(jr.fastener_id or preset.get("fastener_id") or "").lower()
+    if "minifix" in fid or "eccentric" in fid:
+        return "Эксцентрик (Minifix)"
+    if "dowel" in fid or str(jr.preset_id or "").startswith("dowel"):
+        return "Шкант"
+    if "confirmat" in fid or str(jr.preset_id or "").startswith("confirmat"):
+        return "Конфирмат"
+    if "screw" in fid:
+        return "Саморез"
+    label = str(preset.get("label") or "").strip()
+    if label:
+        return label.split("·")[0].split("(")[0].strip() or "Фурнитура"
+    return "Фурнитура"
+
+
+def get_joint_fastener_items(jr: JointRecord, blocks) -> list[dict]:
+    """Возвращает список одиночной фурнитуры, входящей в стык ``jr`` (без номеров позиций)."""
+    by_uid: dict[str, Any] = {}
+    for blk in blocks or []:
+        for p in getattr(blk, "panels", None) or []:
+            uid = str(getattr(p, "uid", "") or "")
+            if uid:
+                by_uid[uid] = p
+
+    pa = by_uid.get(str(jr.panel_a_uid or ""))
+    pb = by_uid.get(str(jr.panel_b_uid or ""))
+    base_name = _fastener_display_name(jr)
+    preset = get_fastener_preset(jr.preset_id) if jr.preset_id else {}
+    params = jr.params if isinstance(jr.params, dict) else {}
+    fastener_id = str(jr.fastener_id or preset.get("fastener_id") or "")
+
+    pts: list = []
+    if pa is not None and pb is not None and pa is not pb:
+        joint = find_joint(pa, pb)
+        if joint is None:
+            joint = find_joint(pa, pb, tol=3.0)
+        if joint is not None:
+            pts = compute_joint_record_points(joint, jr)
+
+    if pts:
+        return [
+            {
+                "index": idx,
+                "name": f"{base_name} #{idx}",
+                "fastener_id": fastener_id,
+                "point": (float(pt[0]), float(pt[1]), float(pt[2])),
+            }
+            for idx, pt in enumerate(pts, start=1)
+        ]
+
+    # Фолбэк, если панели разошлись или стык временно не найден
+    fallback_count = int(params.get("count") or preset.get("count") or 0)
+    if fallback_count <= 0 and pa is not None:
+        fallback_count = len((getattr(pa, "joint_hole_map", None) or {}).get(jr.uid, []))
+    fallback_count = max(0, fallback_count)
+    return [
+        {
+            "index": idx,
+            "name": f"{base_name} #{idx}",
+            "fastener_id": fastener_id,
+            "point": None,
+        }
+        for idx in range(1, fallback_count + 1)
+    ]
+
 

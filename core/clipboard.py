@@ -30,6 +30,8 @@ def _selected_blocks_and_panels(blocks: list) -> tuple[list, list[Panel], set[in
     whole_blocks: list = []
     panels_in_whole: set[int] = set()
     for b in blocks or []:
+        if bool(getattr(b, "is_root", False)):
+            continue
         if getattr(b, "selected", False):
             whole_blocks.append(b)
             for p in getattr(b, "panels", []) or []:
@@ -244,6 +246,7 @@ def _clone_block_dict(bd: dict, dx: float, dy: float, dz: float) -> Block:
             uid=new_block_uid,
             joints=[],
             rebuild_on_init=False,
+            is_assembly=bool(bd.get("is_assembly", True)),
         )
         # Заменяем панели на клоны (не пересобирать parametric — сохранить user geometry)
         cab.panels = panels
@@ -257,6 +260,8 @@ def _clone_block_dict(bd: dict, dx: float, dy: float, dz: float) -> Block:
             code=str(bd.get("code") or ""),
             uid=new_block_uid,
             joints=[],
+            is_assembly=bool(bd.get("is_assembly", True)),
+            is_root=False,
         )
         for p in panels:
             block.add_panel(p)
@@ -329,7 +334,13 @@ def materialize(
             )
             for pd in payload.free_panel_dicts
         ]
-        block = Block("Копия", uid=new_uid(), joints=[])
+        block = Block(
+            "Копия",
+            uid=new_uid(),
+            joints=[],
+            is_assembly=False,
+            is_root=True,
+        )
         for p in panels:
             block.add_panel(p)
         from core.joint import JointRecord, apply_joints

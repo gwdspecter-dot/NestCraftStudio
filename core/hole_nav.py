@@ -354,49 +354,80 @@ def pick_hole_at_ray(
     return best_hit
 
 
+def _nav_scene_blocks(block: Any, blocks: list[Any] | None = None) -> list[Any]:
+    if isinstance(blocks, (list, tuple)) and blocks:
+        seq = [b for b in blocks if b is not None]
+        if block is not None and block not in seq:
+            seq.append(block)
+        return seq
+    sb = getattr(block, "_scene_blocks", None) if block is not None else None
+    if isinstance(sb, list) and sb and (block is None or block in sb):
+        return [b for b in sb if b is not None]
+    return [block] if block is not None else []
+
+
 def collect_owner_holes(
     block: Any,
     kind: str,
     owner_uid: str,
+    *,
+    blocks: list[Any] | None = None,
 ) -> list[tuple[Any, tuple]]:
-    """Возвращает все пары ``(panel, hole)`` блока, принадлежащие стыку или ассоциации ``owner_uid``."""
+    """Возвращает все пары ``(panel, hole)`` блока/сцены, принадлежащие стыку или ассоциации ``owner_uid``."""
     uid = str(owner_uid or "").strip()
-    if block is None or not uid or kind not in ("joint", "assoc"):
+    if (block is None and not blocks) or not uid or kind not in ("joint", "assoc"):
         return []
     out: list[tuple[Any, tuple]] = []
-    for panel in getattr(block, "panels", None) or []:
-        if not getattr(panel, "visible", True):
-            continue
-        for hole in getattr(panel, "holes", None) or []:
-            if hole is None or len(hole) < 6:
+    seen_panels: set[int] = set()
+    for blk in _nav_scene_blocks(block, blocks):
+        for panel in getattr(blk, "panels", None) or []:
+            if id(panel) in seen_panels:
                 continue
-            h_kind, h_uid = classify_hole_owner(hole)
-            if h_kind == kind and h_uid == uid:
-                out.append((panel, tuple(hole)))
+            seen_panels.add(id(panel))
+            if not getattr(panel, "visible", True):
+                continue
+            for hole in getattr(panel, "holes", None) or []:
+                if hole is None or len(hole) < 6:
+                    continue
+                h_kind, h_uid = classify_hole_owner(hole)
+                if h_kind == kind and h_uid == uid:
+                    out.append((panel, tuple(hole)))
     return out
 
 
-def _find_joint_record(block: Any, joint_uid: str) -> JointRecord | None:
-    if block is None or not joint_uid:
+def _find_joint_record(
+    block: Any,
+    joint_uid: str,
+    *,
+    blocks: list[Any] | None = None,
+) -> JointRecord | None:
+    if (block is None and not blocks) or not joint_uid:
         return None
-    if hasattr(block, "get_joint_by_uid"):
-        rec = block.get_joint_by_uid(joint_uid)
-        if rec is not None:
-            return rec
-    for raw in getattr(block, "joints", None) or []:
-        jr = raw if isinstance(raw, JointRecord) else JointRecord.from_dict(raw)
-        if str(getattr(jr, "uid", "")) == joint_uid:
-            return jr
+    for blk in _nav_scene_blocks(block, blocks):
+        if hasattr(blk, "get_joint_by_uid"):
+            rec = blk.get_joint_by_uid(joint_uid)
+            if rec is not None:
+                return rec
+        for raw in getattr(blk, "joints", None) or []:
+            jr = raw if isinstance(raw, JointRecord) else JointRecord.from_dict(raw)
+            if str(getattr(jr, "uid", "")) == joint_uid:
+                return jr
     return None
 
 
-def _find_assoc_record(block: Any, assoc_uid: str) -> AssocRef | None:
-    if block is None or not assoc_uid:
+def _find_assoc_record(
+    block: Any,
+    assoc_uid: str,
+    *,
+    blocks: list[Any] | None = None,
+) -> AssocRef | None:
+    if (block is None and not blocks) or not assoc_uid:
         return None
-    for raw in getattr(block, "assoc_refs", None) or []:
-        ref = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
-        if str(getattr(ref, "uid", "")) == assoc_uid:
-            return ref
+    for blk in _nav_scene_blocks(block, blocks):
+        for raw in getattr(blk, "assoc_refs", None) or []:
+            ref = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
+            if str(getattr(ref, "uid", "")) == assoc_uid:
+                return ref
     return None
 
 
@@ -405,6 +436,7 @@ def describe_hole_hit(
     *,
     include_hint: bool = False,
     compact: bool = True,
+    blocks: list[Any] | None = None,
 ) -> str:
     """Краткая подпись отверстия под курсором (без эмодзи)."""
     hole = hit.hole
@@ -412,13 +444,15 @@ def describe_hole_hit(
     depth = float(hole[4]) if len(hole) > 4 else 0.0
     dim_str = f"Ø{dia:g}×{depth:g}"
     panel_name = str(getattr(hit.panel, "name", "Панель"))
+    scene_blocks = _nav_scene_blocks(hit.block, blocks)
     by_uid = {
         str(getattr(p, "uid", "")): str(getattr(p, "name", "Панель"))
-        for p in (getattr(hit.block, "panels", None) or [])
+        for blk in scene_blocks
+        for p in (getattr(blk, "panels", None) or [])
     }
 
     if hit.kind == "joint":
-        rec = _find_joint_record(hit.block, hit.owner_uid)
+        rec = _find_joint_record(hit.block, hit.owner_uid, blocks=scene_blocks)
         if rec is not None:
             pa = by_uid.get(str(rec.panel_a_uid), "?")
             pb = by_uid.get(str(rec.panel_b_uid), "?")
@@ -436,9 +470,9 @@ def describe_hole_hit(
         return base + ("  [ЛКМ×2 / ПКМ]" if include_hint else "")
 
     if hit.kind == "assoc":
-        ref = _find_assoc_record(hit.block, hit.owner_uid)
+        ref = _find_assoc_record(hit.block, hit.owner_uid, blocks=scene_blocks)
         if ref is not None:
-            st = evaluate_assoc_ref(hit.block, ref)
+            st = evaluate_assoc_ref(hit.block, ref, all_blocks=scene_blocks)
             tgt = by_uid.get(str(ref.target_uid), panel_name)
             src = by_uid.get(str(ref.source_uid), (ref.source_uid or "?")[:8])
             if ref.fixed:
@@ -463,4 +497,5 @@ def describe_hole_hit(
 
     base = f"Отверстие · {dim_str}" if compact else f"Отверстие ({panel_name}): {dim_str}"
     return base + ("  [ЛКМ×2 / ПКМ]" if include_hint else "")
+
 

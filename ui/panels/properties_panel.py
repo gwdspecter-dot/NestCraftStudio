@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (
     QDockWidget,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -12,7 +13,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from core.logging_setup import get_logger
-from models.panel import Panel, ParametricCabinet
+from models.panel import Block, Panel, ParametricCabinet
+from ui.panels.assoc_panel import AssocPanelWidget
+from ui.panels.joints_panel import JointsPanelWidget
 
 _log = get_logger("properties_ui")
 
@@ -33,19 +36,70 @@ class PropertiesDock(QDockWidget):
         self.current_obj = None
         self._updating = False
 
+        self._stack = QStackedWidget(self)
+
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Параметр", "Значение"])
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.itemChanged.connect(self._on_item_changed)
 
-        self.setWidget(self.table)
+        self.joints_panel = JointsPanelWidget(self)
+        self.assoc_panel = AssocPanelWidget(self)
+        self.joints_panel.title_changed.connect(self._on_embedded_title_changed)
+        self.assoc_panel.title_changed.connect(self._on_embedded_title_changed)
+
+        self._stack.addWidget(self.table)
+        self._stack.addWidget(self.joints_panel)
+        self._stack.addWidget(self.assoc_panel)
+
+        self.setWidget(self._stack)
         self.show_object_properties(None)
+
+    def active_mode(self) -> str:
+        """Текущий режим панели свойств: ``properties`` | ``joints`` | ``assoc``."""
+        cur = self._stack.currentWidget()
+        if cur is self.joints_panel:
+            return "joints"
+        if cur is self.assoc_panel:
+            return "assoc"
+        return "properties"
+
+    def refresh_theme(self) -> None:
+        if hasattr(self.assoc_panel, "refresh_theme"):
+            self.assoc_panel.refresh_theme()
+
+    def _on_embedded_title_changed(self, title: str) -> None:
+        cur = self._stack.currentWidget()
+        if cur is self.joints_panel and title.startswith("Стыки"):
+            self.setWindowTitle(f"Свойства — {title}")
+        elif cur is self.assoc_panel and title.startswith("Ассоциации"):
+            self.setWindowTitle(f"Свойства — {title}")
+
+    def show_joints_panel(self, blocks: list, joint_uid: str = "") -> None:
+        """Переключает док-панель «Свойства» в режим редактирования стыков."""
+        self.current_obj = None
+        self.joints_panel.load_joints(blocks)
+        if joint_uid:
+            self.joints_panel.select_joint_by_uid(joint_uid)
+        self._stack.setCurrentWidget(self.joints_panel)
+        self.setWindowTitle(f"Свойства — {self.joints_panel.panel_title()}")
+
+    def show_assoc_panel(self, blocks: list, assoc_uid: str = "") -> None:
+        """Переключает док-панель «Свойства» в режим редактирования ассоциаций."""
+        self.current_obj = None
+        self.assoc_panel.load_assocs(blocks)
+        if assoc_uid:
+            self.assoc_panel.select_assoc_by_uid(assoc_uid)
+        self._stack.setCurrentWidget(self.assoc_panel)
+        self.setWindowTitle(f"Свойства — {self.assoc_panel.panel_title()}")
 
     # ── public API ────────────────────────────────────────────
 
     def show_object_properties(self, obj):
         self._updating = True
+        self._stack.setCurrentWidget(self.table)
+        self.setWindowTitle("Свойства")
         self.current_obj = obj
         self.table.setRowCount(0)
         # Убираем старые виджеты-редакторы (combo и т.п.)
@@ -64,7 +118,35 @@ class PropertiesDock(QDockWidget):
                 ("Позиция Y, мм", str(int(obj.y)), "y"),
                 ("Позиция Z, мм", str(int(obj.z)), "z"),
             ]
-            self._fill_text_props(props)
+            self.table.setRowCount(len(props) + 1)
+            for row, (label, val, attr) in enumerate(props):
+                self._set_label_cell(row, label, attr)
+                self._set_value_cell(row, val, editable=(attr is not None))
+            asm_row = len(props)
+            self._set_label_cell(asm_row, "Сборочная единица", "is_assembly")
+            self.table.setCellWidget(asm_row, 1, self._make_bool_combo(obj, "is_assembly"))
+
+        elif isinstance(obj, Block) and not getattr(obj, "is_root", False):
+            is_asm = bool(getattr(obj, "is_assembly", True))
+            self.table.setRowCount(5)
+            self._set_label_cell(0, "Наименование блока", "name")
+            self._set_value_cell(0, obj.name, editable=True)
+
+            self._set_label_cell(1, "Сборочная единица", "is_assembly")
+            self.table.setCellWidget(1, 1, self._make_bool_combo(obj, "is_assembly"))
+
+            self._set_label_cell(2, "Позиция", "pos_num" if is_asm else None)
+            self._set_value_cell(
+                2,
+                obj.pos_num if is_asm else "— (не сборочная)",
+                editable=is_asm,
+            )
+
+            self._set_label_cell(3, "Обозначение", "code")
+            self._set_value_cell(3, obj.code, editable=True)
+
+            self._set_label_cell(4, "Элементов в блоке", None)
+            self._set_value_cell(4, str(len(getattr(obj, "panels", []) or [])), editable=False)
 
         elif isinstance(obj, Panel):
             saw_x, saw_y, saw_z = (
@@ -156,6 +238,27 @@ class PropertiesDock(QDockWidget):
         if not editable:
             val_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         self.table.setItem(row, 1, val_item)
+
+    def _make_bool_combo(self, obj, attr_name: str) -> QComboBox:
+        combo = QComboBox()
+        combo.addItem("Да", True)
+        combo.addItem("Нет", False)
+        cur = bool(getattr(obj, attr_name, True))
+        combo.setCurrentIndex(0 if cur else 1)
+        combo.currentIndexChanged.connect(
+            lambda _idx, a=attr_name, c=combo: self._on_bool_combo_changed(a, c)
+        )
+        return combo
+
+    def _on_bool_combo_changed(self, attr_name: str, combo: QComboBox) -> None:
+        if self._updating or self.current_obj is None:
+            return
+        new_val = bool(combo.currentData())
+        old_val = bool(getattr(self.current_obj, attr_name, True))
+        if new_val == old_val:
+            return
+        self.property_applied.emit(self.current_obj, attr_name, old_val, new_val)
+        self.property_changed.emit()
 
     def _make_material_combo(self, panel: Panel) -> QComboBox:
         """QComboBox со списком материалов из каталога."""

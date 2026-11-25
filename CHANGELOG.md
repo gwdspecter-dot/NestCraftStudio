@@ -4,6 +4,26 @@
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [Unreleased]
+
+### Added
+- **Явное создание блоков через контекстное меню структуры модели** (`models/panel.py`, `core/undo.py`, `ui/product_dialogs.py`, `ui/panels/structure_panel.py`, `ui/panels/properties_panel.py`, `ui/main_window.py`, `core/project_io.py`, `core/version.py`):
+  - добавлен диалог `CreateBlockDialog` (**ПКМ в «Структуре модели» → «Создать блок…»**) с полем **«Название блока»**, галочкой **«Сборочная единица»** (управляет расстановкой позиций блока и его деталей) и кнопками **«ОК» / «Отмена»**;
+  - добавлена обратимая команда `CreateBlockCommand` в `UndoStack`, поддержка редактирования признака `is_assembly` в панели «Свойства» и миграция формата `.b3d` **`0.0.11 → 0.0.12`** с сохранением полей `is_assembly` и `is_root`.
+- **Стыки, одиночная фурнитура и ассоциации в «Структуре модели» + 5 векторных SVG-иконок** (`ui/icons/struct_*.svg`, `ui/panels/structure_panel.py`, `ui/panels/properties_panel.py`, `ui/panels/joints_panel.py`, `ui/panels/assoc_panel.py`, `core/joint.py`, `tests/test_structure_blocks_joints.py`):
+  - нарисованы 5 тематических SVG-иконок в едином стиле NestCraft Studio (`struct_block.svg`, `struct_panel.svg`, `struct_joint.svg`, `struct_fastener.svg`, `struct_assoc.svg`) с адаптацией под светлую и тёмную тему;
+  - стыки отображаются в «Структуре модели» как узлы-контейнеры (без позиций) с дочерними элементами одиночной фурнитуры (`get_joint_fastener_items`), а ассоциативные отверстия — как листовые элементы (без позиций);
+  - панели **«Стыки»** (`JointsPanelWidget`) и **«Ассоциации»** (`AssocPanelWidget`) перенесены внутрь док-панели **«Свойства»** (`PropertiesDock`) и автоматически открываются при клике на соответствующий элемент в структуре модели или на 3D-отверстие.
+
+### Changed
+- **Плоская структура модели по умолчанию**: вновь созданные и вставленные (`Ctrl+C` / `Ctrl+V`) панели добавляются напрямую в корень модели без автоматического создания обёрток-блоков («Корпус 1», «Копия» и т.п.).
+- Убраны отдельные док-панели «Стыки» и «Ассоциации» из правой колонки главного окна — освобождено рабочее пространство 3D-сцены.
+- Формат файла `.b3d` повышен до **`0.0.12`** (автоматическая миграция `0.0.11 → 0.0.12`).
+
+### Fixed
+- **Межблочные стыки и ассоциации** (`core/joint.py`, `core/assoc.py`, `core/issues.py`, `core/hole_nav.py`, `core/clipboard.py`, `core/undo.py`, `ui/viewport.py`, `ui/assoc_dialog.py`):
+  - исправлена ошибка `«Стык ссылается на удалённую деталь»` и отсутствие крепежа при соединении панелей после `Ctrl+C` / `Ctrl+V` или панелей из разных блоков: расчёт стыков (`apply_joints_in_blocks`), ассоциаций (`apply_assoc_refs_in_blocks`), проверки проблем (`check_broken_joints_in_blocks`, `check_broken_assocs_in_blocks`), 3D-подсветка отверстий и диалог ассоциаций теперь резолвят детали по всей сцене.
+
 ## [0.0.23] - 2026-11-25
 
 ### Added

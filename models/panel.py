@@ -632,7 +632,7 @@ class Panel:
 
 
 class Block:
-    """Базовый сборочный блок"""
+    """Базовый сборочный блок."""
     def __init__(
         self,
         name: str,
@@ -641,6 +641,8 @@ class Block:
         uid: str = "",
         joints: list | None = None,
         assoc_refs: list | None = None,
+        is_assembly: bool = True,
+        is_root: bool = False,
     ):
         self.uid = str(uid).strip() if uid else new_uid()
         self.name = name
@@ -650,6 +652,9 @@ class Block:
         self.joints: list = list(joints) if joints else []
         self.assoc_refs: list = list(assoc_refs) if assoc_refs else []
         self.selected = False
+        self.is_assembly = bool(is_assembly)
+        self.is_root = bool(is_root)
+        self._scene_blocks: list | None = None
 
     def add_panel(self, panel: Panel):
         panel._block = self
@@ -750,8 +755,17 @@ class ParametricCabinet(Block):
                  pos_num: str = "1", code: str = "01.00",
                  uid: str = "",
                  joints: list | None = None,
-                 rebuild_on_init: bool = True):
-        super().__init__(name, pos_num, code, uid=uid, joints=joints)
+                 rebuild_on_init: bool = True,
+                 is_assembly: bool = True):
+        super().__init__(
+            name,
+            pos_num,
+            code,
+            uid=uid,
+            joints=joints,
+            is_assembly=is_assembly,
+            is_root=False,
+        )
         self.x = float(x)
         self.y = float(y)
         self.z = float(z)
@@ -1111,7 +1125,10 @@ class ParametricCabinet(Block):
 
         def next_num() -> str:
             nonlocal idx
-            res = f"{self.pos_num}.{idx}"
+            if not getattr(self, "is_assembly", True):
+                return ""
+            prefix = str(self.pos_num or "1")
+            res = f"{prefix}.{idx}"
             idx += 1
             return res
 
@@ -1144,3 +1161,75 @@ class ParametricCabinet(Block):
             from core.joint import apply_joints
 
             apply_joints(self)
+
+
+def bind_scene_blocks(blocks: list[Block] | None) -> None:
+    """Привязывает ссылку на список блоков сцены ко всем блокам и обратные ссылки панелей."""
+    if not isinstance(blocks, list):
+        return
+    for b in blocks:
+        if b is None:
+            continue
+        b._scene_blocks = blocks
+        for p in getattr(b, "panels", None) or []:
+            p._block = b
+
+
+def ensure_root_block(blocks: list[Block], name: str = "Изделие") -> Block:
+    """Возвращает корневой контейнер свободных панелей или создаёт его в начале списка."""
+    for b in blocks:
+        if bool(getattr(b, "is_root", False)):
+            bind_scene_blocks(blocks)
+            return b
+    root = Block(
+        name=name or "Изделие",
+        pos_num="",
+        code="",
+        is_assembly=False,
+        is_root=True,
+    )
+    blocks.insert(0, root)
+    bind_scene_blocks(blocks)
+    return root
+
+
+def next_assembly_pos_num(blocks: list[Block] | None) -> str:
+    """Возвращает следующий свободный номер позиции для блока-сборочной единицы."""
+    used: set[int] = set()
+    for b in blocks or []:
+        if bool(getattr(b, "is_root", False)):
+            continue
+        if not bool(getattr(b, "is_assembly", True)):
+            continue
+        raw = str(getattr(b, "pos_num", "") or "").strip()
+        if raw.isdigit():
+            used.add(int(raw))
+    n = 1
+    while n in used:
+        n += 1
+    return str(n)
+
+
+def assign_block_positions(block: Block, blocks: list[Block] | None = None) -> None:
+    """Расставляет или очищает позиции блока и его панелей в зависимости от ``is_assembly``.
+
+    - Если ``is_root=True``: блок позиции не имеет (``""``).
+    - Если ``is_assembly=True``: блоку назначается номер позиции (если пуст), панелям — ``<поз>.1``, ``<поз>.2``, …
+    - Если ``is_assembly=False``: позиции блока и его панелей очищаются (``""``).
+    """
+    if block is None:
+        return
+    if bool(getattr(block, "is_root", False)):
+        block.pos_num = ""
+        return
+    if bool(getattr(block, "is_assembly", True)):
+        if not str(getattr(block, "pos_num", "") or "").strip():
+            block.pos_num = next_assembly_pos_num(blocks)
+        prefix = str(block.pos_num).strip()
+        for idx, panel in enumerate(getattr(block, "panels", None) or [], start=1):
+            panel.pos_num = f"{prefix}.{idx}"
+    else:
+        block.pos_num = ""
+        for panel in getattr(block, "panels", None) or []:
+            panel.pos_num = ""
+

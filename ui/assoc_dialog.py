@@ -24,6 +24,7 @@ from core.assoc import (
     resolve_assoc_world_point,
 )
 from ui.dialogs import SmartDoubleSpinBox
+from ui.theme import current_theme
 
 
 class AssocRefDialog(QDialog):
@@ -41,6 +42,7 @@ class AssocRefDialog(QDialog):
         *,
         existing_ref: AssocRef | None = None,
         preview_callback: Callable[[tuple[float, float, float] | None], None] | None = None,
+        all_blocks: list | None = None,
     ):
         super().__init__(parent)
         self.block = block
@@ -51,8 +53,22 @@ class AssocRefDialog(QDialog):
         )
         self.setMinimumWidth(460)
 
-        panels = list(getattr(block, "panels", []) or [])
-        self._panels = [p for p in panels if str(getattr(p, "uid", "") or "")]
+        if all_blocks:
+            scope_blocks = [b for b in all_blocks if b is not None]
+        else:
+            scene_blocks = getattr(block, "_scene_blocks", None)
+            scope_blocks = [b for b in scene_blocks if b is not None] if scene_blocks else [block]
+        self._all_blocks = scope_blocks
+
+        panels: list = []
+        seen_uids: set[str] = set()
+        for b in self._all_blocks:
+            for p in getattr(b, "panels", []) or []:
+                uid = str(getattr(p, "uid", "") or "")
+                if uid and uid not in seen_uids:
+                    seen_uids.add(uid)
+                    panels.append(p)
+        self._panels = panels
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -102,9 +118,10 @@ class AssocRefDialog(QDialog):
 
         layout.addLayout(form)
 
+        t = current_theme()
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #2e6b3e; font-size: 11px;")
+        self.status_label.setStyleSheet(f"color: {t.success}; font-size: 11px;")
         layout.addWidget(self.status_label)
 
         hint = QLabel(
@@ -112,7 +129,7 @@ class AssocRefDialog(QDialog):
             "При сдвиге source отверстие пересчитывается. Точка превью — в 3D-виде."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #666; font-size: 11px;")
+        hint.setStyleSheet(f"color: {t.text_dim}; font-size: 11px;")
         layout.addWidget(hint)
 
         buttons = QDialogButtonBox(
@@ -233,24 +250,27 @@ class AssocRefDialog(QDialog):
         self._emit_preview()
 
     def _emit_preview(self, *_args) -> None:
+        t = current_theme()
         try:
             ref = self.build_ref()
             target = self.target_combo.currentData()
             source = self.source_combo.currentData()
             st = evaluate_assoc_ref_panels(target, source, ref)
             if st.severity == "error":
-                self.status_label.setStyleSheet("color: #c62828; font-size: 11px;")
+                self.status_label.setStyleSheet(f"color: {t.error}; font-size: 11px;")
                 self.status_label.setText(f"❌ {st.message}")
             elif st.severity == "warning":
-                self.status_label.setStyleSheet("color: #b26a00; font-size: 11px;")
+                self.status_label.setStyleSheet(f"color: {t.warning}; font-size: 11px;")
                 self.status_label.setText(f"⚠ {st.message}")
             else:
-                self.status_label.setStyleSheet("color: #2e6b3e; font-size: 11px;")
+                self.status_label.setStyleSheet(f"color: {t.success}; font-size: 11px;")
                 self.status_label.setText(f"✓ {st.message}")
             if self._preview_callback is not None:
-                self._preview_callback(resolve_assoc_world_point(self.block, ref))
+                self._preview_callback(
+                    resolve_assoc_world_point(self.block, ref, all_blocks=self._all_blocks)
+                )
         except Exception:
-            self.status_label.setStyleSheet("color: #c62828; font-size: 11px;")
+            self.status_label.setStyleSheet(f"color: {t.error}; font-size: 11px;")
             self.status_label.setText("⚠ Выберите разные панели target и source")
             if self._preview_callback is not None:
                 self._preview_callback(None)

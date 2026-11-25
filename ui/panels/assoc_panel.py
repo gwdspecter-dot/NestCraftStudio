@@ -271,25 +271,36 @@ from core.logging_setup import get_logger
 _log = get_logger("assoc_panel")
 
 
-class AssocDock(QDockWidget):
-    """Список ассоциативных ссылок блока: добавление, правка параметров, удаление."""
+def _theme_colors():
+    """Возвращает палитру текущей темы (или безопасный fallback в headless-режиме)."""
+    try:
+        from ui.theme import current_theme
+
+        t = current_theme()
+        return t.error, t.warning, t.accent, t.success, t.text_dim
+    except Exception as exc:
+        _log.debug("ui.theme недоступна в headless-режиме: %s", exc)
+        return "#c82828", "#b56800", "#325fa5", "#2e7d32", "#666666"
+
+
+class AssocPanelWidget(QWidget):
+    """Встраиваемый виджет «Ассоциации»: список ссылок, статус, правка, фиксация и удаление."""
 
     assoc_selected = pyqtSignal(object, str)  # (block, assoc_uid)
     assoc_modified = pyqtSignal(object, str, dict, dict)  # (block, uid, old, new)
     assoc_deleted = pyqtSignal(object, str)
     add_assoc_requested = pyqtSignal()
     edit_assoc_requested = pyqtSignal(object, str)  # полный диалог
+    title_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
-        super().__init__("Ассоциации", parent)
-        self.setAllowedAreas(
-            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
-        )
+        super().__init__(parent)
         self.blocks_ref: list = []
         self._updating_ui = False
+        self._title: str = "Ассоциации"
+        self._last_status: AssocAttachmentStatus | None = None
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
@@ -336,9 +347,10 @@ class AssocDock(QDockWidget):
             self.list_widget.itemDoubleClicked.connect(lambda _it: self._emit_edit_requested())
         layout.addWidget(self.list_widget, 1)
 
+        _, _, _, _, dim_col = _theme_colors()
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.status_label.setStyleSheet(f"color: {dim_col}; font-size: 11px;")
         layout.addWidget(self.status_label)
 
         form_w = QWidget()
@@ -400,16 +412,30 @@ class AssocDock(QDockWidget):
 
         layout.addWidget(form_w)
 
-        hint = QLabel(
+        self._hint_label = QLabel(
             "Отверстие на target считается от грани source с учётом якоря.\n"
             "📌 Зафиксировать — заморозить позицию на target; 🧭 Подобрать грань — восстановить после поворота."
         )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #666; font-size: 11px;")
-        layout.addWidget(hint)
+        self._hint_label.setWordWrap(True)
+        self._hint_label.setStyleSheet(f"color: {dim_col}; font-size: 11px;")
+        layout.addWidget(self._hint_label)
 
         self._set_controls_enabled(False)
-        self.setWidget(container)
+
+    def panel_title(self) -> str:
+        return self._title
+
+    def _set_panel_title(self, title: str) -> None:
+        self._title = str(title)
+        self.title_changed.emit(self._title)
+
+    def refresh_theme(self) -> None:
+        _, _, _, _, dim_col = _theme_colors()
+        self._hint_label.setStyleSheet(f"color: {dim_col}; font-size: 11px;")
+        if self._last_status is not None:
+            self._update_status_banner(self._last_status)
+        else:
+            self.status_label.setStyleSheet(f"color: {dim_col}; font-size: 11px;")
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for w in (
@@ -428,6 +454,7 @@ class AssocDock(QDockWidget):
             w.setEnabled(enabled)
         if not enabled:
             self.btn_toggle_fixed.setText("📌 Зафиксировать")
+            self._last_status = None
             self.status_label.setText("")
 
     @staticmethod
@@ -457,35 +484,47 @@ class AssocDock(QDockWidget):
         return ("🔗", "")
 
     @staticmethod
-    def _format_item(block, ref: AssocRef, status: AssocAttachmentStatus | None = None) -> str:
-        by_uid = {
-            str(getattr(p, "uid", "")): getattr(p, "name", "Панель")
-            for p in getattr(block, "panels", []) or []
-        }
+    def _format_item(
+        block,
+        ref: AssocRef,
+        status: AssocAttachmentStatus | None = None,
+        all_panels_by_uid: dict[str, Any] | None = None,
+    ) -> str:
+        if all_panels_by_uid is not None:
+            by_uid = {
+                uid: getattr(p, "name", "Панель")
+                for uid, p in all_panels_by_uid.items()
+            }
+        else:
+            by_uid = {
+                str(getattr(p, "uid", "")): getattr(p, "name", "Панель")
+                for p in getattr(block, "panels", []) or []
+            }
         tgt = by_uid.get(ref.target_uid, (ref.target_uid or "?")[:8])
         src = by_uid.get(ref.source_uid, (ref.source_uid or "?")[:8])
         dia = float(ref.params.get("diameter") or 0.0)
         face = ref.source_face or "?"
-        prefix, suffix = AssocDock._status_badge(status, ref)
+        prefix, suffix = AssocPanelWidget._status_badge(status, ref)
         if ref.fixed and (status is None or status.state == "fixed"):
             return f"{prefix} {tgt}  Ø{dia:g}{suffix}"
         return f"{prefix} {tgt} ← {src}.{face}  Ø{dia:g}{suffix}"
 
     @staticmethod
     def _apply_item_color(item: QListWidgetItem, status: AssocAttachmentStatus) -> None:
-        rgb: tuple[int, int, int] | None = None
+        err_col, warn_col, acc_col, _ok_col, _dim_col = _theme_colors()
+        color_hex: str | None = None
         if status.severity == "error":
-            rgb = (200, 40, 40)
+            color_hex = err_col
         elif status.severity == "warning":
-            rgb = (195, 115, 0)
+            color_hex = warn_col
         elif status.state == "fixed":
-            rgb = (50, 95, 165)
-        if rgb is None:
+            color_hex = acc_col
+        if color_hex is None:
             return
         try:
             from PyQt6.QtGui import QBrush, QColor
 
-            item.setForeground(QBrush(QColor(*rgb)))
+            item.setForeground(QBrush(QColor(color_hex)))
         except Exception as exc:  # noqa: BLE001
             _log.debug("QtGui foreground color unavailable (headless): %s", exc)
 
@@ -493,6 +532,13 @@ class AssocDock(QDockWidget):
         """Обновляет список ассоциаций по всем блокам сцены."""
         prev_block, prev_uid = self.current_assoc_ref()
         self.blocks_ref = list(blocks or [])
+
+        all_by_uid: dict[str, Any] = {}
+        for b in self.blocks_ref:
+            for p in getattr(b, "panels", []) or []:
+                puid = str(getattr(p, "uid", "") or "")
+                if puid:
+                    all_by_uid[puid] = p
 
         self._updating_ui = True
         try:
@@ -503,10 +549,10 @@ class AssocDock(QDockWidget):
             for b in self.blocks_ref:
                 for raw in getattr(b, "assoc_refs", None) or []:
                     ref = raw if isinstance(raw, AssocRef) else AssocRef.from_dict(raw)
-                    st = evaluate_assoc_ref(b, ref)
+                    st = evaluate_assoc_ref(b, ref, all_blocks=self.blocks_ref)
                     if st.severity != "ok":
                         problems += 1
-                    txt = self._format_item(b, ref, st)
+                    txt = self._format_item(b, ref, st, all_panels_by_uid=all_by_uid)
                     item = QListWidgetItem(txt)
                     item.setData(Qt.ItemDataRole.UserRole, (b, ref.uid))
                     tip = st.message + (f"\n{st.remedy}" if st.remedy else "")
@@ -520,15 +566,15 @@ class AssocDock(QDockWidget):
 
             if total > 0:
                 if problems > 0:
-                    self.setWindowTitle(f"Ассоциации ({total} · ⚠ {problems})")
+                    self._set_panel_title(f"Ассоциации ({total} · ⚠ {problems})")
                 else:
-                    self.setWindowTitle(f"Ассоциации ({total})")
+                    self._set_panel_title(f"Ассоциации ({total})")
                 if selected_row >= 0:
                     self.list_widget.setCurrentRow(selected_row)
                 elif self.list_widget.count() > 0:
                     self.list_widget.setCurrentRow(0)
             else:
-                self.setWindowTitle("Ассоциации")
+                self._set_panel_title("Ассоциации")
                 self._set_controls_enabled(False)
         finally:
             self._updating_ui = False
@@ -536,7 +582,6 @@ class AssocDock(QDockWidget):
         cur_b, cur_uid = self.current_assoc_ref()
         self._sync_controls_from_record(cur_b, cur_uid)
 
-    # alias for callers that used refresh(block)
     def refresh(self, _block=None) -> None:
         self.load_assocs(self.blocks_ref)
 
@@ -558,35 +603,42 @@ class AssocDock(QDockWidget):
                 return ref
         return None
 
-    @staticmethod
-    def _find_panel(block, panel_uid: str):
-        if block is None or not panel_uid:
+    def _find_panel(self, block, panel_uid: str):
+        if not panel_uid:
             return None
-        for p in getattr(block, "panels", None) or []:
-            if str(getattr(p, "uid", "")) == str(panel_uid):
-                return p
+        target_uid = str(panel_uid)
+        if block is not None:
+            for p in getattr(block, "panels", None) or []:
+                if str(getattr(p, "uid", "")) == target_uid:
+                    return p
+        for b in self.blocks_ref:
+            for p in getattr(b, "panels", None) or []:
+                if str(getattr(p, "uid", "")) == target_uid:
+                    return p
         return None
 
     def _update_status_banner(self, status: AssocAttachmentStatus) -> None:
+        self._last_status = status
+        err_col, warn_col, acc_col, ok_col, _dim_col = _theme_colors()
         text = status.message
         if status.remedy:
             text = f"{text}\n{status.remedy}"
         self.status_label.setText(text)
         if status.severity == "error":
-            self.status_label.setStyleSheet("color: #c82828; font-size: 11px; font-weight: bold;")
+            self.status_label.setStyleSheet(f"color: {err_col}; font-size: 11px; font-weight: bold;")
         elif status.severity == "warning":
-            self.status_label.setStyleSheet("color: #b56800; font-size: 11px;")
+            self.status_label.setStyleSheet(f"color: {warn_col}; font-size: 11px;")
         elif status.state == "fixed":
-            self.status_label.setStyleSheet("color: #325fa5; font-size: 11px;")
+            self.status_label.setStyleSheet(f"color: {acc_col}; font-size: 11px;")
         else:
-            self.status_label.setStyleSheet("color: #2e7d32; font-size: 11px;")
+            self.status_label.setStyleSheet(f"color: {ok_col}; font-size: 11px;")
 
     def _sync_controls_from_record(self, block, assoc_uid: str) -> None:
         ref = self._find_record(block, assoc_uid)
         if ref is None:
             self._set_controls_enabled(False)
             return
-        st = evaluate_assoc_ref(block, ref)
+        st = evaluate_assoc_ref(block, ref, all_blocks=self.blocks_ref)
         target = self._find_panel(block, ref.target_uid)
         source = self._find_panel(block, ref.source_uid)
 
@@ -691,9 +743,9 @@ class AssocDock(QDockWidget):
             return False
         old_state = ref.to_dict()
         if ref.fixed:
-            new_state = unfreeze_assoc_ref_state(block, ref)
+            new_state = unfreeze_assoc_ref_state(block, ref, all_blocks=self.blocks_ref)
         else:
-            new_state = freeze_assoc_ref_state(block, ref)
+            new_state = freeze_assoc_ref_state(block, ref, all_blocks=self.blocks_ref)
         if not new_state or new_state == old_state:
             return False
         self.assoc_modified.emit(block, uid, old_state, new_state)
@@ -707,7 +759,9 @@ class AssocDock(QDockWidget):
         if block is None or ref is None:
             return False
         old_state = ref.to_dict()
-        new_state = rebind_assoc_ref_state(block, ref, new_face=new_face)
+        new_state = rebind_assoc_ref_state(
+            block, ref, new_face=new_face, all_blocks=self.blocks_ref
+        )
         if not new_state or new_state == old_state:
             return False
         self.assoc_modified.emit(block, uid, old_state, new_state)
@@ -740,3 +794,73 @@ class AssocDock(QDockWidget):
                 self.list_widget.setCurrentRow(row)
                 return True
         return False
+
+
+class AssocDock(QDockWidget):
+    """Совместимая обёртка QDockWidget вокруг `AssocPanelWidget`."""
+
+    assoc_selected = pyqtSignal(object, str)  # (block, assoc_uid)
+    assoc_modified = pyqtSignal(object, str, dict, dict)  # (block, uid, old, new)
+    assoc_deleted = pyqtSignal(object, str)
+    add_assoc_requested = pyqtSignal()
+    edit_assoc_requested = pyqtSignal(object, str)  # полный диалог
+
+    def __init__(self, parent=None):
+        super().__init__("Ассоциации", parent)
+        self.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.panel = AssocPanelWidget(self)
+        self.setWidget(self.panel)
+
+        self.btn_add = self.panel.btn_add
+        self.btn_edit = self.panel.btn_edit
+        self.btn_delete = self.panel.btn_delete
+        self.btn_toggle_fixed = self.panel.btn_toggle_fixed
+        self.btn_rebind_face = self.panel.btn_rebind_face
+        self.list_widget = self.panel.list_widget
+        self.status_label = self.panel.status_label
+        self.face_combo = self.panel.face_combo
+        self.anchor_combo = self.panel.anchor_combo
+        self.u_spin = self.panel.u_spin
+        self.v_spin = self.panel.v_spin
+        self.inset_spin = self.panel.inset_spin
+        self.dia_spin = self.panel.dia_spin
+        self.depth_spin = self.panel.depth_spin
+
+        self.panel.assoc_selected.connect(self.assoc_selected.emit)
+        self.panel.assoc_modified.connect(self.assoc_modified.emit)
+        self.panel.assoc_deleted.connect(self.assoc_deleted.emit)
+        self.panel.add_assoc_requested.connect(self.add_assoc_requested.emit)
+        self.panel.edit_assoc_requested.connect(self.edit_assoc_requested.emit)
+        self.panel.title_changed.connect(self.setWindowTitle)
+
+    @property
+    def blocks_ref(self) -> list:
+        return self.panel.blocks_ref
+
+    @blocks_ref.setter
+    def blocks_ref(self, value: list) -> None:
+        self.panel.blocks_ref = value
+
+    def load_assocs(self, blocks: list) -> None:
+        self.panel.load_assocs(blocks)
+
+    def refresh(self, _block=None) -> None:
+        self.panel.refresh(_block)
+
+    def current_assoc_ref(self) -> tuple[object | None, str]:
+        return self.panel.current_assoc_ref()
+
+    def toggle_fixed_selected_assoc(self) -> bool:
+        return self.panel.toggle_fixed_selected_assoc()
+
+    def rebind_selected_assoc(self, new_face: str | None = None) -> bool:
+        return self.panel.rebind_selected_assoc(new_face=new_face)
+
+    def delete_selected_assoc(self) -> bool:
+        return self.panel.delete_selected_assoc()
+
+    def select_assoc_by_uid(self, assoc_uid: str) -> bool:
+        return self.panel.select_assoc_by_uid(assoc_uid)
+
