@@ -415,7 +415,7 @@ class HomePage(QWidget):
                 padding: 0px;
             }}
             QListWidget#homeRecentList::item:hover {{
-                background-color: {c.bg_input};
+                background-color: {c.bg};
                 border-color: {c.border};
             }}
             QListWidget#homeRecentList::item:selected {{

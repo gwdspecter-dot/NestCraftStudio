@@ -21,6 +21,11 @@
 ### Changed
 - `APP_VERSION` → **0.0.23**; формат файла `.b3d` → **0.0.11** (автоматическая миграция `0.0.10 → 0.0.11`).
 
+### Fixed
+- **Контрастность полей ввода в тёмной теме** (`ui/theme.py`, `ui/home_page.py`, `ui/product_dialogs.py`, `tests/test_theme.py`):
+  - затемнён фон полей ввода и списков (`DARK.bg_input` → `#141416`) и выделены границы (`DARK.border` → `#4a4a50`), чтобы поля `QLineEdit`, `QSpinBox`, `QDoubleSpinBox` и `QComboBox` не сливались с панелями и диалогами;
+  - фон контейнера вкладок `QTabWidget::pane` и активной вкладки `QTabBar::tab:selected` переведён с `bg_input` на `bg_panel` (`#2d2d2d` / `#f7f8fa`), добавлена подсветка рамок полей при наведении и фокусе, а hover кнопок сохранён контрастным.
+
 ## [0.0.22] - 2026-11-20
 
 ### Added

@@ -17,7 +17,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import Qt, QSize, QByteArray, QEvent, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QByteArray, QEvent, QRectF, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QBrush, QFont, QPixmap, QShortcut
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -86,16 +86,28 @@ _IMPLEMENTED_TYPES = {"confirmat"}
 
 
 def _recolor_svg(raw: str, *, for_dark: bool) -> str:
-    """Подменяет палитру SVG под светлую / тёмную тему."""
+    """Подменяет палитру SVG под светлую / тёмную тему.
+
+    Монохромные иконки типов (серая шкала) на тёмной теме инвертируются.
+    Схемы group/group2 сохраняют прежнюю CAD-палитру.
+    """
     if for_dark:
         mapping = {
-            # иконки типов (исходно светло-голубые)
-            "#eef8ff": "#f0f9ff",
-            "#b8e0ff": "#7dd3fc",
-            "#7cc0ff": "#38bdf8",
-            "#EEF8FF": "#f0f9ff",
-            "#B8E0FF": "#7dd3fc",
-            "#7CC0FF": "#38bdf8",
+            # монохромные иконки типов: инверсия серой шкалы под тёмный фон
+            "#0c0e12": "#e9edf3",
+            "#4e535c": "#cfd6e0",
+            "#7b828e": "#a8b0bc",
+            "#a8b0bc": "#7b828e",
+            "#cfd6e0": "#4e535c",
+            "#e9edf3": "#2a2e36",
+            "#ffffff": "#1a1d22",
+            "#0C0E12": "#e9edf3",
+            "#4E535C": "#cfd6e0",
+            "#7B828E": "#a8b0bc",
+            "#A8B0BC": "#7b828e",
+            "#CFD6E0": "#4e535c",
+            "#E9EDF3": "#2a2e36",
+            "#FFFFFF": "#1a1d22",
             # схемы (group.svg) — почти чёрные тела панелей
             "#0F141C": "#334155",
             "#1E293B": "#475569",
@@ -106,13 +118,7 @@ def _recolor_svg(raw: str, *, for_dark: bool) -> str:
         }
     else:
         mapping = {
-            # иконки: контрастные сине-стальные тона на светлом фоне
-            "#eef8ff": "#38bdf8",
-            "#b8e0ff": "#0284c7",
-            "#7cc0ff": "#0c4a6e",
-            "#EEF8FF": "#38bdf8",
-            "#B8E0FF": "#0284c7",
-            "#7CC0FF": "#0c4a6e",
+            # светлая тема: монохром оставляем как есть (тёмный на светлом)
             # схемы: светлая CAD-палитра на белом фоне
             "#0F141C": "#94a3b8",
             "#1E293B": "#cbd5e1",
@@ -142,7 +148,7 @@ def _recolor_svg(raw: str, *, for_dark: bool) -> str:
 
 
 def _themed_fastener_icon(svg_path: Path, size: int = 48) -> QIcon:
-    """Рендерит SVG-иконку с перекраской под текущую тему."""
+    """Рендерит SVG-иконку с перекраской под текущую тему (без подложки — обводка только у кнопки)."""
     if not svg_path.is_file():
         return QIcon()
     try:
@@ -161,15 +167,9 @@ def _themed_fastener_icon(svg_path: Path, size: int = 48) -> QIcon:
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    # Мягкая подложка под иконку: не конфликтует с фоном и границей QToolButton
-    if c.name == "dark":
-        painter.setBrush(QColor(255, 255, 255, 22))
-    else:
-        painter.setBrush(QColor(15, 23, 42, 12))
-    painter.setPen(Qt.PenStyle.NoPen)
-    margin = max(1, size // 16)
-    painter.drawRoundedRect(margin, margin, size - 2 * margin, size - 2 * margin, size // 8, size // 8)
-    renderer.render(painter)
+    # Небольшой внутренний отступ, чтобы иконка не касалась синей рамки selected
+    margin = max(2, size // 14)
+    renderer.render(painter, QRectF(margin, margin, size - 2 * margin, size - 2 * margin))
     painter.end()
     return QIcon(pm)
 
@@ -819,6 +819,7 @@ class FastenerConstructorDialog(QDialog):
             self._user_stub.setStyleSheet(f"color: {c.text_dim}; font-size: 13px;")
 
         if hasattr(self, "_left_bar"):
+            # Одна обводка: прозрачная в покое, синяя 2px только у выбранного типа
             self._left_bar.setStyleSheet(
                 f"""
                 QFrame#fastenerTypeBar {{
@@ -826,22 +827,22 @@ class FastenerConstructorDialog(QDialog):
                     border-right: 1px solid {c.border};
                 }}
                 QFrame#fastenerTypeBar QToolButton {{
-                    background: {c.bg_input};
-                    border: 1px solid {c.border};
+                    background: transparent;
+                    border: 2px solid transparent;
                     border-radius: 8px;
-                    padding: 4px;
+                    padding: 2px;
                 }}
                 QFrame#fastenerTypeBar QToolButton:hover {{
-                    background: {c.select_bg};
-                    border-color: {c.accent_soft};
+                    background: {c.bg_input};
+                    border-color: transparent;
                 }}
                 QFrame#fastenerTypeBar QToolButton:checked {{
                     background: {c.select_bg};
                     border: 2px solid {c.accent};
                 }}
                 QFrame#fastenerTypeBar QToolButton:disabled {{
-                    background: {c.bg_panel};
-                    border-color: {c.border};
+                    background: transparent;
+                    border-color: transparent;
                 }}
                 """
             )
@@ -855,8 +856,9 @@ class FastenerConstructorDialog(QDialog):
             if icon_path.is_file():
                 btn.setIcon(_themed_fastener_icon(icon_path, size=icon_px * 2))
 
-        input_bg = c.bg if is_dark else "#ffffff"
-        input_border = "#64748b" if is_dark else "#9aa3b2"
+        # Мягкие поля: без контрастных обводок (в духе ui.theme)
+        input_bg = c.bg_input
+        input_border = "#4a4a4a" if is_dark else c.border
         spin_btn_bg = c.bg_panel if is_dark else c.bg_alt
 
         if hasattr(self, "fx_tag"):

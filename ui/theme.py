@@ -43,11 +43,12 @@ class ThemeColors:
 
 DARK = ThemeColors(
     name="dark",
-    bg="#1e1e1e",
-    bg_alt="#252526",
-    bg_panel="#2d2d2d",
-    bg_input="#3c3c3c",
-    border="#3c3c3c",
+    # VS Code–подобная мягкая тёмная тема: инпуты чуть светлее панелей, границы почти сливаются
+    bg="#1e1e1e",          # общий фон окна
+    bg_alt="#252526",      # меню, тулбары, статусбар, неактивные вкладки
+    bg_panel="#2d2d2d",    # доки, панели, содержимое вкладок, кнопки
+    bg_input="#3c3c3c",    # поля ввода, таблицы, списки (мягкий контраст)
+    border="#3c3c3c",      # границы без «реза глаз»
     text="#d4d4d4",
     text_dim="#858585",
     text_title="#e8e8e8",
@@ -175,6 +176,11 @@ def build_stylesheet(c: ThemeColors, icons_dir: Path | None = None) -> str:
     chevron_down = _icon_url(icons_dir, "chevron_down.svg")
     chevron_up = _icon_url(icons_dir, "chevron_up.svg")
     close_ico = _icon_url(icons_dir, "close.svg")
+    btn_hover = "#3a3a3f" if c.name == "dark" else c.bg_input
+    # Фокус: мягкий акцент, без яркой обводки «как в Material»
+    input_focus = c.accent if c.name == "dark" else c.accent
+    list_alt = c.bg if c.name == "dark" else c.bg_panel
+    input_border = "#4a4a4a" if c.name == "dark" else c.border  # чуть заметнее фона инпута, но не контрастно
     return f"""
 /* NestCraft theme: {c.name} */
 QWidget {{
@@ -262,9 +268,9 @@ QDockWidget::title {{
 }}
 QTreeWidget, QListWidget, QTableWidget, QTableView, QTreeView {{
     background-color: {c.bg_input};
-    alternate-background-color: {c.bg_panel};
+    alternate-background-color: {list_alt};
     color: {c.text};
-    border: 1px solid {c.border};
+    border: 1px solid {input_border};
     border-radius: 3px;
     outline: none;
 }}
@@ -287,15 +293,29 @@ QHeaderView::section {{
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QPlainTextEdit {{
     background-color: {c.bg_input};
     color: {c.text};
-    border: 1px solid {c.border};
+    border: 1px solid {input_border};
     border-radius: 3px;
     padding: 4px 6px;
     selection-background-color: {c.select_bg};
     selection-color: {c.select_fg};
 }}
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover,
+QComboBox:hover, QTextEdit:hover, QPlainTextEdit:hover {{
+    border-color: {c.text_dim};
+}}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QComboBox:focus, QTextEdit:focus, QPlainTextEdit:focus {{
+    border: 1px solid {input_focus};
+}}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QComboBox:disabled, QTextEdit:disabled, QPlainTextEdit:disabled {{
+    background-color: {c.bg_alt};
+    color: {c.text_dim};
+}}
 QComboBox QAbstractItemView {{
     background-color: {c.bg_alt};
     color: {c.text};
+    border: 1px solid {c.border};
     selection-background-color: {c.select_bg};
 }}
 QPushButton {{
@@ -306,7 +326,7 @@ QPushButton {{
     padding: 5px 14px;
 }}
 QPushButton:hover {{
-    background-color: {c.bg_input};
+    background-color: {btn_hover};
     border-color: {c.accent};
 }}
 QPushButton:pressed {{
@@ -323,7 +343,7 @@ QPushButton:default:hover {{
 }}
 QTabWidget::pane {{
     border: 1px solid {c.border};
-    background: {c.bg_input};
+    background: {c.bg_panel};
     top: -1px;
 }}
 QTabBar {{
@@ -340,9 +360,9 @@ QTabBar::tab {{
     border-top-right-radius: 4px;
 }}
 QTabBar::tab:selected {{
-    background: {c.bg_input};
+    background: {c.bg_panel};
     color: {c.text_title};
-    border-bottom-color: {c.bg_input};
+    border-bottom-color: {c.bg_panel};
 }}
 QScrollBar:vertical {{
     background: {c.bg};
@@ -373,7 +393,7 @@ QToolTip {{
 }}
 QGroupBox {{
     color: {c.text};
-    border: 1px solid {c.border};
+    border: 1px solid {input_border};
     border-radius: 4px;
     margin-top: 8px;
     padding-top: 8px;
@@ -433,6 +453,11 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {{
     border: none;
     background: transparent;
     margin-right: 2px;
+}}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+    background: {btn_hover};
+    border-radius: 2px;
 }}
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
     image: url({chevron_up});

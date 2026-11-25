@@ -178,7 +178,7 @@ class CreateModelDialog(QDialog):
             f"color: {t.error}; font-size: 12px; font-weight: 500;"
         )
         self._room_stub_card.setStyleSheet(
-            f"QFrame {{ background: {t.bg_panel}; border: 1px solid {t.border}; border-radius: 6px; }}"
+            f"QFrame {{ background: {t.bg_alt}; border: 1px solid {t.border}; border-radius: 6px; }}"
         )
         self._room_title.setStyleSheet(
             f"color: {t.text_title}; font-size: 14px; font-weight: 600; border: none; background: transparent;"
