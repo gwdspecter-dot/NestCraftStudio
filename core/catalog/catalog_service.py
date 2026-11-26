@@ -82,18 +82,28 @@ class CatalogService:
     def db_path(self) -> Path:
         return self._db_path
 
+    def _mat_repo(self) -> MaterialRepository:
+        if self._materials is None:
+            raise RuntimeError("CatalogService is not opened")
+        return self._materials
+
+    def _fst_repo(self) -> FastenerRepository:
+        if self._fasteners is None:
+            raise RuntimeError("CatalogService is not opened")
+        return self._fasteners
+
     # ── Materials ─────────────────────────────────────────────
 
     def get_material(self, material_id: str) -> Optional[Material]:
         if material_id in self._mat_cache:
             return self._mat_cache[material_id]
-        m = self._materials.get(material_id)
+        m = self._mat_repo().get(material_id)
         if m:
             self._mat_cache[material_id] = m
         return m
 
     def get_material_by_sku(self, sku: str) -> Optional[Material]:
-        return self._materials.get_by_sku(sku)
+        return self._mat_repo().get_by_sku(sku)
 
     def list_materials(
         self,
@@ -104,7 +114,7 @@ class CatalogService:
         group_ids: Optional[list] = None,
         active_only: bool = True,
     ) -> List[Material]:
-        return self._materials.list(
+        return self._mat_repo().list(
             material_type=material_type,
             thickness_mm=thickness_mm,
             category_id=category_id,
@@ -113,7 +123,7 @@ class CatalogService:
         )
 
     def search_materials(self, query: str) -> List[Material]:
-        return self._materials.search(query)
+        return self._mat_repo().search(query)
 
     def default_material(self) -> Material:
         """Материал по умолчанию для новых панелей (МИСТ VL 16 мм)."""
@@ -131,19 +141,19 @@ class CatalogService:
 
     def insert_material(self, m: Material) -> None:
         """Добавить материал и обновить кэш."""
-        self._materials.insert(m)
+        self._mat_repo().insert(m)
         self.commit()
         self._mat_cache[m.id] = m
 
     def update_material(self, m: Material) -> None:
         """Обновить материал и инвалидировать/обновить кэш."""
-        self._materials.update(m)
+        self._mat_repo().update(m)
         self.commit()
         self._mat_cache[m.id] = m
 
     def delete_material(self, material_id: str) -> bool:
         """Удалить материал (или деактивировать — по правилам репозитория)."""
-        ok = self._materials.delete(material_id)
+        ok = self._mat_repo().delete(material_id)
         if ok:
             self.commit()
             self._mat_cache.pop(material_id, None)
@@ -154,7 +164,7 @@ class CatalogService:
     def get_edge(self, edge_id: str) -> Optional[EdgeBand]:
         if edge_id in self._edge_cache:
             return self._edge_cache[edge_id]
-        e = self._materials.get_edge(edge_id)
+        e = self._mat_repo().get_edge(edge_id)
         if e:
             self._edge_cache[edge_id] = e
         return e
@@ -169,24 +179,24 @@ class CatalogService:
         group_ids: Optional[list] = None,
         active_only: bool = True,
     ) -> List[EdgeBand]:
-        return self._materials.list_edges(group_ids=group_ids, active_only=active_only)
+        return self._mat_repo().list_edges(group_ids=group_ids, active_only=active_only)
 
     def list_edge_bands(self, *, active_only: bool = True) -> List[EdgeBand]:
         """Алиас для list_edges."""
         return self.list_edges(active_only=active_only)
 
     def insert_edge(self, e: EdgeBand) -> None:
-        self._materials.insert_edge(e)
+        self._mat_repo().insert_edge(e)
         self.commit()
         self._edge_cache[e.id] = e
 
     def update_edge(self, e: EdgeBand) -> None:
-        self._materials.update_edge(e)
+        self._mat_repo().update_edge(e)
         self.commit()
         self._edge_cache[e.id] = e
 
     def delete_edge(self, edge_id: str) -> bool:
-        ok = self._materials.delete_edge(edge_id)
+        ok = self._mat_repo().delete_edge(edge_id)
         if ok:
             self.commit()
             self._edge_cache.pop(edge_id, None)
@@ -205,7 +215,7 @@ class CatalogService:
     def get_fastener(self, fastener_id: str) -> Optional[Fastener]:
         if fastener_id in self._fst_cache:
             return self._fst_cache[fastener_id]
-        f = self._fasteners.get(fastener_id)
+        f = self._fst_repo().get(fastener_id)
         if f:
             self._fst_cache[fastener_id] = f
         return f
@@ -216,37 +226,38 @@ class CatalogService:
         type_code: Optional[str] = None,
         active_only: bool = True,
     ) -> List[Fastener]:
-        return self._fasteners.list(type_code=type_code, active_only=active_only)
+        return self._fst_repo().list(type_code=type_code, active_only=active_only)
 
     def list_fastener_types(self) -> List[FastenerType]:
-        return self._fasteners.list_types()
+        return self._fst_repo().list_types()
 
     def default_fastener(self, type_code: str = "confirmat") -> Optional[Fastener]:
         items = self.list_fasteners(type_code=type_code)
         return items[0] if items else None
 
     def insert_fastener(self, f: Fastener) -> None:
-        self._fasteners.insert(f)
+        self._fst_repo().insert(f)
         self.commit()
         self._fst_cache[f.id] = f
 
     def update_fastener(self, f: Fastener) -> None:
-        self._fasteners.update(f)
+        self._fst_repo().update(f)
         self.commit()
         self._fst_cache[f.id] = f
 
     def delete_fastener(self, fastener_id: str) -> bool:
         """Мягкое удаление, если репозиторий поддерживает; иначе deactivate."""
+        repo = self._fst_repo()
         ok = False
-        if hasattr(self._fasteners, "delete"):
-            ok = bool(self._fasteners.delete(fastener_id))
-        elif hasattr(self._fasteners, "set_active"):
-            ok = bool(self._fasteners.set_active(fastener_id, False))
+        if hasattr(repo, "delete"):
+            ok = bool(repo.delete(fastener_id))
+        elif hasattr(repo, "set_active"):
+            ok = bool(repo.set_active(fastener_id, False))
         else:
             f = self.get_fastener(fastener_id)
             if f is not None:
                 f.is_active = False
-                self._fasteners.update(f)
+                repo.update(f)
                 ok = True
         if ok:
             self.commit()
@@ -256,36 +267,36 @@ class CatalogService:
     # ── Meta ──────────────────────────────────────────────────
 
     def list_categories(self) -> List[MaterialCategory]:
-        return self._materials.list_categories()
+        return self._mat_repo().list_categories()
 
     def list_suppliers(self) -> List[Supplier]:
-        return self._materials.list_suppliers()
+        return self._mat_repo().list_suppliers()
 
     # ── Groups tree ───────────────────────────────────────────
 
     def list_groups(self):
-        return self._materials.list_groups()
+        return self._mat_repo().list_groups()
 
     def get_group(self, group_id: str):
-        return self._materials.get_group(group_id)
+        return self._mat_repo().get_group(group_id)
 
     def insert_group(self, g) -> None:
-        self._materials.insert_group(g)
+        self._mat_repo().insert_group(g)
         self.commit()
 
     def update_group(self, g) -> None:
-        self._materials.update_group(g)
+        self._mat_repo().update_group(g)
         self.commit()
 
     def delete_group(self, group_id: str) -> bool:
-        ok = self._materials.delete_group(group_id)
+        ok = self._mat_repo().delete_group(group_id)
         if ok:
             self.commit()
             self._mat_cache.clear()
         return ok
 
     def descendant_group_ids(self, group_id: str) -> list:
-        return self._materials.descendant_group_ids(group_id)
+        return self._mat_repo().descendant_group_ids(group_id)
 
     def ensure_default_groups(self) -> None:
         """Создать стандартные группы при необходимости и привязать позиции без group_id."""

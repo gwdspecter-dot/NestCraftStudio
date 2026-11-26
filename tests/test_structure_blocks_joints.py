@@ -82,7 +82,7 @@ def test_properties_and_structure_panels_wire_embedded_views_ast():
 
 
 def test_copy_paste_loose_panel_merges_into_root_and_allows_joint():
-    from core.clipboard import capture_selection, materialize
+    from core.clipboard import capture_selection, materialize, set_anchor
     from core.issues import check_broken_joints_in_blocks
     from core.joint import JointRecord, apply_joints_in_blocks, get_joint_fastener_items
     from core.undo import PasteBlocksCommand, UndoStack
@@ -99,7 +99,8 @@ def test_copy_paste_loose_panel_merges_into_root_and_allows_joint():
     # Ctrl+C → Ctrl+V через PasteBlocksCommand
     payload = capture_selection(blocks)
     assert payload is not None
-    # Ставим копию горизонтальной полкой рядом? Сначала вставляем как свободную панель
+    set_anchor(payload, 0.0, 0.0, 0.0)
+    # Ставим копию как свободную панель
     new_blocks = materialize(payload, (100.0, 0.0, 0.0))
     assert len(new_blocks) == 1
     assert getattr(new_blocks[0], "is_root", False) is True
@@ -125,8 +126,8 @@ def test_copy_paste_loose_panel_merges_into_root_and_allows_joint():
         preset_id="confirmat_3",
     )
     root.joints.append(jr)
-    applied = apply_joints_in_blocks(blocks, rebuild_geometry=False)
-    assert applied == 1
+    issues = apply_joints_in_blocks(blocks, rebuild_geometry=False)
+    assert issues == []
     assert len(p1.holes) == 3
     assert len(p2.holes) == 3
     assert check_broken_joints_in_blocks(blocks) == []
@@ -165,8 +166,8 @@ def test_cross_block_joint_has_no_broken_issue_and_roundtrips():
     jr = JointRecord(panel_a_uid=pa.uid, panel_b_uid=pb.uid, preset_id="confirmat_3")
     b1.joints.append(jr)
 
-    applied = apply_joints_in_blocks(blocks, rebuild_geometry=False)
-    assert applied == 1
+    issues = apply_joints_in_blocks(blocks, rebuild_geometry=False)
+    assert issues == []
     assert len(pa.holes) == 3
     assert len(pb.holes) == 3
     assert check_broken_joints_in_blocks(blocks) == []
@@ -205,9 +206,9 @@ def test_cross_block_joint_has_no_broken_issue_and_roundtrips():
     # Сохранение и загрузка проекта (.b3d) сохраняют межблочный стык и флаги блоков
     from core.version import FORMAT_VERSION
 
-    data = scene_to_dict("Тест", blocks)
+    data = scene_to_dict(blocks, "Тест")
     assert data["version"] == FORMAT_VERSION
-    _name, loaded_blocks, _warnings = scene_from_dict(data)
+    _name, loaded_blocks = scene_from_dict(data)
     assert len(loaded_blocks) == 2
     assert loaded_blocks[0].is_assembly is True
     assert loaded_blocks[1].is_assembly is False
@@ -241,8 +242,8 @@ def test_cross_block_assoc_ref_works_and_roundtrips():
     )
     root.assoc_refs.append(ref)
 
-    count = apply_assoc_refs_in_blocks(blocks, rebuild_geometry=False)
-    assert count == 1
+    notes = apply_assoc_refs_in_blocks(blocks, rebuild_geometry=False)
+    assert notes == []
     assert len(pa.holes) == 1
     st = evaluate_assoc_ref(root, ref, all_blocks=blocks)
     assert st.severity == "ok"

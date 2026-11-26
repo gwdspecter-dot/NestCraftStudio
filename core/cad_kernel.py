@@ -1,6 +1,9 @@
 import math
 import threading
 
+from typing import Any
+
+np: Any
 try:
     import numpy as np
 except ImportError:  # pragma: no cover
@@ -171,9 +174,9 @@ class CADKernel:
             vx, vy = cc * vx - sc * vy, sc * vx + cc * vy
             return (vx, vy, vz)
 
-        verts = []
-        normals = []
-        tris = []
+        verts: list[tuple[float, float, float]] = []
+        normals: list[tuple[float, float, float]] = []
+        tris: list[list[int]] = []
         for corners, n in faces:
             base = len(verts)
             rn = _nrot(n[0], n[1], n[2])
@@ -264,7 +267,9 @@ class CADKernel:
             return V, T, N
 
         # Чистый fallback только при отсутствии numpy в окружении
-        V_list, T_list, N_list = [], [], []
+        V_list: list[Any] = []
+        T_list: list[tuple[int, int, int]] = []
+        N_list: list[tuple[float, float, float]] = []
         for idx_tri, (i0, i1, i2) in enumerate(tris_raw):
             p0, p1, p2 = v_tuples[i0], v_tuples[i1], v_tuples[i2]
             ux, uy, uz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
@@ -413,7 +418,7 @@ class CADKernel:
             return []
 
         solid_cache: dict = {}
-        results = []
+        results: list[tuple[Any, Any, float | None]] = []
         for idx, (i, j) in enumerate(candidates, start=1):
             p1 = panels[i]
             p2 = panels[j]

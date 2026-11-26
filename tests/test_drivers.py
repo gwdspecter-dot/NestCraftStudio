@@ -10,7 +10,7 @@ from core.drivers import (
     set_driver,
     should_persist_formula,
 )
-from core.project_io import _panel_from_dict, _panel_to_dict, migrate_project_dict
+from core.project_io import _panel_to_dict, migrate_project_dict
 from core.version import FORMAT_VERSION
 from models.panel import Block, Panel
 

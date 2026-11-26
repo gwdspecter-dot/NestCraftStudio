@@ -289,7 +289,7 @@ def pick_hole_at_ray(
 
                 screen_dist = dist_3d
                 screen_mid: tuple[float, float] | None = None
-                if use_screen:
+                if use_screen and mvp is not None and viewport is not None:
                     sp0 = _project_to_logical(p0, mvp, viewport, dpr)
                     sp1 = _project_to_logical(p1, mvp, viewport, dpr)
                     smid = _project_to_logical(mid, mvp, viewport, dpr)

@@ -1234,7 +1234,7 @@ def is_same_process(pid: int | None, expected_start: float | None) -> bool:
     Защита от переиспользования PID (ревизия 4 §1.3): чужой процесс с тем же PID
     не блокирует восстановление autosave.
     """
-    if not is_pid_running(pid):
+    if pid is None or not is_pid_running(pid):
         return False
     if expected_start is None:
         return True  # старые файлы без process_start — только PID
@@ -1337,7 +1337,8 @@ def write_autosave_snapshot(
     autosave_path: str | Path | None = None,
 ) -> Path:
     """Атомарно записывает готовый словарь-снимок автосохранения на диск (безопасно в `QRunnable`)."""
-    meta = snapshot.get("autosave_meta") if isinstance(snapshot.get("autosave_meta"), dict) else {}
+    raw_meta = snapshot.get("autosave_meta")
+    meta: dict = raw_meta if isinstance(raw_meta, dict) else {}
     target_str = str(autosave_path or meta.get("target_path") or "")
     target = Path(target_str) if target_str else autosave_file_path(pid=meta.get("pid"))
     payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
@@ -1471,7 +1472,8 @@ def load_autosave(
         fallback = Path(autosave_path) if autosave_path is not None else autosave_file_path(base_dir, pid=current_pid)
         raise FileNotFoundError(f"Файл автосохранения не найден: {fallback}")
     raw = json.loads(target.read_text(encoding="utf-8"))
-    meta = raw.get("autosave_meta") if isinstance(raw, dict) and isinstance(raw.get("autosave_meta"), dict) else {}
+    raw_meta = raw.get("autosave_meta") if isinstance(raw, dict) else None
+    meta: dict = raw_meta if isinstance(raw_meta, dict) else {}
     meta_out = dict(meta)
     meta_out["autosave_file"] = str(target)
     res = load_project(target)

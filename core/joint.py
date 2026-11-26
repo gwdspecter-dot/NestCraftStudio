@@ -15,8 +15,8 @@ _log = get_logger("joint")
 @dataclass
 class Joint:
     """Прямоугольный стык (контакт двух AABB-панелей)."""
-    panel_a: object
-    panel_b: object
+    panel_a: Any
+    panel_b: Any
     # Точка-начало стыка (мировые координаты)
     origin: np.ndarray  # shape (3,)
     # Ось скольжения крепежа (единичный)
@@ -308,7 +308,7 @@ def is_face_drilling(panel, axis: str) -> bool:
             return axis == ta_axis
     if axis in dims and abs(dims[axis] - thickness) < 1e-6:
         return True
-    min_dim_axis = min(dims, key=dims.get)
+    min_dim_axis = min(dims, key=lambda k: dims[k])
     return axis == min_dim_axis
 
 
@@ -905,9 +905,8 @@ class JointRecord:
             self.fastener_id = str(self.fastener_id).strip()
 
         if "margin" not in raw_params or raw_params["margin"] is None:
-            raw_params["margin"] = float(
-                preset.get("margin") if preset.get("margin") is not None else 50.0
-            )
+            m_val = preset.get("margin")
+            raw_params["margin"] = float(m_val) if m_val is not None else 50.0
         else:
             raw_params["margin"] = float(raw_params["margin"])
 
@@ -971,7 +970,8 @@ class JointRecord:
 
     @property
     def margin(self) -> float:
-        return float(self.params.get("margin") if self.params.get("margin") is not None else 50.0)
+        m_val = self.params.get("margin")
+        return float(m_val) if m_val is not None else 50.0
 
     @margin.setter
     def margin(self, value: float) -> None:
@@ -1019,7 +1019,8 @@ class JointRecord:
         self.preset_id = str(preset_id)
         if preset.get("fastener_id"):
             self.fastener_id = str(preset["fastener_id"])
-        self.params["margin"] = float(preset.get("margin") if preset.get("margin") is not None else 50.0)
+        m_val = preset.get("margin")
+        self.params["margin"] = float(m_val) if m_val is not None else 50.0
         p_val = preset.get("pitch")
         self.params["pitch"] = float(p_val) if p_val is not None else None
         c_val = preset.get("count")
@@ -1171,10 +1172,12 @@ def compute_joint_record_points(joint: Joint, record: JointRecord) -> list[np.nd
     params = record.params if isinstance(record.params, dict) else {}
 
     diameter = float(params.get("diameter") or preset.get("diameter") or 7.0)
+    p_margin = params.get("margin")
+    pr_margin = preset.get("margin")
     margin = (
-        float(params["margin"])
-        if params.get("margin") is not None
-        else float(preset.get("margin") if preset.get("margin") is not None else 50.0)
+        float(p_margin)
+        if p_margin is not None
+        else (float(pr_margin) if pr_margin is not None else 50.0)
     )
     pitch_val = params.get("pitch") if "pitch" in params else preset.get("pitch")
     pitch = float(pitch_val) if (pitch_val is not None and float(pitch_val) > 1e-6) else None

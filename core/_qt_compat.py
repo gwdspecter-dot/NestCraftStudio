@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 try:
-    from PyQt6.QtCore import (  # type: ignore[import]
+    from PyQt6.QtCore import (
         QObject,
         QRunnable,
         QThread,
@@ -52,10 +52,10 @@ except ImportError:  # pragma: no cover - headless
                 setattr(instance, self._attr_name, sig)
             return sig
 
-    def pyqtSignal(*types: Any) -> Any:  # type: ignore[misc]
+    def pyqtSignal(*types: Any) -> Any:  # type: ignore[no-redef]
         return HeadlessSignalDescriptor(*types)
 
-    def pyqtSlot(*_types: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def pyqtSlot(*_types: Any, **_kwargs: Any) -> Any:  # type: ignore[misc]
         def _dec(fn: Callable[..., Any]) -> Callable[..., Any]:
             return fn
 
@@ -79,13 +79,13 @@ except ImportError:  # pragma: no cover - headless
         pass
 
     class QThreadPool:  # type: ignore[no-redef]
-        _instance: "QThreadPool | None" = None
+        _instance: Any = None
 
         def __init__(self) -> None:
             pass
 
         @classmethod
-        def globalInstance(cls) -> "QThreadPool":
+        def globalInstance(cls) -> Any:
             if cls._instance is None:
                 cls._instance = cls()
             return cls._instance

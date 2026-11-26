@@ -337,7 +337,7 @@ class AssocRef:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | "AssocRef") -> "AssocRef":
-        if isinstance(data, cls):
+        if isinstance(data, AssocRef):
             return cls(
                 uid=data.uid,
                 kind=data.kind,

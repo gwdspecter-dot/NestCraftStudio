@@ -806,6 +806,7 @@ class AssocDock(QDockWidget):
     edit_assoc_requested = pyqtSignal(object, str)  # полный диалог
 
     def __init__(self, parent=None):
+        self._cached_title: str = "Ассоциации"
         super().__init__("Ассоциации", parent)
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
@@ -833,7 +834,28 @@ class AssocDock(QDockWidget):
         self.panel.assoc_deleted.connect(self.assoc_deleted.emit)
         self.panel.add_assoc_requested.connect(self.add_assoc_requested.emit)
         self.panel.edit_assoc_requested.connect(self.edit_assoc_requested.emit)
-        self.panel.title_changed.connect(self.setWindowTitle)
+        self.panel.title_changed.connect(self._on_panel_title_changed)
+
+    def _on_panel_title_changed(self, title: str) -> None:
+        self._cached_title = str(title)
+        self.setWindowTitle(self._cached_title)
+
+    @property
+    def _title(self) -> str:
+        panel = getattr(self, "panel", None)
+        if panel is not None:
+            return panel._title
+        return getattr(self, "_cached_title", "Ассоциации")
+
+    @_title.setter
+    def _title(self, value: str) -> None:
+        self._cached_title = str(value)
+        panel = getattr(self, "panel", None)
+        if panel is not None:
+            panel._title = self._cached_title
+
+    def panel_title(self) -> str:
+        return self._title
 
     @property
     def blocks_ref(self) -> list:

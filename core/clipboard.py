@@ -226,6 +226,7 @@ def _clone_block_dict(bd: dict, dx: float, dy: float, dz: float) -> Block:
     if not name.endswith(" (копия)"):
         name = f"{name} (копия)"
 
+    block: Block
     if btype == "cabinet":
         params = dict(bd.get("params") or {})
         cab = ParametricCabinet(

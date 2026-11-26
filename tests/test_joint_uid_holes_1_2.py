@@ -10,8 +10,8 @@ from core.joint import (
     tag_joint_hole,
     holes_equal,
 )
-from core.project_io import migrate_project_dict, _migrate_to_0_0_8
-from core.version import FORMAT_VERSION, version_cmp
+from core.project_io import migrate_project_dict, _migrate_to_0_0_8, version_cmp
+from core.version import FORMAT_VERSION
 
 
 def test_format_version_is_current():

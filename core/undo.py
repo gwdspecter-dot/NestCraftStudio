@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Callable
+from typing import Any, Callable
 
 from core.logging_setup import get_logger
 
@@ -180,11 +180,11 @@ class DeleteItemsCommand(Command):
         super().__init__(description)
         self.blocks = blocks
         # (index_in_blocks, block) for removed whole blocks
-        self.removed_blocks: list[tuple[int, object]] = []
+        self.removed_blocks: list[tuple[int, Any]] = []
         # (block, index_in_panels, panel)
-        self.removed_panels: list[tuple[object, int, object]] = []
+        self.removed_panels: list[tuple[Any, int, Any]] = []
         # (block, index_in_joints, joint_record)
-        self.removed_joints: list[tuple[object, int, object]] = []
+        self.removed_joints: list[tuple[Any, int, Any]] = []
 
     def capture(self) -> bool:
         """Снять снимок того, что удалится. True если есть что удалять."""
@@ -413,15 +413,15 @@ class EditPropertyCommand(Command):
         self._old_material_id = getattr(obj, "material_id", None) if attr_name == "material" else None
         self._old_color = getattr(obj, "color", None) if attr_name == "material" else None
         self._old_missing_material_id = getattr(obj, "missing_material_id", "") if attr_name == "material" else ""
-        self._new_material_id = None
-        self._new_color = None
+        self._new_material_id: str | None = None
+        self._new_color: tuple[float, float, float] | None = None
         # Словари удалённых при структурном rebuild() панелей (role -> dict) для восстановления при Undo (план §1.8)
         self._removed_panels_by_role: dict[str, dict] = {}
         # Для переключения флага «Сборочная единица» сохраняем исходные позиции блока и панелей
         self._old_block_pos_num: str = (
             str(getattr(obj, "pos_num", "") or "") if attr_name == "is_assembly" else ""
         )
-        self._old_panel_pos_nums: list[tuple[object, str]] = (
+        self._old_panel_pos_nums: list[tuple[Any, str]] = (
             [
                 (p, str(getattr(p, "pos_num", "") or ""))
                 for p in (getattr(obj, "panels", None) or [])
@@ -1150,7 +1150,7 @@ class PasteBlocksCommand(Command):
         self.blocks = blocks
         self.new_blocks = list(new_blocks)
         self._appended_blocks: list = []
-        self._merged_root_block = None
+        self._merged_root_block: Any = None
         self._created_root_block: bool = False
         self._merged_panels: list = []
         self._merged_joints: list = []
@@ -1264,10 +1264,10 @@ class CreateBlockCommand(Command):
         self.blocks = blocks
         self.name = clean_name
         self.is_assembly = bool(is_assembly)
-        self.new_block = None
+        self.new_block: Any = None
 
         # Фиксируем исходное положение каждой панели (блок, индекс, pos_num)
-        self._records: list[tuple[object, int, object, str]] = []
+        self._records: list[tuple[Any, int, Any, str]] = []
         seen_ids: set[int] = set()
         for p in panels or []:
             if p is None or id(p) in seen_ids:
@@ -1399,7 +1399,7 @@ def _clone_product_state(state: dict) -> dict:
     """Глубокая копия параметров изделия (наименование, номер заказа, габаритная рамка)."""
     from models.bounding_frame import BoundingFrame
 
-    out = {
+    out: dict[str, Any] = {
         "name": str(state.get("name", "") or ""),
         "order_number": str(state.get("order_number", "") or ""),
     }

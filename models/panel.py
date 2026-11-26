@@ -130,7 +130,11 @@ class Panel:
 
         self.material_id = str(requested_material_id or DEFAULT_MATERIAL_ID)
         self.material = str(legacy_material or DEFAULT_MATERIAL_NAME)
-        self.color = tuple(self.color) if self.color else DEFAULT_MATERIAL_COLOR
+        self.color = (
+            (float(self.color[0]), float(self.color[1]), float(self.color[2]))
+            if (self.color and len(self.color) == 3)
+            else DEFAULT_MATERIAL_COLOR
+        )
 
         dims0 = (self.width, self.height, self.depth)
         if explicit_tax is not None:
@@ -366,8 +370,14 @@ class Panel:
             uid="",  # копия — новый uid
             rebuild=False,
         )
-        p.color = tuple(self.color) if self.color else p.color
-        p.thickness_axis = int(getattr(self, "thickness_axis", p.thickness_axis))
+        p.color = (
+            (float(self.color[0]), float(self.color[1]), float(self.color[2]))
+            if (self.color and len(self.color) == 3)
+            else p.color
+        )
+        src_tax = getattr(self, "thickness_axis", None)
+        if src_tax is not None:
+            p.thickness_axis = int(src_tax)
         p.material_thickness = float(getattr(self, "material_thickness", 0.0) or 0.0)
         p.edge_thicknesses = dict(getattr(self, "edge_thicknesses", {}) or {})
         p.missing_material_id = str(getattr(self, "missing_material_id", "") or "")
@@ -384,7 +394,7 @@ class Panel:
         ctrl = self._get_controller()
         if ctrl is not None and thickness_mm is None:
             return ctrl.set_edge(self, side, edge_band_id)
-        if side in self.edges:
+        if self.edges is not None and side in self.edges:
             eid = str(edge_band_id or "")
             self.edges[side] = eid
             if not eid:
@@ -398,7 +408,7 @@ class Panel:
 
     def get_edge_thickness(self, side: str) -> float:
         """Возвращает толщину кромки в мм на указанном торце."""
-        edge_id = self.edges.get(side)
+        edge_id = self.edges.get(side) if self.edges is not None else None
         if not edge_id:
             return 0.0
         if isinstance(self.edge_thicknesses, dict) and side in self.edge_thicknesses:
@@ -576,7 +586,12 @@ class Panel:
             rebuild=False,
         )
         raw_missing = str(d.get("missing_material_id") or "").strip()
-        raw_missing_edges = d.get("missing_edges") if isinstance(d.get("missing_edges"), dict) else {}
+        raw_me_val = d.get("missing_edges")
+        raw_missing_edges: dict[str, str] = (
+            {str(k): str(v) for k, v in raw_me_val.items()}
+            if isinstance(raw_me_val, dict)
+            else {}
+        )
 
         ctrl = cls._get_controller()
         if ctrl is not None:

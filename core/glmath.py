@@ -772,7 +772,14 @@ def compute_corner_push_pull_box(
     """Вычисляет новые `(x, y, z, width, height, depth)` детали при вытягивании угла `corner = (sx, sy, sz)`
     вдоль его рабочих осей (`new_lens = {axis_idx: length}`) по тому же принципу Push-Pull, что и для граней:
     противоположные грани и противоположный угол остаются строго неподвижными в мире, без переворота бокса."""
-    cur_box = tuple(float(v) for v in orig_box)
+    cur_box: tuple[float, float, float, float, float, float] = (
+        float(orig_box[0]),
+        float(orig_box[1]),
+        float(orig_box[2]),
+        float(orig_box[3]),
+        float(orig_box[4]),
+        float(orig_box[5]),
+    )
     raw_tax = getattr(panel, "thickness_axis", -1) if panel is not None else -1
     if isinstance(raw_tax, str):
         tax = {"X": 0, "Y": 1, "Z": 2}.get(raw_tax.upper(), -1)

@@ -16,7 +16,7 @@ import ast
 import math
 import operator
 import re
-from typing import Any
+from typing import Any, Callable
 
 from core.logging_setup import get_logger
 
@@ -24,7 +24,7 @@ _log = get_logger("formula")
 _MAX_FORMULA_LEN = 200
 _DECIMAL_COMMA_RE = re.compile(r"(?<=\d),(?=\d)")
 
-_BINARY_OPS = {
+_BINARY_OPS: dict[type[ast.operator], Callable[[float, float], float]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -33,12 +33,12 @@ _BINARY_OPS = {
     ast.Mod: operator.mod,
 }
 
-_UNARY_OPS = {
+_UNARY_OPS: dict[type[ast.unaryop], Callable[[float], float]] = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
 
-_SAFE_FUNCS = {
+_SAFE_FUNCS: dict[str, Callable[..., Any]] = {
     "abs": abs,
     "round": round,
     "min": min,
@@ -100,9 +100,9 @@ def context_vars_from_object(
             except Exception as exc:  # noqa: BLE001 — граница material_thickness_mm
                 _log.debug("Не удалось получить толщину материала для контекста формулы: %s", exc)
         if "t" not in env and hasattr(obj, "thickness"):
-            t_val = getattr(obj, "thickness", None)
-            if isinstance(t_val, (int, float)) and math.isfinite(float(t_val)) and float(t_val) > 0.0:
-                env["t"] = float(t_val)
+            raw_t = getattr(obj, "thickness", None)
+            if isinstance(raw_t, (int, float)) and math.isfinite(float(raw_t)) and float(raw_t) > 0.0:
+                env["t"] = float(raw_t)
         if "t" not in env and all(k in env for k in ("w", "h", "d")):
             tax = getattr(obj, "thickness_axis", None)
             if isinstance(tax, str) and tax.upper() in ("X", "Y", "Z"):

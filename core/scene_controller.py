@@ -198,7 +198,7 @@ class SceneController:
 
     def set_edge(self, panel: Panel, side: str, edge_band_id: Optional[str]) -> bool:
         """Назначает кромку на торец ('top', 'bottom', 'left', 'right') и синхронизирует кэш толщины."""
-        if side not in panel.edges:
+        if panel.edges is None or side not in panel.edges:
             return False
         eid = str(edge_band_id or "")
         panel.edges[side] = eid
@@ -229,7 +229,7 @@ class SceneController:
 
     def get_edge_thickness(self, panel: Panel, side: str) -> float:
         """Возвращает толщину кромки в мм на указанном торце детали."""
-        edge_id = panel.edges.get(side)
+        edge_id = panel.edges.get(side) if panel.edges is not None else None
         if not edge_id:
             return 0.0
         cat = self.catalog
@@ -280,8 +280,10 @@ class SceneController:
             elif raw_missing and cat.get_material(raw_missing) is not None:
                 panel.missing_material_id = ""
 
+            edges_map = panel.edges if panel.edges is not None else {}
+            panel.edges = edges_map
             for side in _EDGE_SIDES:
-                eid = str(panel.edges.get(side) or "").strip()
+                eid = str(edges_map.get(side) or "").strip()
                 raw_me = str(raw_me_dict.get(side) or "").strip()
                 if eid:
                     eb = cat.get_edge(eid)
@@ -294,9 +296,9 @@ class SceneController:
                     eb = cat.get_edge(raw_me)
                     if eb is None:
                         panel.missing_edges[side] = raw_me
-                        panel.edges[side] = raw_me
+                        edges_map[side] = raw_me
                     else:
-                        panel.edges[side] = raw_me
+                        edges_map[side] = raw_me
                         panel.edge_thicknesses[side] = float(eb.thickness_mm)
         except Exception:
             _log.exception("Catalog check failed while syncing panel material_id=%s", req_mat)
@@ -356,10 +358,11 @@ class SceneController:
                 panel.thickness_axis = min_ax
 
         # Синхронизируем кромки, если они были переданы при создании
-        for side in _EDGE_SIDES:
-            eid = panel.edges.get(side, "")
-            if eid:
-                self.set_edge(panel, side, eid)
+        if panel.edges is not None:
+            for side in _EDGE_SIDES:
+                eid = panel.edges.get(side, "")
+                if eid:
+                    self.set_edge(panel, side, eid)
 
         if rebuild:
             self.rebuild_geometry(panel, sync=False)

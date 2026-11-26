@@ -24,6 +24,7 @@ def _detach_mesh(mesh):
     """Копия mesh в numpy/list без ссылок на OCC (безопасно между потоками)."""
     if mesh is None:
         return None
+    np: Any
     try:
         import numpy as np
     except ImportError:
@@ -111,13 +112,13 @@ def _qt_obj_alive(obj: Any) -> bool:
     if obj is None:
         return False
     try:
-        import shiboken6  # type: ignore[import]
+        import shiboken6
 
         return bool(shiboken6.isValid(obj))
     except Exception as exc:
         _log.debug("shiboken6.isValid unavailable: %s", exc)
     try:
-        from PyQt6 import sip  # type: ignore[attr-defined]
+        from PyQt6 import sip
 
         return not sip.isdeleted(obj)
     except Exception as exc:
@@ -143,6 +144,7 @@ class GeometryService(QObject):
         # Всегда parent=None: процессный синглтон не должен умирать вместе
         # с временным QApplication из GUI-тестов (иначе «wrapped C/C++ object … deleted»).
         super().__init__(None)
+        self._pool: QThreadPool | None
         if _HAS_PYQT:
             # Отдельный пул на 1 поток: OCC нельзя гонять параллельно
             self._pool = QThreadPool(self)
@@ -185,8 +187,9 @@ class GeometryService(QObject):
             inst = None
         if inst is None:
             # parent всегда None — см. __init__
-            cls._instance = GeometryService(None)
-        return cls._instance
+            inst = GeometryService(None)
+            cls._instance = inst
+        return inst
 
     @classmethod
     def reset(cls) -> None:

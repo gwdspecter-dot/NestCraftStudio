@@ -589,6 +589,7 @@ class JointsDock(QDockWidget):
     add_joint_requested = pyqtSignal()
 
     def __init__(self, parent=None):
+        self._cached_title: str = "Стыки"
         super().__init__("Стыки", parent)
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
@@ -609,7 +610,28 @@ class JointsDock(QDockWidget):
         self.panel.joint_modified.connect(self.joint_modified.emit)
         self.panel.joint_deleted.connect(self.joint_deleted.emit)
         self.panel.add_joint_requested.connect(self.add_joint_requested.emit)
-        self.panel.title_changed.connect(self.setWindowTitle)
+        self.panel.title_changed.connect(self._on_panel_title_changed)
+
+    def _on_panel_title_changed(self, title: str) -> None:
+        self._cached_title = str(title)
+        self.setWindowTitle(self._cached_title)
+
+    @property
+    def _title(self) -> str:
+        panel = getattr(self, "panel", None)
+        if panel is not None:
+            return panel._title
+        return getattr(self, "_cached_title", "Стыки")
+
+    @_title.setter
+    def _title(self, value: str) -> None:
+        self._cached_title = str(value)
+        panel = getattr(self, "panel", None)
+        if panel is not None:
+            panel._title = self._cached_title
+
+    def panel_title(self) -> str:
+        return self._title
 
     @property
     def blocks_ref(self) -> list:

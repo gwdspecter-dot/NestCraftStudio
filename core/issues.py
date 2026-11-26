@@ -55,7 +55,7 @@ def _panel_thickness_axis_name(panel) -> str:
             return ("X", "Y", "Z")[int(ta) % 3]
         except (TypeError, ValueError):
             _log.debug("Invalid thickness_axis=%r on panel, falling back to min dim", ta)
-    return min(dims, key=dims.get)
+    return min(dims, key=lambda k: dims[k])
 
 
 def _active_catalog():
