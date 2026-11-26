@@ -166,10 +166,14 @@ def test_undo_merged_shelf_reductions_restores_all_removed_shelves():
 
 def test_version_and_back_groove_without_modulo_hack(make_panel):
     """План §1.10: единый core.version и явный side в add_back_groove без x % 600."""
+    import re
+    from pathlib import Path
     from core.version import APP_VERSION, FORMAT_VERSION
     from core.project_io import FORMAT_VERSION as IO_FMT
 
-    assert APP_VERSION == "0.0.23"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", APP_VERSION)
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    assert f'version = "{APP_VERSION}"' in pyproject
     assert FORMAT_VERSION == IO_FMT
     from core.project_io import version_cmp
 

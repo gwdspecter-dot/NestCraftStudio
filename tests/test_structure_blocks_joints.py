@@ -202,9 +202,11 @@ def test_cross_block_joint_has_no_broken_issue_and_roundtrips():
     assert "Стойка" in row_txt and "Полка" in row_txt
     assert "[нет детали]" not in row_txt
 
-    # Сохранение и загрузка проекта (.b3d v0.0.12) сохраняют межблочный стык и флаги блоков
+    # Сохранение и загрузка проекта (.b3d) сохраняют межблочный стык и флаги блоков
+    from core.version import FORMAT_VERSION
+
     data = scene_to_dict("Тест", blocks)
-    assert data["version"] == "0.0.12"
+    assert data["version"] == FORMAT_VERSION
     _name, loaded_blocks, _warnings = scene_from_dict(data)
     assert len(loaded_blocks) == 2
     assert loaded_blocks[0].is_assembly is True
@@ -312,6 +314,7 @@ def test_create_block_command_assembly_flag_and_undo_redo():
 
 def test_migration_0_0_11_to_0_0_12():
     from core.project_io import migrate_project_dict
+    from core.version import FORMAT_VERSION
 
     legacy = {
         "version": "0.0.11",
@@ -323,8 +326,8 @@ def test_migration_0_0_11_to_0_0_12():
         ],
     }
     migrated, applied = migrate_project_dict(legacy)
-    assert migrated["version"] == "0.0.12"
-    assert applied == ["0.0.11 -> 0.0.12"]
+    assert migrated["version"] == FORMAT_VERSION
+    assert "0.0.11 -> 0.0.12" in applied
     blk = migrated["blocks"][0]
     assert blk["is_assembly"] is True
     assert blk["is_root"] is False

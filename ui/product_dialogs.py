@@ -12,9 +12,10 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QFrame,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -28,7 +29,9 @@ from models.bounding_frame import (
     MAX_FRAME_DIM_MM,
     validate_bounding_frame_dims,
 )
+from models.room_frame import RoomFrame
 from ui.dialogs import SmartDoubleSpinBox
+from ui.room_layout_dialog import RoomLayoutDialog, render_room_svg_icon
 from ui.theme import current_theme
 
 
@@ -61,8 +64,10 @@ class CreateModelDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Создать модель")
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(460)
         self._validated_frame: BoundingFrame | None = None
+        self._room_frame: RoomFrame | None = None
+        self._room_layout_done: bool = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
@@ -113,33 +118,61 @@ class CreateModelDialog(QDialog):
         frame_layout.addWidget(self._hint_label)
         frame_layout.addStretch(1)
 
-        # ── Вкладка 2: Планировка помещения (заглушка) ────────
+        # ── Вкладка 2: Габаритная рамка помещения ─────────────
         self._room_tab = QWidget(self.mode_tabs)
         room_layout = QVBoxLayout(self._room_tab)
-        room_layout.setContentsMargins(16, 20, 16, 20)
-        room_layout.setSpacing(8)
+        room_layout.setContentsMargins(12, 12, 12, 12)
+        room_layout.setSpacing(10)
 
-        self._room_stub_card = QFrame(self._room_tab)
-        self._room_stub_card.setFrameShape(QFrame.Shape.StyledPanel)
-        stub_inner = QVBoxLayout(self._room_stub_card)
-        stub_inner.setContentsMargins(16, 16, 16, 16)
-        stub_inner.setSpacing(6)
+        room_form = QFormLayout()
+        room_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        room_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        room_form.setHorizontalSpacing(14)
+        room_form.setVerticalSpacing(8)
 
-        self._room_title = QLabel("Планировка помещения", self._room_stub_card)
-        self._room_desc = QLabel(
-            "Режим проектирования планировки помещения находится в разработке.\n"
-            "Для создания изделия переключитесь на вкладку «Габаритная рамка».",
-            self._room_stub_card,
+        self.room_name_edit = QLineEdit("Новое помещение", self._room_tab)
+        self.room_name_edit.setPlaceholderText("Например, Кухня-гостиная")
+        room_form.addRow("Наименование:", self.room_name_edit)
+
+        self.room_order_edit = QLineEdit(default_order_number, self._room_tab)
+        self.room_order_edit.setPlaceholderText("Например, ЗАК-001 (для чертежей и обозначения)")
+        room_form.addRow("Номер заказа:", self.room_order_edit)
+
+        self._room_section_label = QLabel("Габаритная рамка помещения", self._room_tab)
+        room_form.addRow(self._room_section_label)
+
+        plan_row_widget = QWidget(self._room_tab)
+        plan_row = QHBoxLayout(plan_row_widget)
+        plan_row.setContentsMargins(0, 0, 0, 0)
+        plan_row.setSpacing(10)
+
+        self.room_layout_btn = QPushButton("Планировка помещения", plan_row_widget)
+        self.room_layout_btn.clicked.connect(self._on_open_room_layout)
+        plan_row.addWidget(self.room_layout_btn)
+
+        self._room_done_icon_label = QLabel(plan_row_widget)
+        self._room_done_icon_label.setVisible(False)
+        plan_row.addWidget(self._room_done_icon_label)
+
+        self.room_status_label = QLabel("Планировка закончена", plan_row_widget)
+        self.room_status_label.setVisible(False)
+        plan_row.addWidget(self.room_status_label)
+        plan_row.addStretch(1)
+
+        room_form.addRow("Контур помещения:", plan_row_widget)
+        room_layout.addLayout(room_form)
+
+        self._room_summary_label = QLabel(
+            "Нажмите «Планировка помещения», чтобы задать стены, углы, неровности, "
+            "проёмы и препятствия перед переходом в основную 3D-среду.",
+            self._room_tab,
         )
-        self._room_desc.setWordWrap(True)
-        stub_inner.addWidget(self._room_title)
-        stub_inner.addWidget(self._room_desc)
-
-        room_layout.addWidget(self._room_stub_card)
+        self._room_summary_label.setWordWrap(True)
+        room_layout.addWidget(self._room_summary_label)
         room_layout.addStretch(1)
 
         self.mode_tabs.addTab(self._frame_tab, "Габаритная рамка")
-        self.mode_tabs.addTab(self._room_tab, "Планировка помещения")
+        self.mode_tabs.addTab(self._room_tab, "Габаритная рамка помещения")
         self.mode_tabs.setCurrentIndex(0)
         self.mode_tabs.currentChanged.connect(self._on_mode_changed)
         root.addWidget(self.mode_tabs)
@@ -173,19 +206,21 @@ class CreateModelDialog(QDialog):
         self._frame_section_label.setStyleSheet(
             f"color: {t.heading}; font-weight: 600; padding-top: 6px;"
         )
+        self._room_section_label.setStyleSheet(
+            f"color: {t.heading}; font-weight: 600; padding-top: 6px;"
+        )
         self._hint_label.setStyleSheet(f"color: {t.text_dim}; font-size: 11px;")
+        self._room_summary_label.setStyleSheet(f"color: {t.text_dim}; font-size: 11px;")
         self._error_label.setStyleSheet(
             f"color: {t.error}; font-size: 12px; font-weight: 500;"
         )
-        self._room_stub_card.setStyleSheet(
-            f"QFrame {{ background: {t.bg_alt}; border: 1px solid {t.border}; border-radius: 6px; }}"
+        self.room_status_label.setStyleSheet(
+            f"color: {t.success}; font-size: 12px; font-weight: 600;"
         )
-        self._room_title.setStyleSheet(
-            f"color: {t.text_title}; font-size: 14px; font-weight: 600; border: none; background: transparent;"
-        )
-        self._room_desc.setStyleSheet(
-            f"color: {t.text_dim}; font-size: 12px; border: none; background: transparent;"
-        )
+        self.room_layout_btn.setIcon(render_room_svg_icon("room_plan.svg", t.text, 16))
+        self.mode_tabs.setTabIcon(1, render_room_svg_icon("room_frame.svg", t.text, 15))
+        done_ico = render_room_svg_icon("room_check_done.svg", t.success, 16)
+        self._room_done_icon_label.setPixmap(done_ico.pixmap(16, 16))
 
     def current_mode(self) -> str:
         return (
@@ -198,15 +233,47 @@ class CreateModelDialog(QDialog):
         self._error_label.setVisible(False)
         ok_btn = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
         if ok_btn is not None:
-            ok_btn.setEnabled(index == 0)
+            ok_btn.setEnabled(index == 0 or self._room_layout_done)
+
+    def _on_open_room_layout(self) -> None:
+        dlg = RoomLayoutDialog(self._room_frame, parent=self)
+        if dlg.exec():
+            self._room_frame = dlg.get_room_frame()
+            self._room_layout_done = True
+            self._room_done_icon_label.setVisible(True)
+            self.room_status_label.setVisible(True)
+            n_openings = sum(len(w.openings) for w in self._room_frame.walls)
+            self._room_summary_label.setText(
+                f"Стен: {len(self._room_frame.walls)} · "
+                f"Площадь: {self._room_frame.floor_area_m2():.2f} м² · "
+                f"Высота: {self._room_frame.ceiling_height_mm:.0f} мм · "
+                f"Проёмов: {n_openings} · Препятствий: {len(self._room_frame.obstacles)}"
+            )
+            self._error_label.setVisible(False)
+            self._on_mode_changed(self.mode_tabs.currentIndex())
 
     def _show_error(self, message: str) -> None:
         self._error_label.setText(message)
         self._error_label.setVisible(True)
 
     def _on_accept(self) -> None:
-        if self.current_mode() != self.MODE_BOUNDING_FRAME:
-            self._show_error("Режим «Планировка помещения» пока в разработке.")
+        if self.current_mode() == self.MODE_ROOM_LAYOUT:
+            name = self.room_name_edit.text().strip()
+            if not name:
+                self._show_error("Укажите наименование помещения.")
+                self.room_name_edit.setFocus()
+                return
+            if not self._room_layout_done or self._room_frame is None:
+                self._show_error("Сначала выполните планировку помещения кнопкой «Планировка помещения».")
+                return
+            try:
+                self._room_frame.validate()
+            except ValueError as exc:
+                self._show_error(str(exc))
+                return
+            self._room_frame.name = name
+            self._error_label.setVisible(False)
+            self.accept()
             return
 
         name = self.name_edit.text().strip()
@@ -230,7 +297,18 @@ class CreateModelDialog(QDialog):
         self.accept()
 
     def get_model_settings(self) -> dict:
-        """Возвращает подтверждённые настройки новой модели и габаритной рамки."""
+        """Возвращает подтверждённые настройки новой модели (изделия или помещения)."""
+        if self.current_mode() == self.MODE_ROOM_LAYOUT:
+            rf = self._room_frame.clone() if self._room_frame is not None else RoomFrame.create_rectangular()
+            name = self.room_name_edit.text().strip() or "Новое помещение"
+            rf.name = name
+            return {
+                "mode": self.MODE_ROOM_LAYOUT,
+                "name": name,
+                "order_number": self.room_order_edit.text().strip(),
+                "bounding_frame": None,
+                "room_frame": rf,
+            }
         bf = self._validated_frame
         if bf is None:
             bf = BoundingFrame(
@@ -240,10 +318,11 @@ class CreateModelDialog(QDialog):
                 visible=True,
             )
         return {
-            "mode": self.current_mode(),
+            "mode": self.MODE_BOUNDING_FRAME,
             "name": self.name_edit.text().strip() or "Новое изделие",
             "order_number": self.order_edit.text().strip(),
             "bounding_frame": bf.clone(),
+            "room_frame": None,
         }
 
 

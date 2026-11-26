@@ -279,7 +279,7 @@ def test_7_save_load_roundtrip_and_autosave_preserve_order_and_bounding_frame(tm
     )
 
     raw = json.loads(out_path.read_text(encoding="utf-8"))
-    assert raw["version"] == FORMAT_VERSION == "0.0.11"
+    assert raw["version"] == FORMAT_VERSION == "0.0.13"
     assert raw["order_number"] == "ЗАК-2026-042"
     assert raw["bounding_frame"]["width"] == 800.0
     assert raw["bounding_frame"]["visible"] is False
@@ -358,7 +358,7 @@ def test_7b_migration_0_0_10_to_0_0_11_loads_legacy_project_safely(tmp_path: Pat
     }
 
     migrated, steps = migrate_project_dict(legacy, in_place=False)
-    assert steps == ["0.0.10 -> 0.0.11"]
+    assert "0.0.10 -> 0.0.11" in steps
     assert migrated["version"] == FORMAT_VERSION
     assert migrated["order_number"] == ""
     assert migrated["bounding_frame"] is None
@@ -409,6 +409,7 @@ def test_product_dialogs_main_window_and_viewport_wiring_ast():
     dlg_classes = {n.name for n in dlg_tree.body if isinstance(n, ast.ClassDef)}
     assert {"CreateModelDialog", "ProductParamsDialog"} <= dlg_classes
     assert '"Габаритная рамка"' in dlg_src
+    assert '"Габаритная рамка помещения"' in dlg_src
     assert '"Планировка помещения"' in dlg_src
     assert '"Наименование:"' in dlg_src
     assert '"Номер заказа:"' in dlg_src
@@ -451,10 +452,10 @@ def test_create_model_and_product_params_dialogs_gui():
     dlg = CreateModelDialog()
     assert dlg.mode_tabs.count() == 2
     assert dlg.mode_tabs.tabText(0) == "Габаритная рамка"
-    assert dlg.mode_tabs.tabText(1) == "Планировка помещения"
+    assert dlg.mode_tabs.tabText(1) == "Габаритная рамка помещения"
     assert dlg.current_mode() == CreateModelDialog.MODE_BOUNDING_FRAME
 
-    # Переключение на заглушку «Планировка помещения» блокирует кнопку ОК
+    # На вкладке «Габаритная рамка помещения» ОК блокируется до завершения планировки
     ok_btn = dlg.button_box.button(QDialogButtonBox.StandardButton.Ok)
     assert ok_btn is not None and ok_btn.isEnabled()
     dlg.mode_tabs.setCurrentIndex(1)

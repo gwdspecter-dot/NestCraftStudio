@@ -107,6 +107,20 @@ import numpy as np
 import ctypes
 import math
 from models.bounding_frame import BoundingFrame
+from models.room_frame import RoomWorkspace
+from core.room_geometry import (
+    SimpleMesh,
+    WallGapReport,
+    build_floor_ceiling_meshes,
+    build_opening_visual_edges,
+    build_wall_mesh,
+    collect_room_snap_points,
+    compute_room_wall_alpha,
+    is_wall_occluding_camera,
+    product_world_corners_3d,
+    room_display_style,
+    transform_point_y,
+)
 from models.panel import (
     Block,
     Panel,
@@ -354,6 +368,8 @@ class Viewport3D(QOpenGLWidget):
     measurement_updated = pyqtSignal(str)
     hole_navigated = pyqtSignal(object, str, str, object)  # (block, kind, owner_uid, panel)
     hole_edit_requested = pyqtSignal(object, str, str, object)  # (block, kind, owner_uid, panel)
+    room_object_selected = pyqtSignal(str, str)  # (kind, uid)
+    room_product_edit_requested = pyqtSignal(str)  # product_uid
 
     def __init__(self, title="Модель"):
         super().__init__()
@@ -370,6 +386,11 @@ class Viewport3D(QOpenGLWidget):
         self.blocks: list[Block] = []
         self.bounding_frame: BoundingFrame | None = None
         self.order_number: str = ""
+        # Режим рабочего пространства: "product" (изделие) | "room" (габаритная рамка помещения)
+        self.workspace_mode: str = "product"
+        self.room_workspace: RoomWorkspace | None = None
+        self.selected_room_object: tuple[str, str] | None = None
+        self.room_gap_overlay: WallGapReport | None = None
 
         # Параметры камеры
         self.rot_x = 25.0
@@ -516,6 +537,9 @@ class Viewport3D(QOpenGLWidget):
         self._grid_count = 0
         self._line_vao = 0
         self._line_vbo = 0
+        self._room_vao = 0
+        self._room_vbo = 0
+        self._room_ebo = 0
         # stable panel._gpu_id -> {vao, vbo, ebo, count, arrays_token}
         self._panel_gpu: dict[int, dict] = {}
         # Множество _gpu_id панелей текущей сцены для O(1) проверки в _panel_belongs_here
@@ -728,6 +752,28 @@ class Viewport3D(QOpenGLWidget):
                         best_desc = desc
                 except Exception as exc:
                     _log.debug("Ошибка проекции точки привязки габаритной рамки: %s", exc)
+
+        rw = getattr(self, "room_workspace", None)
+        if getattr(self, "workspace_mode", "product") == "room" and rw is not None:
+            for item in collect_room_snap_points(rw):
+                pt, desc = item[0], item[1]
+                if plane is not None and not glmath.point_passes_clip_plane(
+                    float(pt[0]), float(pt[1]), float(pt[2]), plane
+                ):
+                    continue
+                try:
+                    wx, wy, wz = glmath.project(pt[0], pt[1], pt[2], mvp, vp)
+                    if wz < 0.0 or wz > 1.0:
+                        continue
+                    sx = wx / dpr
+                    sy = (vp[3] - wy) / dpr
+                    dist = math.hypot(sx - mx, sy - my)
+                    if dist < min_d:
+                        min_d = dist
+                        best_pt = np.asarray(pt, dtype=float).copy()
+                        best_desc = desc
+                except Exception as exc:
+                    _log.debug("Ошибка проекции точки привязки помещения: %s", exc)
 
         if best_pt is not None:
             prefix = "🧲 [Ctrl] " if is_ctrl else "🧲 "
@@ -979,6 +1025,24 @@ class Viewport3D(QOpenGLWidget):
             max_x = max(max_x, bx0, bx1)
             max_y = max(max_y, by0, by1)
             max_z = max(max_z, bz0, bz1)
+        rw = getattr(self, "room_workspace", None)
+        if getattr(self, "workspace_mode", "product") == "room" and rw is not None:
+            (rx0, ry0, rz0), (rx1, ry1, rz1) = rw.room_frame.world_aabb()
+            found = True
+            min_x = min(min_x, rx0, rx1)
+            min_y = min(min_y, ry0, ry1)
+            min_z = min(min_z, rz0, rz1)
+            max_x = max(max_x, rx0, rx1)
+            max_y = max(max_y, ry0, ry1)
+            max_z = max(max_z, rz0, rz1)
+            for prod in rw.products:
+                for px, py, pz in product_world_corners_3d(prod):
+                    min_x = min(min_x, px)
+                    min_y = min(min_y, py)
+                    min_z = min(min_z, pz)
+                    max_x = max(max_x, px)
+                    max_y = max(max_y, py)
+                    max_z = max(max_z, pz)
         if not found:
             return 300.0, 350.0, 280.0, 800.0
         cx = 0.5 * (min_x + max_x)
@@ -1172,6 +1236,19 @@ class Viewport3D(QOpenGLWidget):
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
         glBindVertexArray(0)
 
+        # Динамический меш-буфер для геометрии помещения (позиция + нормаль)
+        self._room_vao = glGenVertexArrays(1)
+        self._room_vbo = glGenBuffers(1)
+        self._room_ebo = glGenBuffers(1)
+        glBindVertexArray(self._room_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._room_vbo)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self._room_ebo)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(12))
+        glBindVertexArray(0)
+
     def _detect_stencil_buffer(self) -> bool:
         """Определяет наличие аппаратного stencil-буфера в текущем FBO (OpenGL 3.3 Core).
 
@@ -1341,13 +1418,15 @@ class Viewport3D(QOpenGLWidget):
         blocks = getattr(self, "blocks", None)
         bf = getattr(self, "bounding_frame", None)
         has_bf = bf is not None and getattr(bf, "visible", True)
+        rw = getattr(self, "room_workspace", None)
+        has_room = getattr(self, "workspace_mode", "product") == "room" and rw is not None
         panels = [
             p
             for b in (blocks or ())
             for p in getattr(b, "panels", ()) or ()
             if getattr(p, "visible", True)
         ]
-        if not panels and not has_bf:
+        if not panels and not has_bf and not has_room:
             return None
 
         extra_aabbs: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
@@ -1385,6 +1464,44 @@ class Viewport3D(QOpenGLWidget):
             sx1 = max(sx1, bmx[0])
             sy1 = max(sy1, bmx[1])
             sz1 = max(sz1, bmx[2])
+
+        if has_room and rw is not None:
+            rmn, rmx = rw.room_frame.world_aabb()
+            extra_aabbs.append((rmn, rmx))
+            sx0 = min(sx0, rmn[0])
+            sy0 = min(sy0, rmn[1])
+            sz0 = min(sz0, rmn[2])
+            sx1 = max(sx1, rmx[0])
+            sy1 = max(sy1, rmx[1])
+            sz1 = max(sz1, rmx[2])
+            for obs in rw.room_frame.obstacles:
+                if not obs.visible:
+                    continue
+                oc = self._oriented_box_corners(
+                    obs.x, obs.y, obs.z, obs.width, obs.height, obs.depth, obs.rotation_y_deg
+                )
+                ox0 = min(pt[0] for pt in oc)
+                oy0 = min(pt[1] for pt in oc)
+                oz0 = min(pt[2] for pt in oc)
+                ox1 = max(pt[0] for pt in oc)
+                oy1 = max(pt[1] for pt in oc)
+                oz1 = max(pt[2] for pt in oc)
+                extra_aabbs.append(((ox0, oy0, oz0), (ox1, oy1, oz1)))
+                sx0, sy0, sz0 = min(sx0, ox0), min(sy0, oy0), min(sz0, oz0)
+                sx1, sy1, sz1 = max(sx1, ox1), max(sy1, oy1), max(sz1, oz1)
+            for prod in rw.products:
+                if not prod.visible:
+                    continue
+                pc = product_world_corners_3d(prod)
+                px0 = min(pt[0] for pt in pc)
+                py0 = min(pt[1] for pt in pc)
+                pz0 = min(pt[2] for pt in pc)
+                px1 = max(pt[0] for pt in pc)
+                py1 = max(pt[1] for pt in pc)
+                pz1 = max(pt[2] for pt in pc)
+                extra_aabbs.append(((px0, py0, pz0), (px1, py1, pz1)))
+                sx0, sy0, sz0 = min(sx0, px0), min(sy0, py0), min(sz0, pz0)
+                sx1, sy1, sz1 = max(sx1, px1), max(sy1, py1), max(sz1, pz1)
 
         # Включаем мировые 3D-оси [0..300]^3, если они в пределах 3 м от сцены
         dx_ax = max(0.0, sx0 - 300.0, -sx1)
@@ -1663,6 +1780,13 @@ class Viewport3D(QOpenGLWidget):
         glDisable(GL_CLIP_DISTANCE0)
         self._clip_plane_active = False
 
+        if (
+            self.workspace_mode == "room"
+            and self.room_workspace is not None
+            and self.display_mode != "xray"
+        ):
+            self._draw_room_workspace()
+
         if self.bounding_frame is not None and self.bounding_frame.visible:
             self._draw_bounding_frame()
 
@@ -1790,6 +1914,642 @@ class Viewport3D(QOpenGLWidget):
         finally:
             glDepthMask(GL_TRUE)
             glDepthFunc(GL_LESS)
+
+    # ── Режим «Габаритная рамка помещения» ────────────────────────
+
+    def set_room_workspace(self, ws: RoomWorkspace | None) -> None:
+        """Активирует рабочую сцену помещения или сбрасывает в режим изделия."""
+        self.room_workspace = ws
+        self.workspace_mode = "room" if ws is not None else "product"
+        self.selected_room_object = None
+        self.room_gap_overlay = None
+        self.update()
+
+    def clear_room_workspace(self) -> None:
+        """Возвращает вьюпорт в обычный режим изделия."""
+        self.room_workspace = None
+        self.workspace_mode = "product"
+        self.selected_room_object = None
+        self.room_gap_overlay = None
+        self.update()
+
+    def set_room_selection(self, kind: str, uid: str) -> None:
+        """Синхронизирует выделенный объект помещения (стена/проём/препятствие/изделие)."""
+        k = str(kind or "").strip()
+        u = str(uid or "").strip()
+        self.selected_room_object = (k, u) if (k and u) else None
+        self.update()
+
+    def set_room_gap_overlay(self, report: WallGapReport | None) -> None:
+        """Показывает или скрывает 3D-лучи анализа зазоров между мебелью и стеной."""
+        self.room_gap_overlay = report
+        self.update()
+
+    def set_room_view_mode(self, mode: str, *, animate: bool = True) -> None:
+        """Переключает вид помещения между 2D-планом сверху и 3D-сценой без потери контекста."""
+        if str(mode).lower() == "2d":
+            self.set_Standard_view("top", animate=animate)
+        else:
+            self.set_Standard_view("iso", animate=animate)
+
+    def _ensure_room_buffers(self) -> bool:
+        if self._room_vao and self._room_vbo and self._room_ebo:
+            return True
+        if not self._gl_ready:
+            return False
+        self._room_vao = glGenVertexArrays(1)
+        self._room_vbo = glGenBuffers(1)
+        self._room_ebo = glGenBuffers(1)
+        glBindVertexArray(self._room_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._room_vbo)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self._room_ebo)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(12))
+        glBindVertexArray(0)
+        return True
+
+    def _draw_simple_mesh(
+        self,
+        mesh: SimpleMesh,
+        color: tuple[float, float, float],
+        alpha: float = 1.0,
+    ) -> None:
+        """Рендерит произвольный треугольный SimpleMesh через _prog_solid."""
+        if not mesh.vertices or not mesh.indices:
+            return
+        if not self._ensure_room_buffers():
+            return
+        n_verts = len(mesh.vertices)
+        if len(mesh.normals) != n_verts:
+            return
+        interleaved = np.empty((n_verts, 6), dtype=np.float32)
+        interleaved[:, :3] = np.asarray(mesh.vertices, dtype=np.float32)
+        interleaved[:, 3:] = np.asarray(mesh.normals, dtype=np.float32)
+        idx = np.asarray(mesh.indices, dtype=np.uint32)
+
+        glBindVertexArray(self._room_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._room_vbo)
+        glBufferData(GL_ARRAY_BUFFER, interleaved.nbytes, interleaved, GL_DYNAMIC_DRAW)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self._room_ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL_DYNAMIC_DRAW)
+
+        is_trans = float(alpha) < 0.995
+        if is_trans:
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glDepthMask(GL_FALSE)
+        else:
+            glDisable(GL_BLEND)
+            glDepthMask(GL_TRUE)
+
+        glEnable(GL_POLYGON_OFFSET_FILL)
+        glPolygonOffset(1.5, 2.0)
+        glUseProgram(self._prog_solid)
+        glUniformMatrix4fv(
+            glGetUniformLocation(self._prog_solid, "uMVP"),
+            1,
+            GL_TRUE,
+            self._mvp,
+        )
+        glUniform3f(
+            glGetUniformLocation(self._prog_solid, "uColor"),
+            float(color[0]),
+            float(color[1]),
+            float(color[2]),
+        )
+        self._apply_studio_light_uniforms(self._prog_solid)
+        self._apply_clip_plane_uniform(self._prog_solid)
+        aloc = glGetUniformLocation(self._prog_solid, "uAlpha")
+        if aloc >= 0:
+            glUniform1f(aloc, float(alpha))
+        glDrawElements(GL_TRIANGLES, int(idx.size), GL_UNSIGNED_INT, None)
+        glBindVertexArray(0)
+        glUseProgram(0)
+        glDisable(GL_POLYGON_OFFSET_FILL)
+        if is_trans:
+            glDepthMask(GL_TRUE)
+            glDisable(GL_BLEND)
+
+    @staticmethod
+    def _build_oriented_box_mesh(
+        corners: list[tuple[float, float, float]],
+    ) -> SimpleMesh:
+        """Строит SimpleMesh из 8 вершин бокса (нижние 0..3, верхние 4..7) с внешними нормалями."""
+        mesh = SimpleMesh()
+        if len(corners) != 8:
+            return mesh
+        c = corners
+        faces = [
+            (c[0], c[1], c[2], c[3]),  # низ (-Y)
+            (c[4], c[7], c[6], c[5]),  # верх (+Y)
+            (c[0], c[4], c[5], c[1]),  # зад (-Z)
+            (c[3], c[2], c[6], c[7]),  # перед (+Z)
+            (c[0], c[3], c[7], c[4]),  # лево (-X)
+            (c[1], c[5], c[6], c[2]),  # право (+X)
+        ]
+        for p0, p1, p2, p3 in faces:
+            mesh.add_quad(p0, p1, p2, p3)
+        return mesh
+
+    @staticmethod
+    def _box_wire_segments(
+        corners: list[tuple[float, float, float]],
+    ) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+        if len(corners) != 8:
+            return []
+        c = corners
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        return [(c[a], c[b]) for a, b in edges]
+
+    @staticmethod
+    def _oriented_box_corners(
+        x: float,
+        y: float,
+        z: float,
+        w: float,
+        h: float,
+        d: float,
+        rotation_y_deg: float,
+    ) -> list[tuple[float, float, float]]:
+        local = [
+            (0.0, 0.0, 0.0), (w, 0.0, 0.0), (w, 0.0, d), (0.0, 0.0, d),
+            (0.0, h, 0.0), (w, h, 0.0), (w, h, d), (0.0, h, d),
+        ]
+        return [
+            transform_point_y(lx, ly, lz, x, y, z, rotation_y_deg)
+            for lx, ly, lz in local
+        ]
+
+    def _is_room_wall_hidden_by_camera(self, rf, wall) -> bool:
+        """Возвращает True, если стена находится перед камерой и должна быть скрыта для обзора."""
+        if not getattr(rf, "auto_hide_front_walls", True):
+            return False
+        ws = self.room_workspace
+        view_mode = getattr(ws, "view_mode", "3d") if ws is not None else "3d"
+        _right, _up, fwd = self._camera_axes()
+        return is_wall_occluding_camera(
+            rf,
+            wall,
+            (float(fwd[0]), float(fwd[1]), float(fwd[2])),
+            view_mode=view_mode,
+        )
+
+    def _collect_room_render_data(self) -> dict | None:
+        """Собирает 3D-сетки и контурные рёбра помещения с учётом скрытых перед камерой стен."""
+        ws = self.room_workspace
+        if ws is None:
+            return None
+        rf = ws.room_frame
+        sel_kind, sel_uid = self.selected_room_object or ("", "")
+
+        floor_mesh, ceiling_mesh = build_floor_ceiling_meshes(rf)
+        floor_edges: list[tuple[float, float, float]] = []
+        if rf.show_floor and floor_mesh.edges:
+            for a, b in floor_mesh.edges:
+                floor_edges.append(a)
+                floor_edges.append(b)
+
+        wall_meshes: list[tuple[SimpleMesh, bool]] = []
+        opening_meshes: list[SimpleMesh] = []
+        wall_edges_normal: list[tuple[float, float, float]] = []
+        wall_edges_sel: list[tuple[float, float, float]] = []
+        dev_markers: list[tuple[float, float, float]] = []
+        opening_edges_all: list[tuple[float, float, float]] = []
+
+        if rf.show_walls:
+            for wall in rf.walls:
+                if not wall.visible or self._is_room_wall_hidden_by_camera(rf, wall):
+                    continue
+                is_sel = sel_kind == "wall" and sel_uid == wall.uid
+                w_mesh = build_wall_mesh(rf, wall)
+                wall_meshes.append((w_mesh, is_sel))
+
+                tgt_list = wall_edges_sel if is_sel else wall_edges_normal
+                for a, b in w_mesh.edges:
+                    tgt_list.append(a)
+                    tgt_list.append(b)
+
+                info = rf.wall_geometry(wall)
+                y0 = rf.floor_elevation_mm
+                sx, sz = info.start_xz
+                tx, tz = info.tangent_xz
+                inx, inz = info.inward_normal_xz
+                for st in wall.deviation_stations:
+                    base_x = sx + tx * st.s_mm
+                    base_z = sz + tz * st.s_mm
+                    py = y0 + st.height_mm
+                    tip_x = base_x + inx * st.offset_mm
+                    tip_z = base_z + inz * st.offset_mm
+                    dev_markers.append((base_x, py, base_z))
+                    dev_markers.append((tip_x, py, tip_z))
+                    dev_markers.append((tip_x, py - 25.0, tip_z))
+                    dev_markers.append((tip_x, py + 25.0, tip_z))
+
+                if rf.show_openings:
+                    for op in wall.openings:
+                        op_edges, op_mesh = build_opening_visual_edges(rf, wall, op)
+                        if op_mesh.vertices:
+                            opening_meshes.append(op_mesh)
+                        for a, b in op_edges:
+                            opening_edges_all.append(a)
+                            opening_edges_all.append(b)
+
+        obstacle_meshes: list[tuple[SimpleMesh, bool]] = []
+        obs_edges_norm: list[tuple[float, float, float]] = []
+        obs_edges_sel: list[tuple[float, float, float]] = []
+        obs_clear_edges: list[tuple[float, float, float]] = []
+        if rf.show_obstacles:
+            for obs in rf.obstacles:
+                if not obs.visible:
+                    continue
+                is_sel = sel_kind == "obstacle" and sel_uid == obs.uid
+                corners = self._oriented_box_corners(
+                    obs.x, obs.y, obs.z, obs.width, obs.height, obs.depth, obs.rotation_y_deg
+                )
+                obstacle_meshes.append((self._build_oriented_box_mesh(corners), is_sel))
+                tgt = obs_edges_sel if is_sel else obs_edges_norm
+                for a, b in self._box_wire_segments(corners):
+                    tgt.append(a)
+                    tgt.append(b)
+                if obs.clearance_mm > 0.5:
+                    c_mm = obs.clearance_mm
+                    cx, cy, cz = transform_point_y(
+                        -c_mm, 0.0, -c_mm, obs.x, max(rf.floor_elevation_mm, obs.y - c_mm), obs.z, obs.rotation_y_deg
+                    )
+                    c_corners = self._oriented_box_corners(
+                        cx,
+                        cy,
+                        cz,
+                        obs.width + 2.0 * c_mm,
+                        obs.height + 2.0 * c_mm,
+                        obs.depth + 2.0 * c_mm,
+                        obs.rotation_y_deg,
+                    )
+                    for a, b in self._box_wire_segments(c_corners):
+                        obs_clear_edges.append(a)
+                        obs_clear_edges.append(b)
+
+        product_panel_meshes: list[tuple[SimpleMesh, tuple[float, float, float]]] = []
+        product_empty_meshes: list[tuple[SimpleMesh, bool]] = []
+        prod_edges_norm: list[tuple[float, float, float]] = []
+        prod_edges_sel: list[tuple[float, float, float]] = []
+        prod_panel_edges: list[tuple[float, float, float]] = []
+        if rf.show_furniture:
+            for prod in ws.products:
+                if not prod.visible:
+                    continue
+                is_sel = sel_kind == "product" and sel_uid == prod.uid
+                bf_corners = product_world_corners_3d(prod)
+                has_panels = False
+                for bdict in prod.blocks_data or []:
+                    for pdict in bdict.get("panels", []) or []:
+                        has_panels = True
+                        px = float(pdict.get("x", 0.0))
+                        py = float(pdict.get("y", 0.0))
+                        pz = float(pdict.get("z", 0.0))
+                        pw = float(pdict.get("width", 16.0))
+                        ph = float(pdict.get("height", 100.0))
+                        pd = float(pdict.get("depth", 100.0))
+                        local_c = [
+                            (px, py, pz), (px + pw, py, pz),
+                            (px + pw, py, pz + pd), (px, py, pz + pd),
+                            (px, py + ph, pz), (px + pw, py + ph, pz),
+                            (px + pw, py + ph, pz + pd), (px, py + ph, pz + pd),
+                        ]
+                        wc = [
+                            transform_point_y(lx, ly, lz, prod.x, prod.y, prod.z, prod.rotation_y_deg)
+                            for lx, ly, lz in local_c
+                        ]
+                        p_col = pdict.get("color", [0.85, 0.78, 0.65])
+                        rgb = (
+                            (0.95, 0.72, 0.56)
+                            if is_sel
+                            else (float(p_col[0]), float(p_col[1]), float(p_col[2]))
+                        )
+                        product_panel_meshes.append((self._build_oriented_box_mesh(wc), rgb))
+                        for a, b in self._box_wire_segments(wc):
+                            prod_panel_edges.append(a)
+                            prod_panel_edges.append(b)
+
+                if not has_panels:
+                    product_empty_meshes.append((self._build_oriented_box_mesh(bf_corners), is_sel))
+
+                tgt = prod_edges_sel if is_sel else prod_edges_norm
+                for a, b in self._box_wire_segments(bf_corners):
+                    tgt.append(a)
+                    tgt.append(b)
+
+        return {
+            "rf": rf,
+            "floor_mesh": floor_mesh,
+            "ceiling_mesh": ceiling_mesh,
+            "floor_edges": floor_edges,
+            "wall_meshes": wall_meshes,
+            "opening_meshes": opening_meshes,
+            "wall_edges_normal": wall_edges_normal,
+            "wall_edges_sel": wall_edges_sel,
+            "dev_markers": dev_markers,
+            "opening_edges_all": opening_edges_all,
+            "obstacle_meshes": obstacle_meshes,
+            "obs_edges_norm": obs_edges_norm,
+            "obs_edges_sel": obs_edges_sel,
+            "obs_clear_edges": obs_clear_edges,
+            "product_panel_meshes": product_panel_meshes,
+            "product_empty_meshes": product_empty_meshes,
+            "prod_edges_norm": prod_edges_norm,
+            "prod_edges_sel": prod_edges_sel,
+            "prod_panel_edges": prod_panel_edges,
+        }
+
+    def _draw_room_edge_batches(self, data: dict, *, hidden_pass: bool = False) -> None:
+        """Рисует пакет контуров помещения внутри активного ``_begin_line_batch()``."""
+        if hidden_pass:
+            # Скрытые рёбра в режиме X-Ray — светло-серые (как у панелей)
+            hid_norm = (0.74, 0.75, 0.78)
+            hid_sel = (0.92, 0.66, 0.50)
+            if data["floor_edges"]:
+                self._draw_lines(np.asarray(data["floor_edges"], dtype=np.float32), (0.80, 0.81, 0.84))
+            if data["wall_edges_normal"]:
+                self._draw_lines(np.asarray(data["wall_edges_normal"], dtype=np.float32), hid_norm)
+            if data["wall_edges_sel"]:
+                self._draw_lines(np.asarray(data["wall_edges_sel"], dtype=np.float32), hid_sel)
+            if data["opening_edges_all"]:
+                self._draw_lines(np.asarray(data["opening_edges_all"], dtype=np.float32), (0.64, 0.78, 0.88))
+            if data["obs_edges_norm"]:
+                self._draw_lines(np.asarray(data["obs_edges_norm"], dtype=np.float32), (0.80, 0.72, 0.66))
+            if data["obs_edges_sel"]:
+                self._draw_lines(np.asarray(data["obs_edges_sel"], dtype=np.float32), hid_sel)
+            if data["prod_panel_edges"]:
+                self._draw_lines(np.asarray(data["prod_panel_edges"], dtype=np.float32), (0.72, 0.72, 0.74))
+            if data["prod_edges_norm"]:
+                self._draw_lines(np.asarray(data["prod_edges_norm"], dtype=np.float32), (0.64, 0.80, 0.86))
+            if data["prod_edges_sel"]:
+                self._draw_lines(np.asarray(data["prod_edges_sel"], dtype=np.float32), hid_sel)
+            return
+
+        # Видимые рёбра (твёрдотельный, каркас и видимый проход X-Ray)
+        is_wire_or_xray = room_display_style(
+            self.display_mode, wireframe_only=bool(self.wireframe_only)
+        ) in ("wireframe", "xray")
+        wall_col = (0.16, 0.18, 0.22) if is_wire_or_xray else (0.32, 0.36, 0.42)
+        if is_wire_or_xray and data["floor_edges"]:
+            self._draw_lines(np.asarray(data["floor_edges"], dtype=np.float32), (0.42, 0.45, 0.50))
+        if data["wall_edges_normal"]:
+            self._draw_lines(np.asarray(data["wall_edges_normal"], dtype=np.float32), wall_col)
+        if data["wall_edges_sel"]:
+            self._draw_lines(np.asarray(data["wall_edges_sel"], dtype=np.float32), (0.90, 0.42, 0.08))
+        if data["dev_markers"]:
+            self._draw_lines(np.asarray(data["dev_markers"], dtype=np.float32), (0.88, 0.50, 0.06))
+        if data["opening_edges_all"]:
+            self._draw_lines(np.asarray(data["opening_edges_all"], dtype=np.float32), (0.14, 0.52, 0.76))
+        if data["obs_edges_norm"]:
+            self._draw_lines(np.asarray(data["obs_edges_norm"], dtype=np.float32), (0.58, 0.30, 0.14))
+        if data["obs_edges_sel"]:
+            self._draw_lines(np.asarray(data["obs_edges_sel"], dtype=np.float32), (0.95, 0.28, 0.10))
+        if data["obs_clear_edges"]:
+            self._draw_lines(np.asarray(data["obs_clear_edges"], dtype=np.float32), (0.90, 0.48, 0.14))
+        if data["prod_panel_edges"]:
+            self._draw_lines(np.asarray(data["prod_panel_edges"], dtype=np.float32), (0.15, 0.15, 0.17))
+        if data["prod_edges_norm"]:
+            self._draw_lines(np.asarray(data["prod_edges_norm"], dtype=np.float32), (0.04, 0.54, 0.72))
+        if data["prod_edges_sel"]:
+            self._draw_lines(np.asarray(data["prod_edges_sel"], dtype=np.float32), (0.95, 0.38, 0.06))
+
+        rep = self.room_gap_overlay
+        if rep is not None and rep.samples:
+            for smp in rep.samples:
+                if smp.status == "collision":
+                    g_col = (0.95, 0.12, 0.12)
+                elif smp.status == "excess_gap":
+                    g_col = (0.92, 0.56, 0.08)
+                else:
+                    g_col = (0.12, 0.66, 0.30)
+                self._draw_lines(
+                    np.asarray([smp.furniture_point, smp.wall_point], dtype=np.float32),
+                    g_col,
+                )
+
+    def _draw_room_workspace(self) -> None:
+        """Отрисовка помещения в твёрдотельном и каркасном режимах (X-Ray выполняется в _draw_scene_xray)."""
+        data = self._collect_room_render_data()
+        if data is None:
+            return
+        rf = data["rf"]
+        style = room_display_style(self.display_mode, wireframe_only=bool(self.wireframe_only))
+
+        if style == "solid":
+            wall_alpha = compute_room_wall_alpha(
+                self.display_mode,
+                wireframe_only=bool(self.wireframe_only),
+                walls_translucent=bool(rf.walls_translucent),
+                custom_alpha=float(rf.walls_alpha),
+            )
+            translucent_meshes: list[tuple[SimpleMesh, tuple[float, float, float], float]] = []
+
+            # 1. Непрозрачные объекты (пол, панели размещённой мебели, непрозрачные стены)
+            if rf.show_floor and data["floor_mesh"].vertices:
+                self._draw_simple_mesh(data["floor_mesh"], (0.91, 0.90, 0.87), alpha=1.0)
+            for p_mesh, rgb in data["product_panel_meshes"]:
+                self._draw_simple_mesh(p_mesh, rgb, alpha=1.0)
+            for w_mesh, is_sel in data["wall_meshes"]:
+                w_col = (0.88, 0.78, 0.64) if is_sel else (0.84, 0.86, 0.89)
+                if wall_alpha >= 0.999:
+                    self._draw_simple_mesh(w_mesh, w_col, alpha=1.0)
+                else:
+                    translucent_meshes.append((w_mesh, w_col, wall_alpha))
+
+            # 2. Полупрозрачные объекты (строго после непрозрачных)
+            for o_mesh, is_sel in data["obstacle_meshes"]:
+                o_col = (0.94, 0.62, 0.34) if is_sel else (0.76, 0.56, 0.42)
+                translucent_meshes.append((o_mesh, o_col, 0.92))
+            for bf_mesh, is_sel in data["product_empty_meshes"]:
+                fill_col = (0.30, 0.62, 0.90) if is_sel else (0.48, 0.72, 0.86)
+                translucent_meshes.append((bf_mesh, fill_col, 0.28 if is_sel else 0.16))
+            for op_mesh in data["opening_meshes"]:
+                op_alpha = min(0.55, max(0.18, wall_alpha * 0.75)) if wall_alpha < 0.999 else 0.55
+                translucent_meshes.append((op_mesh, (0.64, 0.76, 0.88), op_alpha))
+            if rf.show_ceiling and data["ceiling_mesh"].vertices:
+                translucent_meshes.append((data["ceiling_mesh"], (0.93, 0.94, 0.96), 0.35))
+
+            for t_mesh, t_col, t_alpha in translucent_meshes:
+                self._draw_simple_mesh(t_mesh, t_col, alpha=t_alpha)
+
+        # В каркасном режиме (style == "wireframe") заливки пропускаются — остаются только контуры, как у панелей
+        glDepthFunc(GL_LEQUAL)
+        self._begin_line_batch()
+        try:
+            self._draw_room_edge_batches(data, hidden_pass=False)
+        finally:
+            self._flush_line_batch()
+        glDepthFunc(GL_LESS)
+
+    def _pick_room_object_raycast(self, mouse_x: int, mouse_y: int) -> tuple[str, str] | None:
+        """Выбор размещённого изделия, препятствия или стены лучом из камеры."""
+        ws = self.room_workspace
+        if ws is None:
+            return None
+        rf = ws.room_frame
+        origin, ray_dir = self._mouse_ray(mouse_x, mouse_y)
+        best_hit: tuple[str, str] | None = None
+        best_t = float("inf")
+
+        # 1. Приоритет — размещённые изделия
+        if rf.show_furniture:
+            for prod in ws.products:
+                if not prod.visible:
+                    continue
+                rad = math.radians(-prod.rotation_y_deg)
+                ca, sa = math.cos(rad), math.sin(rad)
+                ox, oy, oz = float(origin[0]) - prod.x, float(origin[1]) - prod.y, float(origin[2]) - prod.z
+                dx, dy, dz = float(ray_dir[0]), float(ray_dir[1]), float(ray_dir[2])
+                l_orig = np.array([ox * ca + oz * sa, oy, -ox * sa + oz * ca], dtype=float)
+                l_dir = np.array([dx * ca + dz * sa, dy, -dx * sa + dz * ca], dtype=float)
+                (bx0, by0, bz0), (bx1, by1, bz1) = prod.bounding_frame.world_aabb()
+                t = self._intersect_ray_aabb(
+                    l_orig,
+                    l_dir,
+                    np.array([bx0, by0, bz0], dtype=float),
+                    np.array([bx1, by1, bz1], dtype=float),
+                )
+                if t is not None and t < best_t:
+                    best_t = t
+                    best_hit = ("product", prod.uid)
+
+        if best_hit is not None:
+            return best_hit
+
+        # 2. Препятствия
+        if rf.show_obstacles:
+            for obs in rf.obstacles:
+                if not obs.visible:
+                    continue
+                rad = math.radians(-obs.rotation_y_deg)
+                ca, sa = math.cos(rad), math.sin(rad)
+                ox, oy, oz = float(origin[0]) - obs.x, float(origin[1]) - obs.y, float(origin[2]) - obs.z
+                dx, dy, dz = float(ray_dir[0]), float(ray_dir[1]), float(ray_dir[2])
+                l_orig = np.array([ox * ca + oz * sa, oy, -ox * sa + oz * ca], dtype=float)
+                l_dir = np.array([dx * ca + dz * sa, dy, -dx * sa + dz * ca], dtype=float)
+                t = self._intersect_ray_aabb(
+                    l_orig,
+                    l_dir,
+                    np.array([0.0, 0.0, 0.0], dtype=float),
+                    np.array([obs.width, obs.height, obs.depth], dtype=float),
+                )
+                if t is not None and t < best_t:
+                    best_t = t
+                    best_hit = ("obstacle", obs.uid)
+
+        if best_hit is not None:
+            return best_hit
+
+        # 3. Стены (скрытые перед камерой пропускаем, чтобы клик проходил к мебели)
+        if rf.show_walls:
+            for wall in rf.walls:
+                if not wall.visible or self._is_room_wall_hidden_by_camera(rf, wall):
+                    continue
+                info = rf.wall_geometry(wall)
+                sx, sz = info.start_xz
+                tx, tz = info.tangent_xz
+                inx, inz = info.inward_normal_xz
+                ox = float(origin[0]) - sx
+                oy = float(origin[1]) - rf.floor_elevation_mm
+                oz = float(origin[2]) - sz
+                dx, dy, dz = float(ray_dir[0]), float(ray_dir[1]), float(ray_dir[2])
+                lu = ox * tx + oz * tz
+                lv = ox * inx + oz * inz
+                du = dx * tx + dz * tz
+                dv = dx * inx + dz * inz
+                t = self._intersect_ray_aabb(
+                    np.array([lu, oy, lv], dtype=float),
+                    np.array([du, dy, dv], dtype=float),
+                    np.array([0.0, 0.0, -wall.thickness_mm], dtype=float),
+                    np.array([info.length_mm, wall.height_mm, 10.0], dtype=float),
+                )
+                if t is not None and t < best_t:
+                    best_t = t
+                    best_hit = ("wall", wall.uid)
+
+        return best_hit
+
+    def _draw_room_hud_overlay(self, painter: QPainter) -> None:
+        """Подписи стен (в 2D-плане), наименования изделий и значения зазоров."""
+        ws = self.room_workspace
+        if ws is None:
+            return
+        t = current_theme()
+        dpr = float(self.devicePixelRatioF())
+        vp = self._vp_size
+        mvp = self._mvp
+        rf = ws.room_frame
+
+        font = QFont(painter.font())
+        font.setPointSize(9)
+        painter.setFont(font)
+
+        def _proj(x: float, y: float, z: float) -> tuple[float, float] | None:
+            try:
+                wx, wy, wz = glmath.project(x, y, z, mvp, vp)
+                if wz < 0.0 or wz > 1.0:
+                    return None
+                return wx / dpr, (vp[3] - wy) / dpr
+            except Exception as exc:
+                _log.debug("Ошибка проекции подписи помещения: %s", exc)
+                return None
+
+        # В 2D-плане сверху подписываем длины стен и углы при вершинах
+        if self.is_ortho and self.view_name == "top" and rf.show_walls:
+            for wall in rf.walls:
+                if not wall.visible:
+                    continue
+                info = rf.wall_geometry(wall)
+                mx = 0.5 * (info.start_xz[0] + info.end_xz[0])
+                mz = 0.5 * (info.start_xz[1] + info.end_xz[1])
+                sp = _proj(mx, rf.floor_elevation_mm + wall.height_mm, mz)
+                if sp is not None:
+                    label = f"{wall.name}: {info.length_mm:.0f} мм"
+                    painter.setPen(QColor(t.text))
+                    painter.drawText(int(sp[0]) - 36, int(sp[1]) - 6, label)
+
+                ang = info.interior_angle_start_deg
+                vp_pt = _proj(info.start_xz[0], rf.floor_elevation_mm + wall.height_mm, info.start_xz[1])
+                if vp_pt is not None:
+                    non90 = abs(ang - 90.0) > 0.25
+                    painter.setPen(QColor(t.warning if non90 else t.text_dim))
+                    painter.drawText(int(vp_pt[0]) + 6, int(vp_pt[1]) + 12, f"{ang:.1f}°")
+
+        # Подписи размещённой мебели
+        if rf.show_furniture:
+            for prod in ws.products:
+                if not prod.visible:
+                    continue
+                corners = product_world_corners_3d(prod)
+                cx = sum(p[0] for p in corners) / max(1, len(corners))
+                top_y = max(p[1] for p in corners) + 30.0
+                cz = sum(p[2] for p in corners) / max(1, len(corners))
+                sp = _proj(cx, top_y, cz)
+                if sp is not None:
+                    is_sel = self.selected_room_object == ("product", prod.uid)
+                    painter.setPen(QColor(t.accent if is_sel else t.text))
+                    painter.drawText(int(sp[0]) - 40, int(sp[1]), prod.name)
+
+        # Значения зазоров из отчёта анализа прилегания
+        rep = self.room_gap_overlay
+        if rep is not None and rep.samples:
+            for smp in rep.samples:
+                mx = 0.5 * (smp.furniture_point[0] + smp.wall_point[0])
+                my = 0.5 * (smp.furniture_point[1] + smp.wall_point[1])
+                mz = 0.5 * (smp.furniture_point[2] + smp.wall_point[2])
+                sp = _proj(mx, my, mz)
+                if sp is not None:
+                    col = t.error if smp.status == "collision" else (t.warning if smp.status == "excess_gap" else t.success)
+                    painter.setPen(QColor(col))
+                    painter.drawText(int(sp[0]) + 4, int(sp[1]) - 4, f"{smp.gap_mm:.1f} мм")
 
     def draw_axes(self):
         pts = np.array([
@@ -2527,8 +3287,8 @@ class Viewport3D(QOpenGLWidget):
 
     def _draw_scene_xray(self):
         """
-        Прозрачный вид со скрытыми рёбрами:
-        1) depth-prepass по заливам
+        Прозрачный вид со скрытыми рёбрами (единый для панелей и помещения):
+        1) depth-prepass по заливам панелей и стен/пола/препятствий/мебели помещения
         2) скрытые рёбра (за геометрией) — светло-серые
         3) видимые рёбра — тёмно-серые / чёрные
         """
@@ -2537,8 +3297,14 @@ class Viewport3D(QOpenGLWidget):
             for panel in block.panels:
                 panels.append((panel, panel.selected or block.selected))
 
+        room_data = (
+            self._collect_room_render_data()
+            if self.workspace_mode == "room" and self.room_workspace is not None
+            else None
+        )
+
         try:
-            # --- 1. Depth only ---
+            # --- 1. Depth only (панели + геометрия помещения в едином буфере глубины) ---
             glDisable(GL_BLEND)
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
             glDepthMask(GL_TRUE)
@@ -2546,9 +3312,19 @@ class Viewport3D(QOpenGLWidget):
             glDepthFunc(GL_LESS)
             for p, sel in panels:
                 self._draw_panel_solid(p, sel, alpha=1.0)
+            if room_data is not None:
+                rf = room_data["rf"]
+                if rf.show_floor and room_data["floor_mesh"].vertices:
+                    self._draw_simple_mesh(room_data["floor_mesh"], (1.0, 1.0, 1.0), alpha=1.0)
+                for w_mesh, _is_sel in room_data["wall_meshes"]:
+                    self._draw_simple_mesh(w_mesh, (1.0, 1.0, 1.0), alpha=1.0)
+                for o_mesh, _is_sel in room_data["obstacle_meshes"]:
+                    self._draw_simple_mesh(o_mesh, (1.0, 1.0, 1.0), alpha=1.0)
+                for p_mesh, _rgb in room_data["product_panel_meshes"]:
+                    self._draw_simple_mesh(p_mesh, (1.0, 1.0, 1.0), alpha=1.0)
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
 
-            # --- 2. Hidden edges (behind surface) — grey ---
+            # --- 2. Hidden edges (behind surface) — light grey ---
             glDepthFunc(GL_GREATER)
             glDepthMask(GL_FALSE)
             self._begin_line_batch()
@@ -2556,6 +3332,8 @@ class Viewport3D(QOpenGLWidget):
                 for p, sel in panels:
                     hidden = (0.90, 0.55, 0.52) if sel else (0.72, 0.72, 0.74)
                     self._draw_panel_edges(p, hidden, include_features=True)
+                if room_data is not None:
+                    self._draw_room_edge_batches(room_data, hidden_pass=True)
             finally:
                 self._flush_line_batch()
 
@@ -2566,6 +3344,8 @@ class Viewport3D(QOpenGLWidget):
                 for p, sel in panels:
                     vis = (0.85, 0.15, 0.12) if sel else (0.12, 0.12, 0.14)
                     self._draw_panel_edges(p, vis, include_features=True)
+                if room_data is not None:
+                    self._draw_room_edge_batches(room_data, hidden_pass=False)
             finally:
                 self._flush_line_batch()
         finally:
@@ -3475,6 +4255,18 @@ class Viewport3D(QOpenGLWidget):
                     if glmath.point_passes_clip_plane(float(item[0][0]), float(item[0][1]), float(item[0][2]), plane)
                 ]
             candidates.extend(bf_pts)
+        rw = getattr(self, "room_workspace", None)
+        if getattr(self, "workspace_mode", "product") == "room" and rw is not None:
+            rw_pts = [
+                (np.asarray(pt, dtype=float), desc, kind, owner, meta)
+                for pt, desc, kind, owner, meta in collect_room_snap_points(rw)
+            ]
+            if plane is not None:
+                rw_pts = [
+                    item for item in rw_pts
+                    if glmath.point_passes_clip_plane(float(item[0][0]), float(item[0][1]), float(item[0][2]), plane)
+                ]
+            candidates.extend(rw_pts)
         return candidates
 
     def _find_nearest_snap_point(self, mx: int, my: int, max_dist_px: float = 24.0, ctrl_boost: bool = False):
@@ -6054,6 +6846,29 @@ class Viewport3D(QOpenGLWidget):
                     self.is_dragging = False
                     return
 
+                # В режиме помещения можно напрямую конструировать и выделять панели,
+                # а если клик не попал по панели — выделяем объект помещения (изделие/препятствие/стену)
+                if (
+                    self.workspace_mode == "room"
+                    and self.room_workspace is not None
+                    and clicked_panel is None
+                ):
+                    for b in self.blocks:
+                        b.selected = False
+                        for p in b.panels:
+                            p.selected = False
+                    self._active_hole_owner = None
+                    room_hit = self._pick_room_object_raycast(event.pos().x(), event.pos().y())
+                    self.selected_room_object = room_hit
+                    if room_hit is not None:
+                        self.room_object_selected.emit(room_hit[0], room_hit[1])
+                    else:
+                        self.room_object_selected.emit("", "")
+                    self.is_dragging = False
+                    self.update()
+                    return
+
+                self.selected_room_object = None
                 self._active_hole_owner = None
                 shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
 
@@ -6076,16 +6891,22 @@ class Viewport3D(QOpenGLWidget):
         self.is_dragging = False
 
     def mouseDoubleClickEvent(self, event):
-        """Двойной клик ЛКМ по отверстию в 3D — переход к породившему стыку или ассоциации."""
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and self._can_pick_hole_in_current_mode()
-            and self._viewcube_hover is None
-        ):
-            hit = self.pick_hole_at_screen(event.pos().x(), event.pos().y())
-            if hit is not None:
-                self._navigate_to_hole_hit(hit)
-                return
+        """Двойной клик ЛКМ: по отверстию панели — переход к стыку; в помещении по изделию — редактировать изделие."""
+        if event.button() == Qt.MouseButton.LeftButton and self._viewcube_hover is None:
+            if self._can_pick_hole_in_current_mode():
+                hole_hit = self.pick_hole_at_screen(event.pos().x(), event.pos().y())
+                if hole_hit is not None:
+                    self._navigate_to_hole_hit(hole_hit)
+                    return
+            if self.workspace_mode == "room" and self.room_workspace is not None:
+                self._sync_viewport_matrices()
+                hit = self._pick_room_object_raycast(event.pos().x(), event.pos().y())
+                if hit is not None and hit[0] == "product":
+                    self.selected_room_object = hit
+                    self.room_object_selected.emit(hit[0], hit[1])
+                    self.room_product_edit_requested.emit(hit[1])
+                    self.update()
+                    return
         super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event):
@@ -6115,6 +6936,9 @@ class Viewport3D(QOpenGLWidget):
 
         if self._hovered_hole is not None and self._can_pick_hole_in_current_mode():
             self._draw_hole_hover_overlay(painter)
+
+        if self.workspace_mode == "room" and self.room_workspace is not None:
+            self._draw_room_hud_overlay(painter)
 
         try:
             from ui.viewcube import draw_viewcube

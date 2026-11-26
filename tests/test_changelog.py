@@ -40,9 +40,10 @@ def test_markdown_to_html():
 
 def test_load_real_changelog():
     from core.changelog import load_changelog
+    from core.version import APP_VERSION
     entries = load_changelog()
     assert entries
-    assert entries[0].version == "0.0.23"
+    assert entries[0].version == APP_VERSION
 
 
 def test_load_real_release_notes_and_merge():

@@ -11,11 +11,11 @@ from core.joint import (
     holes_equal,
 )
 from core.project_io import migrate_project_dict, _migrate_to_0_0_8
-from core.version import FORMAT_VERSION
+from core.version import FORMAT_VERSION, version_cmp
 
 
 def test_format_version_is_current():
-    assert FORMAT_VERSION == "0.0.11"
+    assert version_cmp(FORMAT_VERSION, "0.0.11") >= 0
 
 
 def test_tag_and_extract_by_uid():

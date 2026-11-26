@@ -11,6 +11,7 @@ from PyQt6.QtGui import QAction, QKeySequence, QIcon
 from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QRunnable, pyqtSignal
 
 from models.bounding_frame import BoundingFrame
+from models.room_frame import PlacedProduct, RoomFrame, RoomWorkspace
 from models.panel import (
     Block,
     Panel,
@@ -23,11 +24,21 @@ from ui.home_page import HomePage
 from ui.viewport import CentralWorkspace
 from ui.dialogs import CreatePanelDialog, HoleDialog, LinearArrayDialog, MirrorPanelDialog
 from ui.product_dialogs import CreateBlockDialog, CreateModelDialog, ProductParamsDialog
+from ui.room_layout_dialog import (
+    RoomLayoutDialog,
+    SnapProductToWallDialog,
+    WallGapReportDialog,
+    render_room_svg_icon,
+)
 from ui.fastener_constructor_dialog import FastenerConstructorDialog
 from ui.panels.structure_panel import StructureDock
 from ui.panels.properties_panel import PropertiesDock
 from ui.panels.browser_panel import BrowserDock
 from ui.panels.history_panel import AnalysisDock, HistoryDock
+from core.room_geometry import (
+    check_room_issues,
+    snap_product_to_wall,
+)
 from core.undo import (
     AddAssocRefCommand,
     AddMultiplePanelsCommand,
@@ -39,12 +50,14 @@ from core.undo import (
     EditJointCommand,
     EditProductParamsCommand,
     EditPropertyCommand,
+    EditRoomWorkspaceCommand,
     ReplaceBlocksCommand,
     SetHolesCommand,
 )
 from core.project_io import (
     save_project,
     load_project,
+    scene_to_dict,
     materialize_project_snapshot,
     ProjectDataSnapshot,
     FILE_FILTER,
@@ -122,6 +135,7 @@ class MainWindow(QMainWindow):
         self._saved_chrome_visibility: dict[object, bool] | None = None
         self._editor_toolbars: list[QToolBar] = []
         self._editor_docks: list = []
+        self._editing_room_context: dict | None = None
 
         self._central_stack = QStackedWidget(self)
         self.home_page = HomePage(self)
@@ -171,10 +185,15 @@ class MainWindow(QMainWindow):
         self.structure_dock.assoc_selected.connect(self._on_structure_assoc_selected)
         self.structure_dock.create_block_requested.connect(self._on_create_block_requested)
         self.structure_dock.multi_panels_selected.connect(self._on_multi_panels_selected)
+        self.structure_dock.room_object_selected.connect(self._on_room_object_selected_from_tree)
+        self.structure_dock.room_product_edit_requested.connect(self._enter_room_product_edit)
+        self.structure_dock.room_action_requested.connect(self._on_room_tree_action)
 
         self.properties_dock.property_changed.connect(self._on_property_changed)
         self.properties_dock.property_applied.connect(self._on_property_applied)
         self.properties_dock.validation_failed.connect(self._on_validation_failed)
+        self.properties_dock.room_property_applied.connect(self._on_room_property_applied)
+        self.properties_dock.room_edit_product_requested.connect(self._enter_room_product_edit)
         self.properties_dock.joints_panel.joint_selected.connect(self._on_joint_selected)
         self.properties_dock.joints_panel.joint_modified.connect(self._on_joint_modified)
         self.properties_dock.joints_panel.joint_deleted.connect(self._on_joint_deleted)
@@ -201,6 +220,7 @@ class MainWindow(QMainWindow):
             self.structure_dock.refresh_theme()
         if hasattr(self, "properties_dock") and self.properties_dock is not None:
             self.properties_dock.refresh_theme()
+        self._refresh_room_toolbar_icons()
 
     def is_home_page_visible(self) -> bool:
         """True, если сейчас открыта домашняя страница."""
@@ -215,6 +235,8 @@ class MainWindow(QMainWindow):
             }
         for w in (*self._editor_toolbars, *self._editor_docks):
             w.setVisible(False)
+        if hasattr(self, "_room_toolbar") and self._room_toolbar is not None:
+            self._room_toolbar.setVisible(False)
         self._central_stack.setCurrentWidget(self.home_page)
         self._is_home_mode = True
         self.home_page.refresh_recent_files()
@@ -236,6 +258,7 @@ class MainWindow(QMainWindow):
             self.act_home_page.blockSignals(True)
             self.act_home_page.setChecked(False)
             self.act_home_page.blockSignals(False)
+        self._sync_room_mode_ui()
         self._update_window_title()
 
     def _toggle_home_page(self, checked: bool) -> None:
@@ -254,17 +277,71 @@ class MainWindow(QMainWindow):
         return vp
 
     def _on_home_create_model(self) -> None:
-        """Создать модель: открывает окно настроек изделия и габаритной рамки."""
+        """Создать модель: открывает окно настроек изделия или габаритной рамки помещения."""
         dlg = CreateModelDialog(self)
         if not dlg.exec():
             return
         if self.workspace.count() > 0 and not self._confirm_discard_changes("создать новую модель"):
             return
         settings = dlg.get_model_settings()
+        if settings.get("mode") == CreateModelDialog.MODE_ROOM_LAYOUT:
+            self._create_room_workspace_with_settings(
+                name=settings["name"],
+                order_number=settings["order_number"],
+                room_frame=settings.get("room_frame"),
+            )
+            return
         self._create_model_with_settings(
             name=settings["name"],
             order_number=settings["order_number"],
             bounding_frame=settings["bounding_frame"],
+        )
+
+    def _create_room_workspace_with_settings(
+        self,
+        *,
+        name: str,
+        order_number: str = "",
+        room_frame: RoomFrame | None = None,
+    ) -> None:
+        """Создаёт рабочую среду проектирования в режиме «Габаритная рамка помещения»."""
+        model_name = (name or "Новое помещение").strip() or "Новое помещение"
+        order_num = str(order_number or "").strip()
+        rf = room_frame.clone() if room_frame is not None else RoomFrame.create_rectangular()
+        ws = RoomWorkspace(room_frame=rf)
+
+        vp = self._ensure_workspace_viewport(model_name)
+        if not vp:
+            return
+        if hasattr(vp, "_free_all_panel_gpu"):
+            vp._free_all_panel_gpu()
+        vp.blocks[:] = []
+        vp.bounding_frame = None
+        vp.order_number = order_num
+        vp.set_room_workspace(ws)
+        vp.undo_stack.clear()
+        vp.undo_stack.mark_clean()
+
+        self._editing_room_context = None
+        self.project_path = None
+        self.project_name = model_name
+        self.order_number = order_num
+        self.mark_modified(False)
+        clear_autosave()
+        self._sync_bounding_frame_action(vp)
+        self._sync_room_mode_ui()
+        self._update_window_title()
+        self._refresh_structure()
+        self._refresh_history_dock()
+        self.properties_dock.show_room_object_properties(ws)
+        if hasattr(vp, "go_home_view"):
+            vp.go_home_view(animate=False)
+        vp.update()
+
+        order_part = f" · заказ {order_num}" if order_num else ""
+        self.statusBar().showMessage(
+            f"Создано помещение «{model_name}»{order_part} · {len(rf.walls)} стен, {rf.floor_area_m2():.1f} м²",
+            6000,
         )
 
     def _create_model_with_settings(
@@ -284,6 +361,8 @@ class MainWindow(QMainWindow):
             return
         if hasattr(vp, "_free_all_panel_gpu"):
             vp._free_all_panel_gpu()
+        if hasattr(vp, "clear_room_workspace"):
+            vp.clear_room_workspace()
         vp.blocks[:] = [Block(model_name, "", "", is_assembly=False, is_root=True)]
         bind_scene_blocks(vp.blocks)
         vp.bounding_frame = frame
@@ -291,12 +370,14 @@ class MainWindow(QMainWindow):
         vp.undo_stack.clear()
         vp.undo_stack.mark_clean()
 
+        self._editing_room_context = None
         self.project_path = None
         self.project_name = model_name
         self.order_number = order_num
         self.mark_modified(False)
         clear_autosave()
         self._sync_bounding_frame_action(vp)
+        self._sync_room_mode_ui()
         self._update_window_title()
         self._refresh_structure()
         self._refresh_history_dock()
@@ -439,6 +520,8 @@ class MainWindow(QMainWindow):
             ("measurement_updated", self._on_measurement_updated),
             ("hole_navigated", self._on_hole_navigated),
             ("hole_edit_requested", self._on_hole_edit_requested),
+            ("room_object_selected", self._on_room_object_selected_from_vp),
+            ("room_product_edit_requested", self._enter_room_product_edit),
         ):
             sig = getattr(vp, sig_name, None)
             if sig is None:
@@ -479,15 +562,25 @@ class MainWindow(QMainWindow):
         if vp is not None:
             self.order_number = str(getattr(vp, "order_number", "") or "").strip()
         self._bind_viewport_signals(vp)
+        self._sync_room_mode_ui()
         self._refresh_structure()
         self._refresh_history_dock()
         if vp:
             sel = vp.get_selected_panel()
-            self.properties_dock.show_object_properties(sel)
-            if sel:
-                self._update_coord_boxes(sel.x, sel.y, sel.z)
-            else:
+            if (
+                getattr(vp, "workspace_mode", "product") == "room"
+                and getattr(vp, "room_workspace", None) is not None
+                and sel is None
+            ):
+                sel_k, sel_u = vp.selected_room_object or ("", "")
+                self.properties_dock.show_room_object_properties(vp.room_workspace, sel_k, sel_u)
                 self._update_coord_boxes(0.0, 0.0, 0.0)
+            else:
+                self.properties_dock.show_object_properties(sel)
+                if sel:
+                    self._update_coord_boxes(sel.x, sel.y, sel.z)
+                else:
+                    self._update_coord_boxes(0.0, 0.0, 0.0)
             if hasattr(self, "act_measure"):
                 self.act_measure.setChecked(vp.measure_mode)
             if hasattr(self, "act_live_collisions"):
@@ -565,9 +658,17 @@ class MainWindow(QMainWindow):
             bind_scene_blocks(vp.blocks)
             if hasattr(vp, "_rebuild_scene_gpu_ids"):
                 vp._rebuild_scene_gpu_ids()
-            self.structure_dock.load_structure(
-                vp.title, vp.blocks, order_number=self.order_number
-            )
+            if getattr(vp, "workspace_mode", "product") == "room" and getattr(vp, "room_workspace", None) is not None:
+                self.structure_dock.load_room_structure(
+                    vp.title,
+                    vp.room_workspace,
+                    order_number=self.order_number,
+                    blocks=vp.blocks,
+                )
+            else:
+                self.structure_dock.load_structure(
+                    vp.title, vp.blocks, order_number=self.order_number
+                )
             self.properties_dock.joints_panel.load_joints(vp.blocks)
             self.properties_dock.assoc_panel.load_assocs(vp.blocks)
             self._refresh_issues_only()
@@ -860,6 +961,8 @@ class MainWindow(QMainWindow):
             self._update_coord_boxes(obj.x, obj.y, obj.z)
         vp = self.workspace.current_viewport()
         if vp:
+            if obj is not None:
+                vp.selected_room_object = None
             if hasattr(vp, "set_active_hole_owner"):
                 vp.set_active_hole_owner(None)
             if hasattr(vp, "set_assoc_preview_point"):
@@ -867,6 +970,9 @@ class MainWindow(QMainWindow):
             vp.update()
 
     def _on_viewport_clicked(self, obj):
+        vp = self.workspace.current_viewport()
+        if vp and obj is not None:
+            vp.selected_room_object = None
         self.properties_dock.show_object_properties(obj)
         if isinstance(obj, Panel):
             self._update_coord_boxes(obj.x, obj.y, obj.z)
@@ -919,6 +1025,17 @@ class MainWindow(QMainWindow):
         base_x = float(bf.x) if bf is not None else 0.0
         base_y = float(bf.y) if bf is not None else 0.0
         base_z = float(bf.z) if bf is not None else 0.0
+        if (
+            sel is None
+            and bf is None
+            and getattr(vp, "workspace_mode", "product") == "room"
+            and getattr(vp, "room_workspace", None) is not None
+        ):
+            rf = vp.room_workspace.room_frame
+            (rx0, ry0, rz0), (rx1, _ry1, rz1) = rf.world_aabb()
+            base_x = round(0.5 * (rx0 + rx1), 1)
+            base_y = float(ry0)
+            base_z = round(0.5 * (rz0 + rz1), 1)
         def_x = sel.x + sel.width if (sel and panel_type != "vertical") else (sel.x if sel else base_x)
         def_y = sel.y if sel else base_y
         def_z = sel.z if sel else base_z
@@ -951,9 +1068,11 @@ class MainWindow(QMainWindow):
                 for old_p in b.panels:
                     old_p.selected = False
             p.selected = True
+            vp.selected_room_object = None
 
             vp.undo_stack.push(AddPanelCommand(vp.blocks, target_block, p, f"Построение: {p.name}"))
             self._refresh_structure()
+            self.structure_dock.highlight_object(p)
             self.properties_dock.show_object_properties(p)
             self._update_coord_boxes(p.x, p.y, p.z)
             vp.update()
@@ -1260,6 +1379,8 @@ class MainWindow(QMainWindow):
         if not vp:
             return
         issues = list(extra_issues or [])
+        if getattr(vp, "workspace_mode", "product") == "room" and getattr(vp, "room_workspace", None) is not None:
+            issues.extend(check_room_issues(vp.room_workspace))
         issues.extend(check_scene_issues(vp.blocks, include_collisions=False))
 
         all_panels = [p for b in vp.blocks for p in getattr(b, "panels", [])]
@@ -1512,12 +1633,16 @@ class MainWindow(QMainWindow):
         if not vp:
             return
         try:
+            ws_mode = getattr(vp, "workspace_mode", "product")
+            rw = getattr(vp, "room_workspace", None)
             snapshot = create_autosave_snapshot(
                 vp.blocks,
                 project_name=self.project_name or "Новый проект.b3d",
                 original_path=self.project_path,
                 order_number=self.order_number,
                 bounding_frame=getattr(vp, "bounding_frame", None),
+                workspace_mode=ws_mode,
+                room_workspace=rw,
             )
             self.bg_tasks.submit_autosave(snapshot, sync=not async_run)
         except Exception:
@@ -1557,8 +1682,17 @@ class MainWindow(QMainWindow):
             return False
         if hasattr(vp, "_free_all_panel_gpu"):
             vp._free_all_panel_gpu()
-        vp.blocks[:] = list(res.blocks)
-        vp.bounding_frame = res.bounding_frame.clone() if res.bounding_frame is not None else None
+        self._editing_room_context = None
+        if res.workspace_mode == "room" and res.room_workspace is not None:
+            vp.blocks[:] = list(res.blocks)
+            bind_scene_blocks(vp.blocks)
+            vp.bounding_frame = None
+            vp.set_room_workspace(res.room_workspace.clone())
+        else:
+            if hasattr(vp, "clear_room_workspace"):
+                vp.clear_room_workspace()
+            vp.blocks[:] = list(res.blocks)
+            vp.bounding_frame = res.bounding_frame.clone() if res.bounding_frame is not None else None
         order_num = str(res.order_number or meta.get("order_number") or "").strip()
         vp.order_number = order_num
         vp.undo_stack.clear()
@@ -1567,10 +1701,14 @@ class MainWindow(QMainWindow):
         self.order_number = order_num
         self.is_modified = True
         self._sync_bounding_frame_action(vp)
+        self._sync_room_mode_ui()
         self._update_window_title()
         self._refresh_structure()
         self._refresh_history_dock()
-        self.properties_dock.show_object_properties(None)
+        if vp.workspace_mode == "room" and vp.room_workspace is not None:
+            self.properties_dock.show_room_object_properties(vp.room_workspace)
+        else:
+            self.properties_dock.show_object_properties(None)
         vp.update()
         self.statusBar().showMessage(f"Восстановлен проект из автосохранения: {proj_label}", 6000)
         self._show_load_warnings_in_problems_dock(res.warnings)
@@ -1610,16 +1748,20 @@ class MainWindow(QMainWindow):
             return
         self._ensure_workspace_viewport("Новый проект.b3d")
         self.clear_scene()
+        self._editing_room_context = None
         self.project_path = None
         self.project_name = "Новый проект.b3d"
         self.order_number = ""
         vp = self.workspace.current_viewport()
         if vp:
+            if hasattr(vp, "clear_room_workspace"):
+                vp.clear_room_workspace()
             vp.bounding_frame = None
             vp.order_number = ""
             vp.undo_stack.clear()  # clear → _clean_top=None → is_clean True
             vp.undo_stack.mark_clean()
             self._sync_bounding_frame_action(vp)
+            self._sync_room_mode_ui()
             self._refresh_history_dock()
             vp.update()
         self.mark_modified(False)
@@ -1639,11 +1781,15 @@ class MainWindow(QMainWindow):
             name, blocks, warnings = result.name, result.blocks, result.warnings
             order_number = result.order_number
             bounding_frame = result.bounding_frame
+            workspace_mode = result.workspace_mode
+            room_workspace = result.room_workspace
         else:
             name, blocks = result
             warnings = []
             order_number = ""
             bounding_frame = None
+            workspace_mode = "product"
+            room_workspace = None
         vp = self._ensure_workspace_viewport(name or p_obj.name)
         if not vp:
             return False
@@ -1651,8 +1797,17 @@ class MainWindow(QMainWindow):
         # при уже новом project_path и следующее Save перезапишет чужой файл.
         if hasattr(vp, "_free_all_panel_gpu"):
             vp._free_all_panel_gpu()
-        vp.blocks[:] = list(blocks)
-        vp.bounding_frame = bounding_frame.clone() if bounding_frame is not None else None
+        self._editing_room_context = None
+        if workspace_mode == "room" and room_workspace is not None:
+            vp.blocks[:] = list(blocks)
+            bind_scene_blocks(vp.blocks)
+            vp.bounding_frame = None
+            vp.set_room_workspace(room_workspace.clone())
+        else:
+            if hasattr(vp, "clear_room_workspace"):
+                vp.clear_room_workspace()
+            vp.blocks[:] = list(blocks)
+            vp.bounding_frame = bounding_frame.clone() if bounding_frame is not None else None
         vp.order_number = str(order_number or "").strip()
         vp.undo_stack.clear()
         vp.undo_stack.mark_clean()
@@ -1664,10 +1819,16 @@ class MainWindow(QMainWindow):
         add_recent_file(self.project_path)
         self._rebuild_recent_files_menu()
         self._sync_bounding_frame_action(vp)
+        self._sync_room_mode_ui()
         self._update_window_title()
         self._refresh_structure()
         self._refresh_history_dock()
-        self.properties_dock.show_object_properties(None)
+        if vp.workspace_mode == "room" and vp.room_workspace is not None:
+            self.properties_dock.show_room_object_properties(vp.room_workspace)
+            if hasattr(vp, "go_home_view"):
+                vp.go_home_view(animate=False)
+        else:
+            self.properties_dock.show_object_properties(None)
         vp.update()
         self.statusBar().showMessage(f"✅ Проект загружен: {self.project_name}", 4000)
         self._show_load_warnings_in_problems_dock(warnings)
@@ -1755,12 +1916,27 @@ class MainWindow(QMainWindow):
         if not saved_name or saved_name == "Новый проект.b3d":
             saved_name = Path(path).stem
         try:
+            ws_mode = getattr(vp, "workspace_mode", "product")
+            rw = getattr(vp, "room_workspace", None)
+            blocks_to_save = vp.blocks
+            bf_to_save = getattr(vp, "bounding_frame", None)
+            order_to_save = self.order_number
+            if self._editing_room_context is not None:
+                # Сохраняем весь проект помещения с актуальными правками текущего изделия и прямой конструкции
+                rw = self._build_synced_room_workspace_from_product_editor(vp)
+                ws_mode = "room"
+                blocks_to_save = list(self._editing_room_context.get("room_blocks") or [])
+                bf_to_save = None
+                saved_name = self._editing_room_context.get("room_project_name") or saved_name
+                order_to_save = self._editing_room_context.get("room_order_number") or ""
             save_project(
                 path,
-                vp.blocks,
+                blocks_to_save,
                 saved_name,
-                order_number=self.order_number,
-                bounding_frame=getattr(vp, "bounding_frame", None),
+                order_number=order_to_save,
+                bounding_frame=bf_to_save,
+                workspace_mode=ws_mode,
+                room_workspace=rw,
             )
         except Exception as e:
             _log.exception("save_project failed path=%s", path)
@@ -2312,6 +2488,68 @@ class MainWindow(QMainWindow):
         product_menu.addSeparator()
         product_menu.addAction(self.act_bounding_frame_visible)
 
+        room_menu = menubar.addMenu("Помещение")
+        self.act_room_layout = QAction("Планировка помещения…", self)
+        self.act_room_layout.triggered.connect(self._open_room_layout_editor)
+        room_menu.addAction(self.act_room_layout)
+
+        self.act_room_2d = QAction("2D-план помещения", self)
+        self.act_room_2d.triggered.connect(lambda: self._set_room_view_mode("2d"))
+        room_menu.addAction(self.act_room_2d)
+
+        self.act_room_3d = QAction("3D-вид помещения", self)
+        self.act_room_3d.triggered.connect(lambda: self._set_room_view_mode("3d"))
+        room_menu.addAction(self.act_room_3d)
+
+        room_menu.addSeparator()
+        self.act_room_add_product = QAction("Добавить изделие…", self)
+        self.act_room_add_product.triggered.connect(self._add_product_to_room)
+        room_menu.addAction(self.act_room_add_product)
+
+        self.act_room_dup_product = QAction("Дублировать изделие", self)
+        self.act_room_dup_product.triggered.connect(lambda: self._duplicate_selected_room_product())
+        room_menu.addAction(self.act_room_dup_product)
+
+        self.act_room_edit_product = QAction("Редактировать изделие", self)
+        self.act_room_edit_product.triggered.connect(lambda: self._enter_room_product_edit())
+        room_menu.addAction(self.act_room_edit_product)
+
+        self.act_room_return = QAction("← Вернуться в помещение", self)
+        self.act_room_return.triggered.connect(self._return_to_room_workspace)
+        room_menu.addAction(self.act_room_return)
+
+        room_menu.addSeparator()
+        self.act_room_snap_wall = QAction("Привязать изделие к стене…", self)
+        self.act_room_snap_wall.triggered.connect(lambda: self._snap_selected_room_product_to_wall())
+        room_menu.addAction(self.act_room_snap_wall)
+
+        self.act_room_gap_check = QAction("Анализ зазоров до стены…", self)
+        self.act_room_gap_check.triggered.connect(lambda: self._analyze_selected_room_product_gaps())
+        room_menu.addAction(self.act_room_gap_check)
+
+        room_menu.addSeparator()
+        self._room_vis_menu = room_menu.addMenu("Видимость помещения")
+        self._room_vis_actions: dict[str, QAction] = {}
+        for key, label in (
+            ("show_walls", "Показать стены"),
+            ("auto_hide_front_walls", "Скрывать стены перед камерой"),
+            ("walls_translucent", "Полупрозрачные стены"),
+            ("show_floor", "Показать пол"),
+            ("show_ceiling", "Показать потолок"),
+            ("show_openings", "Показать проёмы"),
+            ("show_obstacles", "Показать препятствия"),
+            ("show_furniture", "Показать мебель"),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked=False, k=key: self._toggle_room_visibility(k, checked))
+            self._room_vis_menu.addAction(act)
+            self._room_vis_actions[key] = act
+        self._room_vis_menu.addSeparator()
+        self.act_room_toggle_wall = QAction("Скрыть / показать выбранную стену", self)
+        self.act_room_toggle_wall.triggered.connect(lambda: self._toggle_selected_room_wall_visibility())
+        self._room_vis_menu.addAction(self.act_room_toggle_wall)
+
         menubar.addMenu("Скрипты")
 
         help_menu = menubar.addMenu("Справка")
@@ -2529,6 +2767,508 @@ class MainWindow(QMainWindow):
         left_tb.addSeparator()
         left_tb.addAction(self.act_measure)
         left_tb.addAction(self.act_clear_dims)
+
+        # Контекстная панель режима «Габаритная рамка помещения»
+        self._room_toolbar = QToolBar("Помещение")
+        self._room_toolbar.setIconSize(QSize(20, 20))
+        self._room_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._room_toolbar)
+        self._room_toolbar.addAction(self.act_room_return)
+        self._room_toolbar.addAction(self.act_room_layout)
+        self._room_toolbar.addSeparator()
+        self._room_toolbar.addAction(self.act_room_2d)
+        self._room_toolbar.addAction(self.act_room_3d)
+        self._room_toolbar.addSeparator()
+        self._room_toolbar.addAction(self.act_room_add_product)
+        self._room_toolbar.addAction(self.act_room_edit_product)
+        self._room_toolbar.addAction(self.act_room_snap_wall)
+        self._room_toolbar.addAction(self.act_room_gap_check)
+        vis_btn = QToolButton(self._room_toolbar)
+        vis_btn.setText("Видимость")
+        vis_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        vis_btn.setMenu(self._room_vis_menu)
+        self._room_vis_btn = vis_btn
+        self._room_vis_btn_action = self._room_toolbar.addWidget(vis_btn)
+        self._refresh_room_toolbar_icons()
+        self._room_toolbar.setVisible(False)
+
+    # ── Методы режима «Габаритная рамка помещения» ────────────────
+
+    def _refresh_room_toolbar_icons(self) -> None:
+        if not hasattr(self, "act_room_layout"):
+            return
+        self.act_room_layout.setIcon(render_room_svg_icon("room_plan.svg", size=18))
+        self.act_room_2d.setIcon(render_room_svg_icon("room_2d_view.svg", size=18))
+        self.act_room_3d.setIcon(render_room_svg_icon("room_3d_view.svg", size=18))
+        self.act_room_add_product.setIcon(render_room_svg_icon("room_furniture.svg", size=18))
+        self.act_room_dup_product.setIcon(render_room_svg_icon("room_furniture.svg", size=18))
+        self.act_room_edit_product.setIcon(render_room_svg_icon("room_edit_product.svg", size=18))
+        self.act_room_return.setIcon(render_room_svg_icon("room_back_to_room.svg", size=18))
+        self.act_room_snap_wall.setIcon(render_room_svg_icon("room_snap_wall.svg", size=18))
+        self.act_room_gap_check.setIcon(render_room_svg_icon("room_gap_check.svg", size=18))
+
+    def _sync_room_mode_ui(self) -> None:
+        """Показывает/скрывает контекстные команды помещения и кнопку возврата из изделия."""
+        if not hasattr(self, "_room_toolbar"):
+            return
+        vp = self.workspace.current_viewport()
+        in_room = bool(
+            vp is not None
+            and getattr(vp, "workspace_mode", "product") == "room"
+            and getattr(vp, "room_workspace", None) is not None
+        )
+        in_sub_product = self._editing_room_context is not None and not in_room
+        show_tb = (not getattr(self, "_is_home_mode", False)) and (in_room or in_sub_product)
+        self._room_toolbar.setVisible(show_tb)
+
+        self.act_room_return.setVisible(in_sub_product)
+        for act in (
+            self.act_room_layout,
+            self.act_room_2d,
+            self.act_room_3d,
+            self.act_room_add_product,
+            self.act_room_dup_product,
+            self.act_room_edit_product,
+            self.act_room_snap_wall,
+            self.act_room_gap_check,
+            self._room_vis_btn_action,
+        ):
+            act.setVisible(in_room)
+
+        if in_room and vp is not None and vp.room_workspace is not None:
+            rf = vp.room_workspace.room_frame
+            for key, act in self._room_vis_actions.items():
+                act.blockSignals(True)
+                act.setChecked(bool(getattr(rf, key, True)))
+                act.blockSignals(False)
+
+    def _apply_room_workspace_state(self, vp, ws: RoomWorkspace) -> None:
+        if vp is None:
+            return
+        vp.room_workspace = ws.clone()
+        vp.workspace_mode = "room"
+        self._sync_room_mode_ui()
+        self._refresh_structure()
+        sel_k, sel_u = vp.selected_room_object or ("", "")
+        self.properties_dock.show_room_object_properties(vp.room_workspace, sel_k, sel_u)
+        vp.update()
+
+    def _commit_room_workspace(self, vp, new_ws: RoomWorkspace, description: str) -> None:
+        if vp is None or getattr(vp, "room_workspace", None) is None:
+            return
+        cmd = EditRoomWorkspaceCommand(
+            old_workspace=vp.room_workspace,
+            new_workspace=new_ws,
+            apply_fn=lambda state, v=vp: self._apply_room_workspace_state(v, state),
+            description=description,
+        )
+        vp.undo_stack.push(cmd, execute=True)
+        self.mark_modified(True)
+        self._refresh_history_dock()
+
+    def _open_room_layout_editor(self) -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            QMessageBox.information(
+                self,
+                "Планировка помещения",
+                "Создайте модель в режиме «Габаритная рамка помещения» или откройте проект помещения.",
+            )
+            return
+        dlg = RoomLayoutDialog(vp.room_workspace.room_frame, self)
+        if not dlg.exec():
+            return
+        new_ws = vp.room_workspace.clone()
+        new_ws.room_frame = dlg.get_room_frame()
+        vp.set_room_gap_overlay(None)
+        self._commit_room_workspace(vp, new_ws, "Редактирование планировки помещения")
+        self.statusBar().showMessage("Планировка помещения обновлена", 4000)
+
+    def _set_room_view_mode(self, mode: str) -> None:
+        vp = self.workspace.current_viewport()
+        if vp is not None and vp.workspace_mode == "room":
+            vp.set_room_view_mode(mode, animate=True)
+
+    def _selected_room_product_uid(self, explicit_uid: str = "") -> str:
+        if explicit_uid:
+            return explicit_uid
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.room_workspace is None:
+            return ""
+        sel = vp.selected_room_object
+        if sel is not None and sel[0] == "product":
+            return sel[1]
+        if len(vp.room_workspace.products) == 1:
+            return vp.room_workspace.products[0].uid
+        return ""
+
+    def _add_product_to_room(self) -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        dlg = CreateModelDialog(self)
+        dlg.mode_tabs.setTabEnabled(1, False)
+        dlg.mode_tabs.setCurrentIndex(0)
+        dlg.setWindowTitle("Добавить изделие в помещение")
+        if not dlg.exec():
+            return
+        settings = dlg.get_model_settings()
+        bf: BoundingFrame = settings["bounding_frame"]
+        rf = vp.room_workspace.room_frame
+        (x0, y0, z0), (x1, _y1, z1) = rf.world_aabb()
+        cx = 0.5 * (x0 + x1) - 0.5 * bf.width
+        cz = 0.5 * (z0 + z1) - 0.5 * bf.depth
+        prod = PlacedProduct(
+            name=settings["name"],
+            order_number=settings["order_number"],
+            bounding_frame=bf,
+            x=round(cx, 1),
+            y=float(y0),
+            z=round(cz, 1),
+        )
+        new_ws = vp.room_workspace.clone()
+        new_ws.add_product(prod)
+        self._commit_room_workspace(vp, new_ws, f"Добавить изделие «{prod.name}»")
+        vp.set_room_selection("product", prod.uid)
+        self.structure_dock.highlight_room_object("product", prod.uid)
+        self.properties_dock.show_room_object_properties(vp.room_workspace, "product", prod.uid)
+        self.statusBar().showMessage(
+            f"Изделие «{prod.name}» добавлено в помещение (двойной клик для редактирования)",
+            5000,
+        )
+
+    def _duplicate_selected_room_product(self, product_uid: str = "") -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        uid = self._selected_room_product_uid(product_uid)
+        if not uid:
+            QMessageBox.information(self, "Дублировать изделие", "Выберите изделие в помещении.")
+            return
+        src = vp.room_workspace.get_product(uid)
+        if src is None:
+            return
+        new_ws = vp.room_workspace.clone()
+        dup = new_ws.duplicate_product(uid, offset_x_mm=src.bounding_frame.width + 50.0)
+        self._commit_room_workspace(vp, new_ws, f"Дублировать изделие «{src.name}»")
+        vp.set_room_selection("product", dup.uid)
+        self.structure_dock.highlight_room_object("product", dup.uid)
+        self.properties_dock.show_room_object_properties(vp.room_workspace, "product", dup.uid)
+
+    def _delete_selected_room_product(self, product_uid: str = "") -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        uid = self._selected_room_product_uid(product_uid)
+        if not uid:
+            return
+        src = vp.room_workspace.get_product(uid)
+        if src is None:
+            return
+        new_ws = vp.room_workspace.clone()
+        new_ws.remove_product(uid)
+        vp.set_room_selection("", "")
+        vp.set_room_gap_overlay(None)
+        self._commit_room_workspace(vp, new_ws, f"Удалить изделие «{src.name}»")
+
+    def _snap_selected_room_product_to_wall(self, product_uid: str = "") -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        uid = self._selected_room_product_uid(product_uid)
+        if not uid:
+            QMessageBox.information(self, "Привязка к стене", "Выберите изделие в помещении.")
+            return
+        prod = vp.room_workspace.get_product(uid)
+        if prod is None:
+            return
+        dlg = SnapProductToWallDialog(vp.room_workspace.room_frame, prod, self)
+        if not dlg.exec():
+            return
+        params = dlg.get_snap_params()
+        new_ws = vp.room_workspace.clone()
+        new_prod = new_ws.get_product(uid)
+        if new_prod is None:
+            return
+        snap_product_to_wall(
+            new_ws.room_frame,
+            new_prod,
+            params["wall_uid"],
+            offset_mm=params["offset_mm"],
+            s_position_mm=params["s_position_mm"],
+            elevation_y_mm=params["elevation_y_mm"],
+        )
+        self._commit_room_workspace(vp, new_ws, f"Привязка «{prod.name}» к стене")
+        vp.set_room_selection("product", uid)
+        self.properties_dock.show_room_object_properties(vp.room_workspace, "product", uid)
+        self.statusBar().showMessage(
+            f"Изделие «{prod.name}» выровнено по стене с отступом {params['offset_mm']:.1f} мм",
+            5000,
+        )
+
+    def _analyze_selected_room_product_gaps(self, product_uid: str = "") -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        uid = self._selected_room_product_uid(product_uid)
+        if not uid:
+            QMessageBox.information(self, "Анализ зазоров", "Выберите изделие в помещении.")
+            return
+        prod = vp.room_workspace.get_product(uid)
+        if prod is None:
+            return
+        dlg = WallGapReportDialog(vp.room_workspace, prod, self)
+        if dlg.last_report is not None:
+            vp.set_room_gap_overlay(dlg.last_report)
+        dlg.exec()
+        if dlg.last_report is not None:
+            vp.set_room_gap_overlay(dlg.last_report)
+
+    def _toggle_room_visibility(self, flag_name: str, checked: bool) -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        rf = vp.room_workspace.room_frame
+        if hasattr(rf, flag_name):
+            setattr(rf, flag_name, bool(checked))
+            self._sync_room_mode_ui()
+            vp.update()
+
+    def _toggle_selected_room_wall_visibility(self, wall_uid: str = "") -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        uid = wall_uid
+        if not uid and vp.selected_room_object is not None and vp.selected_room_object[0] == "wall":
+            uid = vp.selected_room_object[1]
+        if not uid:
+            return
+        wall = vp.room_workspace.room_frame.get_wall(uid)
+        if wall is None:
+            return
+        wall.visible = not wall.visible
+        self._refresh_structure()
+        self.properties_dock.show_room_object_properties(vp.room_workspace, "wall", uid)
+        vp.update()
+
+    def _on_room_object_selected_from_vp(self, kind: str, uid: str) -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        if kind:
+            for b in vp.blocks:
+                b.selected = False
+                for p in getattr(b, "panels", []) or []:
+                    p.selected = False
+        self.structure_dock.highlight_room_object(kind, uid)
+        self.properties_dock.show_room_object_properties(vp.room_workspace, kind, uid)
+
+    def _on_room_object_selected_from_tree(self, kind: str, uid: str) -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        if kind:
+            for b in vp.blocks:
+                b.selected = False
+                for p in getattr(b, "panels", []) or []:
+                    p.selected = False
+        vp.set_room_selection(kind, uid)
+        self.properties_dock.show_room_object_properties(vp.room_workspace, kind, uid)
+
+    def _on_room_tree_action(self, action: str, _kind: str, uid: str) -> None:
+        if action == "snap_wall":
+            self._snap_selected_room_product_to_wall(uid)
+        elif action == "gap_check":
+            self._analyze_selected_room_product_gaps(uid)
+        elif action == "duplicate_product":
+            self._duplicate_selected_room_product(uid)
+        elif action == "delete_product":
+            self._delete_selected_room_product(uid)
+        elif action == "toggle_wall_visible":
+            self._toggle_selected_room_wall_visibility(uid)
+
+    def _on_room_property_applied(self, kind: str, uid: str, attr_name: str, new_val) -> None:
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        new_ws = vp.room_workspace.clone()
+        rf = new_ws.room_frame
+        try:
+            if kind == "wall":
+                wall = rf.get_wall(uid)
+                if wall is None:
+                    return
+                if attr_name == "name":
+                    wall.name = str(new_val) or wall.name
+                elif attr_name == "length_mm":
+                    rf.set_wall_length(wall.uid, float(new_val))
+                elif attr_name == "start_angle_deg":
+                    rf.set_wall_angle_at_start(wall.uid, float(new_val))
+                elif attr_name == "thickness_mm":
+                    wall.thickness_mm = max(20.0, float(new_val))
+                elif attr_name == "height_mm":
+                    wall.height_mm = max(200.0, float(new_val))
+                elif attr_name == "visible":
+                    wall.visible = bool(new_val)
+            elif kind == "opening":
+                pair = rf.get_opening(uid)
+                if pair is None:
+                    return
+                op = pair[1]
+                if attr_name == "name":
+                    op.name = str(new_val) or op.name
+                elif attr_name in ("offset_s_mm", "width_mm", "height_mm", "sill_height_mm", "swing_angle_deg"):
+                    setattr(op, attr_name, float(new_val))
+            elif kind == "obstacle":
+                obs = rf.get_obstacle(uid)
+                if obs is None:
+                    return
+                if attr_name == "name":
+                    obs.name = str(new_val) or obs.name
+                elif attr_name in ("x", "y", "z", "width", "height", "depth", "rotation_y_deg", "clearance_mm"):
+                    setattr(obs, attr_name, float(new_val))
+            elif kind == "product":
+                prod = new_ws.get_product(uid)
+                if prod is None:
+                    return
+                if attr_name == "name":
+                    prod.name = str(new_val) or prod.name
+                elif attr_name == "order_number":
+                    prod.order_number = str(new_val)
+                elif attr_name in ("x", "y", "z", "rotation_y_deg", "wall_offset_mm"):
+                    setattr(prod, attr_name, float(new_val))
+            else:
+                return
+        except Exception as exc:
+            self.statusBar().showMessage(f"Ошибка изменения параметра: {exc}", 5000)
+            self.properties_dock.show_room_object_properties(vp.room_workspace, kind, uid)
+            return
+
+        self._commit_room_workspace(vp, new_ws, f"Изменить {attr_name}")
+
+    def _enter_room_product_edit(self, product_uid: str = "") -> None:
+        """Открывает размещённое в помещении изделие в полноценном редакторе NestCraft Studio."""
+        vp = self.workspace.current_viewport()
+        if vp is None or vp.workspace_mode != "room" or vp.room_workspace is None:
+            return
+        uid = self._selected_room_product_uid(product_uid)
+        if not uid:
+            QMessageBox.information(self, "Редактировать изделие", "Выберите изделие в помещении.")
+            return
+        prod = vp.room_workspace.get_product(uid)
+        if prod is None:
+            return
+
+        self._editing_room_context = {
+            "room_workspace": vp.room_workspace.clone(),
+            "room_blocks": list(vp.blocks),
+            "product_uid": prod.uid,
+            "room_project_name": self.project_name,
+            "room_order_number": self.order_number,
+            "room_project_path": self.project_path,
+        }
+
+        # Материализуем локальные блоки изделия в независимой СК (0, 0, 0)
+        blocks: list[Block] = []
+        if prod.blocks_data:
+            snap = ProjectDataSnapshot(
+                data={
+                    "format": "NestCraft",
+                    "version": "0.0.13",
+                    "name": prod.name,
+                    "order_number": prod.order_number,
+                    "bounding_frame": prod.bounding_frame.to_dict(),
+                    "blocks": prod.blocks_data,
+                },
+                warnings=[],
+                source_path=None,
+            )
+            res = materialize_project_snapshot(snap)
+            blocks = list(res.blocks)
+        if not blocks:
+            blocks = [Block(prod.name, "", "", is_assembly=False, is_root=True)]
+
+        if hasattr(vp, "_free_all_panel_gpu"):
+            vp._free_all_panel_gpu()
+        vp.clear_room_workspace()
+        vp.blocks[:] = blocks
+        bind_scene_blocks(vp.blocks)
+        vp.bounding_frame = prod.bounding_frame.clone()
+        vp.order_number = prod.order_number
+        vp.undo_stack.clear()
+
+        self.project_name = f"{prod.name} [из помещения]"
+        self.order_number = prod.order_number
+        self._sync_bounding_frame_action(vp)
+        self._sync_room_mode_ui()
+        self._update_window_title()
+        self._refresh_structure()
+        self._refresh_history_dock()
+        self.properties_dock.show_object_properties(None)
+        if hasattr(vp, "go_home_view"):
+            vp.go_home_view(animate=False)
+        vp.update()
+        self.statusBar().showMessage(
+            f"Редактирование изделия «{prod.name}». Нажмите «← Вернуться в помещение» для возврата.",
+            7000,
+        )
+
+    def _build_synced_room_workspace_from_product_editor(self, vp) -> RoomWorkspace:
+        """Синхронизирует отредактированное изделие обратно в RoomWorkspace без потери локальной СК."""
+        ctx = self._editing_room_context or {}
+        ws: RoomWorkspace = ctx["room_workspace"].clone()
+        prod = ws.get_product(ctx.get("product_uid", ""))
+        if prod is not None and vp is not None:
+            raw_prod_dict = scene_to_dict(
+                vp.blocks,
+                prod.name,
+                order_number=vp.order_number,
+                bounding_frame=getattr(vp, "bounding_frame", None),
+            )
+            prod.blocks_data = list(raw_prod_dict.get("blocks", []))
+            if getattr(vp, "bounding_frame", None) is not None:
+                prod.bounding_frame = vp.bounding_frame.clone()
+            prod.order_number = str(getattr(vp, "order_number", prod.order_number) or "")
+        return ws
+
+    def _return_to_room_workspace(self) -> None:
+        """Возвращает пользователя из редактора изделия обратно в сцену помещения."""
+        if self._editing_room_context is None:
+            return
+        vp = self.workspace.current_viewport()
+        if vp is None:
+            return
+        updated_ws = self._build_synced_room_workspace_from_product_editor(vp)
+        ctx = self._editing_room_context
+        prod_uid = str(ctx.get("product_uid") or "")
+        self._editing_room_context = None
+
+        if hasattr(vp, "_free_all_panel_gpu"):
+            vp._free_all_panel_gpu()
+        vp.blocks[:] = list(ctx.get("room_blocks") or [])
+        bind_scene_blocks(vp.blocks)
+        vp.bounding_frame = None
+        vp.set_room_workspace(updated_ws)
+        vp.order_number = str(ctx.get("room_order_number") or "")
+        vp.undo_stack.clear()
+
+        self.project_name = str(ctx.get("room_project_name") or "Помещение")
+        self.order_number = str(ctx.get("room_order_number") or "")
+        self.project_path = ctx.get("room_project_path")
+        self.mark_modified(True)
+        self._sync_bounding_frame_action(vp)
+        self._sync_room_mode_ui()
+        self._update_window_title()
+        self._refresh_structure()
+        self._refresh_history_dock()
+        if prod_uid:
+            vp.set_room_selection("product", prod_uid)
+            self.structure_dock.highlight_room_object("product", prod_uid)
+            self.properties_dock.show_room_object_properties(vp.room_workspace, "product", prod_uid)
+        if hasattr(vp, "go_home_view"):
+            vp.go_home_view(animate=False)
+        vp.update()
+        self.statusBar().showMessage("Изменения изделия применены в сцене помещения", 5000)
 
     def _set_standard_view(self, view_code: str):
         vp = self.workspace.current_viewport()

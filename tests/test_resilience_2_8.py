@@ -71,6 +71,8 @@ def test_b3d_migration_chain_from_0_0_4():
         "0.0.8 -> 0.0.9",
         "0.0.9 -> 0.0.10",
         "0.0.10 -> 0.0.11",
+        "0.0.11 -> 0.0.12",
+        "0.0.12 -> 0.0.13",
     ], f"Unexpected steps: {steps}"
     assert migrated["version"] == FORMAT_VERSION
 
@@ -116,6 +118,8 @@ def test_b3d_migration_chain_from_0_0_1():
         "0.0.8 -> 0.0.9",
         "0.0.9 -> 0.0.10",
         "0.0.10 -> 0.0.11",
+        "0.0.11 -> 0.0.12",
+        "0.0.12 -> 0.0.13",
     ]
     assert migrated["blocks"][0]["joints"] == []
     pd = migrated["blocks"][0]["panels"][0]

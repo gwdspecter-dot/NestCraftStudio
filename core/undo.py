@@ -1439,3 +1439,37 @@ class EditProductParamsCommand(Command):
         self._apply_fn(_clone_product_state(self._old_state))
 
 
+def _clone_room_workspace_state(ws):
+    """Глубокая копия состояния рабочего пространства помещения."""
+    from models.room_frame import RoomWorkspace
+
+    if isinstance(ws, RoomWorkspace):
+        return ws.clone()
+    if isinstance(ws, dict):
+        return RoomWorkspace.from_dict(ws)
+    return None
+
+
+class EditRoomWorkspaceCommand(Command):
+    """Обратимое изменение геометрии помещения, проёмов, препятствий или расстановки мебели."""
+
+    def __init__(
+        self,
+        old_workspace,
+        new_workspace,
+        apply_fn: Callable[[object], None],
+        description: str = "Изменение помещения",
+    ):
+        super().__init__(description)
+        self._old_ws = _clone_room_workspace_state(old_workspace)
+        self._new_ws = _clone_room_workspace_state(new_workspace)
+        self._apply_fn = apply_fn
+
+    def redo(self) -> None:
+        self._apply_fn(_clone_room_workspace_state(self._new_ws))
+
+    def undo(self) -> None:
+        self._apply_fn(_clone_room_workspace_state(self._old_ws))
+
+
+

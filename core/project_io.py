@@ -15,6 +15,7 @@ from typing import Callable
 
 from models.bounding_frame import BoundingFrame
 from models.panel import Panel, Block, ParametricCabinet, new_uid
+from models.room_frame import RoomWorkspace
 from core.logging_setup import get_logger, user_data_dir
 from core.version import FORMAT_VERSION, MIN_SUPPORTED_VERSION
 
@@ -295,6 +296,28 @@ def _migrate_to_0_0_12(data: dict) -> dict:
     return data
 
 
+def _migrate_to_0_0_13(data: dict) -> dict:
+    """v0.0.12 -> v0.0.13: режим рабочего пространства `workspace_mode` и данные помещения `room_workspace`.
+
+    Старые проекты без данных помещения открываются в обычном режиме изделия
+    (`workspace_mode="product"`, `room_workspace=None`) без изменения деталей.
+    """
+    raw_mode = str(data.get("workspace_mode") or "product").strip().lower()
+    data["workspace_mode"] = "room" if raw_mode == "room" else "product"
+    raw_rw = data.get("room_workspace")
+    if isinstance(raw_rw, dict):
+        try:
+            rw = RoomWorkspace.from_dict(raw_rw)
+            data["room_workspace"] = rw.to_dict() if rw is not None else None
+        except ValueError:
+            _log.warning("Некорректные данные room_workspace при миграции — сброшены")
+            data["room_workspace"] = None
+            data["workspace_mode"] = "product"
+    else:
+        data["room_workspace"] = None
+    return data
+
+
 MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.1", "0.0.2", _migrate_to_0_0_2),
     ("0.0.2", "0.0.3", _migrate_to_0_0_3),
@@ -307,6 +330,7 @@ MIGRATION_STEPS: list[tuple[str, str, Callable[[dict], dict]]] = [
     ("0.0.9", "0.0.10", _migrate_to_0_0_10),
     ("0.0.10", "0.0.11", _migrate_to_0_0_11),
     ("0.0.11", "0.0.12", _migrate_to_0_0_12),
+    ("0.0.12", "0.0.13", _migrate_to_0_0_13),
 ]
 
 
@@ -522,19 +546,35 @@ def _serialize_bounding_frame(bounding_frame: BoundingFrame | dict | None) -> di
     return None
 
 
+def _serialize_room_workspace(room_workspace: RoomWorkspace | dict | None) -> dict | None:
+    if room_workspace is None:
+        return None
+    if isinstance(room_workspace, RoomWorkspace):
+        return room_workspace.to_dict()
+    if isinstance(room_workspace, dict):
+        rw = RoomWorkspace.from_dict(room_workspace)
+        return rw.to_dict() if rw is not None else None
+    return None
+
+
 def scene_to_dict(
     blocks: list,
     project_name: str = "project",
     *,
     order_number: str = "",
     bounding_frame: BoundingFrame | dict | None = None,
+    workspace_mode: str = "product",
+    room_workspace: RoomWorkspace | dict | None = None,
 ) -> dict:
+    mode = "room" if str(workspace_mode or "product").strip().lower() == "room" else "product"
     return {
         "format": "NestCraft",
         "version": FORMAT_VERSION,
         "name": project_name,
         "order_number": str(order_number or "").strip(),
+        "workspace_mode": mode,
         "bounding_frame": _serialize_bounding_frame(bounding_frame),
+        "room_workspace": _serialize_room_workspace(room_workspace),
         "blocks": [_block_to_dict(b) for b in blocks],
     }
 
@@ -647,6 +687,8 @@ def save_project(
     *,
     order_number: str = "",
     bounding_frame: BoundingFrame | dict | None = None,
+    workspace_mode: str = "product",
+    room_workspace: RoomWorkspace | dict | None = None,
 ) -> None:
     """Атомарная запись: temp-файл в той же папке + os.replace."""
     path = Path(path)
@@ -655,6 +697,8 @@ def save_project(
         project_name,
         order_number=order_number,
         bounding_frame=bounding_frame,
+        workspace_mode=workspace_mode,
+        room_workspace=room_workspace,
     )
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     try:
@@ -697,6 +741,8 @@ class ProjectLoadResult:
         path: str | Path | None = None,
         order_number: str = "",
         bounding_frame: BoundingFrame | None = None,
+        workspace_mode: str = "product",
+        room_workspace: RoomWorkspace | None = None,
     ):
         self.name = name
         self.blocks = blocks
@@ -709,6 +755,14 @@ class ProjectLoadResult:
             bounding_frame.clone()
             if isinstance(bounding_frame, BoundingFrame)
             else BoundingFrame.from_dict(bounding_frame)
+        )
+        self.workspace_mode = (
+            "room" if str(workspace_mode or "product").strip().lower() == "room" else "product"
+        )
+        self.room_workspace = (
+            room_workspace.clone()
+            if isinstance(room_workspace, RoomWorkspace)
+            else RoomWorkspace.from_dict(room_workspace)
         )
 
 
@@ -763,8 +817,6 @@ def materialize_project_snapshot(
     progress_cb: Callable[[int, int, str], None] | None = None,
 ) -> ProjectLoadResult:
     """Создаёт объекты `Block` и `Panel` из `ProjectDataSnapshot` и собирает предупреждения каталога."""
-    from core.assoc import apply_assoc_refs_in_blocks
-    from core.joint import apply_joints_in_blocks
     from models.panel import bind_scene_blocks
 
     raw_blocks = snapshot.migrated_dict.get("blocks", []) or []
@@ -777,8 +829,12 @@ def materialize_project_snapshot(
 
     bind_scene_blocks(blocks)
     if any(getattr(b, "joints", None) for b in blocks):
+        from core.joint import apply_joints_in_blocks
+
         apply_joints_in_blocks(blocks)
     elif any(getattr(b, "assoc_refs", None) for b in blocks):
+        from core.assoc import apply_assoc_refs_in_blocks
+
         apply_assoc_refs_in_blocks(blocks)
 
     warnings = list(snapshot.warnings)
@@ -810,6 +866,16 @@ def materialize_project_snapshot(
             bounding_frame = None
 
     order_number = str(snapshot.migrated_dict.get("order_number") or "").strip()
+    workspace_mode = str(snapshot.migrated_dict.get("workspace_mode") or "product").strip().lower()
+    raw_rw = snapshot.migrated_dict.get("room_workspace")
+    room_workspace: RoomWorkspace | None = None
+    if raw_rw is not None:
+        try:
+            room_workspace = RoomWorkspace.from_dict(raw_rw)
+        except ValueError as exc:
+            warnings.append(f"Некорректные параметры помещения в файле: {exc}")
+            room_workspace = None
+            workspace_mode = "product"
 
     return ProjectLoadResult(
         name=snapshot.name,
@@ -820,6 +886,8 @@ def materialize_project_snapshot(
         path=snapshot.path,
         order_number=order_number,
         bounding_frame=bounding_frame,
+        workspace_mode=workspace_mode,
+        room_workspace=room_workspace,
     )
 
 
@@ -1226,6 +1294,8 @@ def create_autosave_snapshot(
     *,
     order_number: str = "",
     bounding_frame: BoundingFrame | dict | None = None,
+    workspace_mode: str = "product",
+    room_workspace: RoomWorkspace | dict | None = None,
     autosave_path: str | Path | None = None,
     base_dir: str | Path | None = None,
     pid: int | None = None,
@@ -1242,6 +1312,8 @@ def create_autosave_snapshot(
         project_name,
         order_number=order_number,
         bounding_frame=bounding_frame,
+        workspace_mode=workspace_mode,
+        room_workspace=room_workspace,
     )
     start = process_start_time(actual_pid)
     if start is None:
@@ -1280,6 +1352,8 @@ def write_autosave(
     *,
     order_number: str = "",
     bounding_frame: BoundingFrame | dict | None = None,
+    workspace_mode: str = "product",
+    room_workspace: RoomWorkspace | dict | None = None,
     autosave_path: str | Path | None = None,
     base_dir: str | Path | None = None,
     pid: int | None = None,
@@ -1291,6 +1365,8 @@ def write_autosave(
         original_path=original_path,
         order_number=order_number,
         bounding_frame=bounding_frame,
+        workspace_mode=workspace_mode,
+        room_workspace=room_workspace,
         autosave_path=autosave_path,
         base_dir=base_dir,
         pid=pid,

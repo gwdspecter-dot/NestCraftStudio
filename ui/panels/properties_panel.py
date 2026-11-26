@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QComboBox,
+    QPushButton,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -26,6 +27,10 @@ class PropertiesDock(QDockWidget):
     property_applied = pyqtSignal(object, str, object, object)
     # Сообщение об отклонённом вводе (для statusBar)
     validation_failed = pyqtSignal(str)
+    # Редактирование свойства объекта помещения: (kind, uid, attr_name, new_val)
+    room_property_applied = pyqtSignal(str, str, str, object)
+    # Запрос открытия размещённого изделия на редактирование: product_uid
+    room_edit_product_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__("Свойства", parent)
@@ -34,6 +39,8 @@ class PropertiesDock(QDockWidget):
         )
 
         self.current_obj = None
+        self._room_target: tuple[str, str] | None = None
+        self._room_ws_ref = None
         self._updating = False
 
         self._stack = QStackedWidget(self)
@@ -98,6 +105,8 @@ class PropertiesDock(QDockWidget):
 
     def show_object_properties(self, obj):
         self._updating = True
+        self._room_target = None
+        self._room_ws_ref = None
         self._stack.setCurrentWidget(self.table)
         self.setWindowTitle("Свойства")
         self.current_obj = obj
@@ -218,6 +227,151 @@ class PropertiesDock(QDockWidget):
             self._fill_text_props(props)
 
         self._updating = False
+
+    def show_room_object_properties(self, room_workspace, kind: str = "", uid: str = "") -> None:
+        """Показывает свойства помещения, стены, проёма, препятствия или размещённого изделия."""
+        self._updating = True
+        self.current_obj = None
+        self._room_ws_ref = room_workspace
+        self._room_target = (kind, uid) if (kind and uid) else None
+        self._stack.setCurrentWidget(self.table)
+        self.table.setRowCount(0)
+        self.table.clearContents()
+
+        if room_workspace is None:
+            self.setWindowTitle("Свойства")
+            self._updating = False
+            return
+
+        rf = room_workspace.room_frame
+        if kind == "wall" and uid:
+            wall = rf.get_wall(uid)
+            if wall is not None:
+                info = rf.wall_geometry(wall)
+                ang = info.interior_angle_start_deg
+                self.setWindowTitle(f"Свойства — {wall.name}")
+                props = [
+                    ("Наименование стены", wall.name, "name"),
+                    ("Длина стены, мм", f"{info.length_mm:.1f}", "length_mm"),
+                    ("Угол в начале стены, °", f"{ang:.1f}", "start_angle_deg"),
+                    ("Толщина, мм", f"{wall.thickness_mm:.1f}", "thickness_mm"),
+                    ("Высота, мм", f"{wall.height_mm:.1f}", "height_mm"),
+                    ("Точек замера неровности", str(len(wall.deviation_stations)), None),
+                    ("Проёмов на стене", str(len(wall.openings)), None),
+                ]
+                self.table.setRowCount(len(props) + 1)
+                for r, (lbl, val, attr) in enumerate(props):
+                    self._set_label_cell(r, lbl, attr)
+                    self._set_value_cell(r, val, editable=(attr is not None))
+                v_row = len(props)
+                self._set_label_cell(v_row, "Видимость стены", "visible")
+                self.table.setCellWidget(
+                    v_row, 1, self._make_room_bool_combo("wall", wall.uid, "visible", wall.visible)
+                )
+                self._updating = False
+                return
+
+        if kind == "opening" and uid:
+            pair = rf.get_opening(uid)
+            found_op = pair[1] if pair is not None else None
+            if found_op is not None:
+                self.setWindowTitle(f"Свойства — {found_op.name}")
+                props = [
+                    ("Наименование", found_op.name, "name"),
+                    ("Отступ вдоль стены, мм", f"{found_op.offset_s_mm:.1f}", "offset_s_mm"),
+                    ("Ширина проёма, мм", f"{found_op.width_mm:.1f}", "width_mm"),
+                    ("Высота проёма, мм", f"{found_op.height_mm:.1f}", "height_mm"),
+                    ("Высота подоконника, мм", f"{found_op.sill_height_mm:.1f}", "sill_height_mm"),
+                    ("Угол открывания, °", f"{found_op.swing_angle_deg:.1f}", "swing_angle_deg"),
+                ]
+                self._fill_text_props(props)
+                self._updating = False
+                return
+
+        if kind == "obstacle" and uid:
+            obs = rf.get_obstacle(uid)
+            if obs is not None:
+                self.setWindowTitle(f"Свойства — {obs.name}")
+                props = [
+                    ("Наименование", obs.name, "name"),
+                    ("Координата X, мм", f"{obs.x:.1f}", "x"),
+                    ("Координата Y, мм", f"{obs.y:.1f}", "y"),
+                    ("Координата Z, мм", f"{obs.z:.1f}", "z"),
+                    ("Ширина (X), мм", f"{obs.width:.1f}", "width"),
+                    ("Высота (Y), мм", f"{obs.height:.1f}", "height"),
+                    ("Глубина (Z), мм", f"{obs.depth:.1f}", "depth"),
+                    ("Поворот вокруг Y, °", f"{obs.rotation_y_deg:.1f}", "rotation_y_deg"),
+                    ("Зона обслуживания, мм", f"{obs.clearance_mm:.1f}", "clearance_mm"),
+                ]
+                self._fill_text_props(props)
+                self._updating = False
+                return
+
+        if kind == "product" and uid:
+            prod = room_workspace.get_product(uid)
+            if prod is not None:
+                bf = prod.bounding_frame
+                p_count = prod.panel_count()
+                self.setWindowTitle(f"Свойства — {prod.name}")
+                props = [
+                    ("Наименование изделия", prod.name, "name"),
+                    ("Номер заказа", prod.order_number, "order_number"),
+                    ("Позиция X, мм", f"{prod.x:.1f}", "x"),
+                    ("Позиция Y, мм", f"{prod.y:.1f}", "y"),
+                    ("Позиция Z, мм", f"{prod.z:.1f}", "z"),
+                    ("Поворот вокруг Y, °", f"{prod.rotation_y_deg:.1f}", "rotation_y_deg"),
+                    ("Монтажный отступ от стены, мм", f"{prod.wall_offset_mm:.1f}", "wall_offset_mm"),
+                    ("Габаритная рамка, мм", f"{bf.width:.0f} × {bf.height:.0f} × {bf.depth:.0f}", None),
+                    ("Панелей в изделии", str(p_count), None),
+                ]
+                self.table.setRowCount(len(props) + 1)
+                for r, (lbl, val, attr) in enumerate(props):
+                    self._set_label_cell(r, lbl, attr)
+                    self._set_value_cell(r, val, editable=(attr is not None))
+                btn_row = len(props)
+                self._set_label_cell(btn_row, "Редактор изделия", None)
+                edit_btn = QPushButton("Редактировать изделие")
+                edit_btn.clicked.connect(
+                    lambda _checked=False, p_uid=prod.uid: self.room_edit_product_requested.emit(p_uid)
+                )
+                self.table.setCellWidget(btn_row, 1, edit_btn)
+                self._updating = False
+                return
+
+        # Общая сводка помещения
+        self.setWindowTitle("Свойства — Помещение")
+        openings_cnt = sum(len(w.openings) for w in rf.walls)
+        props = [
+            ("Стен в контуре", str(len(rf.walls)), None),
+            ("Площадь пола, м²", f"{rf.floor_area_m2():.2f}", None),
+            ("Высота потолка, мм", f"{rf.ceiling_height_mm:.0f}", None),
+            ("Проёмов", str(openings_cnt), None),
+            ("Препятствий", str(len(rf.obstacles)), None),
+            ("Размещённых изделий", str(len(room_workspace.products)), None),
+        ]
+        self._fill_text_props(props)
+        self._updating = False
+
+    def _make_room_bool_combo(
+        self, kind: str, uid: str, attr_name: str, current: bool
+    ) -> QComboBox:
+        combo = QComboBox()
+        combo.addItem("Да", True)
+        combo.addItem("Нет", False)
+        combo.setCurrentIndex(0 if current else 1)
+        combo.currentIndexChanged.connect(
+            lambda _idx, k=kind, u=uid, a=attr_name, c=combo: self._on_room_bool_combo_changed(
+                k, u, a, c
+            )
+        )
+        return combo
+
+    def _on_room_bool_combo_changed(
+        self, kind: str, uid: str, attr_name: str, combo: QComboBox
+    ) -> None:
+        if self._updating:
+            return
+        self.room_property_applied.emit(kind, uid, attr_name, bool(combo.currentData()))
 
     # ── helpers ───────────────────────────────────────────────
 
@@ -445,7 +599,30 @@ class PropertiesDock(QDockWidget):
         self._updating = False
 
     def _on_item_changed(self, item: QTableWidgetItem):
-        if self._updating or self.current_obj is None or item.column() != 1:
+        if self._updating or item.column() != 1:
+            return
+
+        if self._room_target is not None:
+            attr_name = self.table.item(item.row(), 0).data(Qt.ItemDataRole.UserRole)
+            if not attr_name:
+                return
+            kind, uid = self._room_target
+            raw_text = item.text().strip()
+            str_attrs = {"name", "order_number"}
+            if attr_name in str_attrs:
+                self.room_property_applied.emit(kind, uid, str(attr_name), raw_text)
+                return
+            try:
+                val = self._parse_finite_float(raw_text.replace(",", "."))
+            except (ValueError, TypeError, OverflowError):
+                self.validation_failed.emit(f"Недопустимое числовое значение «{raw_text}»")
+                if self._room_ws_ref is not None:
+                    self.show_room_object_properties(self._room_ws_ref, kind, uid)
+                return
+            self.room_property_applied.emit(kind, uid, str(attr_name), float(val))
+            return
+
+        if self.current_obj is None:
             return
 
         attr_name = self.table.item(item.row(), 0).data(Qt.ItemDataRole.UserRole)
