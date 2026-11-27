@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QVBoxLayout,
 )
@@ -24,6 +25,7 @@ from core.assoc import (
     resolve_assoc_world_point,
 )
 from ui.dialogs import SmartDoubleSpinBox
+from ui.icon_utils import render_svg_pixmap
 from ui.theme import current_theme
 
 
@@ -119,10 +121,17 @@ class AssocRefDialog(QDialog):
         layout.addLayout(form)
 
         t = current_theme()
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(6)
+        self._status_icon_label = QLabel()
+        self._status_icon_label.setFixedSize(16, 16)
+        status_row.addWidget(self._status_icon_label)
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet(f"color: {t.success}; font-size: 11px;")
-        layout.addWidget(self.status_label)
+        status_row.addWidget(self.status_label, 1)
+        layout.addLayout(status_row)
 
         hint = QLabel(
             "Отверстие ставится на target; позиция — якорь грани source + u/v.\n"
@@ -257,23 +266,36 @@ class AssocRefDialog(QDialog):
             source = self.source_combo.currentData()
             st = evaluate_assoc_ref_panels(target, source, ref)
             if st.severity == "error":
+                self._set_status_icon("status_error.svg", t.error)
                 self.status_label.setStyleSheet(f"color: {t.error}; font-size: 11px;")
-                self.status_label.setText(f"❌ {st.message}")
+                self.status_label.setText(str(st.message))
             elif st.severity == "warning":
+                self._set_status_icon("status_warning.svg", t.warning)
                 self.status_label.setStyleSheet(f"color: {t.warning}; font-size: 11px;")
-                self.status_label.setText(f"⚠ {st.message}")
+                self.status_label.setText(str(st.message))
             else:
+                self._set_status_icon("status_ok.svg", t.success)
                 self.status_label.setStyleSheet(f"color: {t.success}; font-size: 11px;")
-                self.status_label.setText(f"✓ {st.message}")
+                self.status_label.setText(str(st.message))
             if self._preview_callback is not None:
                 self._preview_callback(
                     resolve_assoc_world_point(self.block, ref, all_blocks=self._all_blocks)
                 )
         except Exception:
+            self._set_status_icon("status_warning.svg", t.error)
             self.status_label.setStyleSheet(f"color: {t.error}; font-size: 11px;")
-            self.status_label.setText("⚠ Выберите разные панели target и source")
+            self.status_label.setText("Выберите разные панели target и source")
             if self._preview_callback is not None:
                 self._preview_callback(None)
+
+    def _set_status_icon(self, icon_name: str, color_hex: str) -> None:
+        pm = render_svg_pixmap(icon_name, color_hex, 14)
+        if pm is not None and not pm.isNull():
+            self._status_icon_label.setPixmap(pm)
+            self._status_icon_label.setVisible(True)
+        else:
+            self._status_icon_label.clear()
+            self._status_icon_label.setVisible(False)
 
     def build_ref(self) -> AssocRef:
         target = self.target_combo.currentData()

@@ -417,7 +417,7 @@ def compute_smart_measurement(t1: MeasureTarget, t2: MeasureTarget) -> SmartMeas
                     sub_label=sub_lbl,
                 )
                 status = (
-                    f"📏 {main_title} ({t1.format_hover_summary()} ↔ {t2.format_hover_summary()}) | "
+                    f"{main_title} ({t1.format_hover_summary()} ↔ {t2.format_hover_summary()}) | "
                     f"По прямой: {direct_dist:.1f} мм"
                 )
                 return SmartMeasurementResult(
@@ -450,7 +450,7 @@ def compute_smart_measurement(t1: MeasureTarget, t2: MeasureTarget) -> SmartMeas
                 name=main_title,
                 sub_label=sub_lbl,
             )
-            status = f"📐 Угол между гранями: {face_angle:.1f}°{right_str} | Расстояние: {direct_dist:.1f} мм"
+            status = f"Угол между гранями: {face_angle:.1f}°{right_str} | Расстояние: {direct_dist:.1f} мм"
             return SmartMeasurementResult(
                 mode="angled_faces",
                 dimension_line=dim,
@@ -477,7 +477,7 @@ def compute_smart_measurement(t1: MeasureTarget, t2: MeasureTarget) -> SmartMeas
             name=main_title,
             sub_label=sub_lbl,
         )
-        status = f"🕳 {main_title}{sys32_tag} (ΔX: {dx:.1f}, ΔY: {dy:.1f}, ΔZ: {dz:.1f})"
+        status = f"{main_title}{sys32_tag} (ΔX: {dx:.1f}, ΔY: {dy:.1f}, ΔZ: {dz:.1f})"
         return SmartMeasurementResult(
             mode="hole_step",
             dimension_line=dim,
@@ -509,7 +509,7 @@ def compute_smart_measurement(t1: MeasureTarget, t2: MeasureTarget) -> SmartMeas
                 name=main_title,
                 sub_label=sub_lbl,
             )
-            status = f"📏 Отступ отверстия Ø{diam:.1f} до грани «{face_t.face_label}»: {perp_dist:.1f} мм"
+            status = f"Отступ отверстия Ø{diam:.1f} до грани «{face_t.face_label}»: {perp_dist:.1f} мм"
             return SmartMeasurementResult(
                 mode="hole_to_face",
                 dimension_line=dim,
@@ -522,7 +522,7 @@ def compute_smart_measurement(t1: MeasureTarget, t2: MeasureTarget) -> SmartMeas
     # 4. Стандартное измерение точка ↔ точка (с возможностью 3-й точкой померить угол)
     dim = DimensionLine(pt1=p1, pt2=p2)
     dx, dy, dz = abs(float(direct_vec[0])), abs(float(direct_vec[1])), abs(float(direct_vec[2]))
-    status = f"📏 Отрезок: {direct_dist:.1f} мм (ΔX: {dx:.1f}, ΔY: {dy:.1f}, ΔZ: {dz:.1f})"
+    status = f"Отрезок: {direct_dist:.1f} мм (ΔX: {dx:.1f}, ΔY: {dy:.1f}, ΔZ: {dz:.1f})"
     return SmartMeasurementResult(
         mode="point_to_point",
         dimension_line=dim,

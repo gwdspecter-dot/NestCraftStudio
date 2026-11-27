@@ -440,5 +440,5 @@ class CADKernel:
         name_a = getattr(panel_a, "name", str(panel_a))
         name_b = getattr(panel_b, "name", str(panel_b))
         if vol is None or (isinstance(vol, float) and math.isnan(vol)):
-            return f"⚠️ Не удалось проверить: {name_a} <-> {name_b}"
-        return f"❌ Пересечение ({int(vol)} мм³): {name_a} <-> {name_b}"
+            return f"Не удалось проверить: {name_a} <-> {name_b}"
+        return f"Пересечение ({int(vol)} мм³): {name_a} <-> {name_b}"

@@ -30,11 +30,13 @@ from ui.room_layout_dialog import (
     WallGapReportDialog,
     render_room_svg_icon,
 )
+from ui.icon_utils import clear_icon_cache, render_svg_icon, render_svg_pixmap
 from ui.fastener_constructor_dialog import FastenerConstructorDialog
 from ui.panels.structure_panel import StructureDock
 from ui.panels.properties_panel import PropertiesDock
 from ui.panels.browser_panel import BrowserDock
 from ui.panels.history_panel import AnalysisDock, HistoryDock
+from ui.theme import current_theme
 from core.room_geometry import (
     check_room_issues,
     snap_product_to_wall,
@@ -214,12 +216,18 @@ class MainWindow(QMainWindow):
 
     def refresh_theme(self) -> None:
         """Обновляет оформление зависимых от темы виджетов (вызывается из ui.theme.apply_theme)."""
+        clear_icon_cache()
         if hasattr(self, "home_page") and self.home_page is not None:
             self.home_page.refresh_theme()
         if hasattr(self, "structure_dock") and self.structure_dock is not None:
             self.structure_dock.refresh_theme()
         if hasattr(self, "properties_dock") and self.properties_dock is not None:
             self.properties_dock.refresh_theme()
+        if hasattr(self, "browser_dock") and self.browser_dock is not None:
+            self.browser_dock.refresh_theme()
+        if hasattr(self, "analysis_dock") and self.analysis_dock is not None:
+            self.analysis_dock.refresh_theme()
+        self._refresh_ui_icons()
         self._refresh_room_toolbar_icons()
 
     def is_home_page_visible(self) -> bool:
@@ -851,8 +859,7 @@ class MainWindow(QMainWindow):
             found = self.properties_dock.joints_panel.select_joint_by_uid(uid)
             if found:
                 self._on_joint_selected(block, uid)
-                if hasattr(self, "statusBar") and self.statusBar() is not None:
-                    self.statusBar().showMessage("🔩 Переход к стыку в панели «Свойства»", 4000)
+                self._show_status("Переход к стыку в панели «Свойства»", 4000, icon_name="struct_joint.svg")
                 return True
 
         if norm_kind == "assoc" and uid:
@@ -862,8 +869,7 @@ class MainWindow(QMainWindow):
             found = self.properties_dock.assoc_panel.select_assoc_by_uid(uid)
             if found:
                 self._on_assoc_selected(block, uid)
-                if hasattr(self, "statusBar") and self.statusBar() is not None:
-                    self.statusBar().showMessage("🔗 Переход к ассоциации в панели «Свойства»", 4000)
+                self._show_status("Переход к ассоциации в панели «Свойства»", 4000, icon_name="struct_assoc.svg")
                 return True
 
         if panel is not None:
@@ -881,10 +887,11 @@ class MainWindow(QMainWindow):
             self.structure_dock.highlight_object(panel)
             self._update_coord_boxes(panel.x, panel.y, panel.z)
             vp.update()
-            if hasattr(self, "statusBar") and self.statusBar() is not None:
-                self.statusBar().showMessage(
-                    f"○ Ручное отверстие на детали «{getattr(panel, 'name', 'Панель')}»", 4000
-                )
+            self._show_status(
+                f"Ручное отверстие на детали «{getattr(panel, 'name', 'Панель')}»",
+                4000,
+                icon_name="status_hole.svg",
+            )
             return True
         return False
 
@@ -1436,7 +1443,7 @@ class MainWindow(QMainWindow):
                     self.analysis_dock.list_widget.addItem(iss.format_line())
             else:
                 self.analysis_dock.list_widget.addItem(
-                    "✅ Ошибок нет! Замечаний и пересечений деталей не обнаружено."
+                    "Ошибок нет! Замечаний и пересечений деталей не обнаружено."
                 )
         if vp is not None:
             vp.update()
@@ -1445,7 +1452,7 @@ class MainWindow(QMainWindow):
         if not self.bg_tasks.is_latest(task_id, kind):
             return
         if message:
-            self.statusBar().showMessage(message, 4000)
+            self._show_status(message, 4000, icon_name="status_busy.svg")
 
     def _on_bg_task_progress(
         self,
@@ -1459,11 +1466,11 @@ class MainWindow(QMainWindow):
             return
         if total > 0:
             pct = int(round(current * 100.0 / max(1, total)))
-            text = f"{message} ({pct}%)" if message else f"⏳ Выполнение ({current}/{total}, {pct}%)"
+            text = f"{message} ({pct}%)" if message else f"Выполнение ({current}/{total}, {pct}%)"
         else:
             text = message
         if text:
-            self.statusBar().showMessage(text, 4000)
+            self._show_status(text, 4000, icon_name="status_busy.svg")
 
     def _on_bg_task_finished(self, task_id: int, kind: str, result: object) -> None:
         if not self.bg_tasks.is_latest(task_id, kind):
@@ -1476,7 +1483,7 @@ class MainWindow(QMainWindow):
             try:
                 loaded = materialize_project_snapshot(
                     result,
-                    progress_cb=lambda cur, tot, msg: self.statusBar().showMessage(msg, 3000),
+                    progress_cb=lambda cur, tot, msg: self._show_status(msg, 3000, icon_name="status_busy.svg"),
                 )
                 self._apply_loaded_project_result(result.path, loaded)
             except Exception as exc:
@@ -1489,7 +1496,12 @@ class MainWindow(QMainWindow):
     def _on_bg_task_failed(self, task_id: int, kind: str, error_msg: str) -> None:
         if not self.bg_tasks.is_latest(task_id, kind):
             return
-        self.statusBar().showMessage(f"⚠️ Ошибка фоновой операции ({kind}): {error_msg}", 6000)
+        self._show_status(
+            f"Ошибка фоновой операции ({kind}): {error_msg}",
+            6000,
+            icon_name="status_warning.svg",
+            color_hex=current_theme().warning,
+        )
         if kind == TASK_PROJECT_LOAD:
             QMessageBox.critical(self, "Ошибка открытия", error_msg)
 
@@ -1506,9 +1518,10 @@ class MainWindow(QMainWindow):
         # ждать geometry_pending нельзя — флаг мог зависнуть, анализ «Проблемы» блокировался навсегда.
         pending_n = sum(1 for p in all_panels if getattr(p, "geometry_pending", False))
         if pending_n:
-            self.statusBar().showMessage(
-                f"⏳ У {pending_n} дет. ещё строится mesh-превью; анализ коллизий всё равно запускается",
+            self._show_status(
+                f"У {pending_n} дет. ещё строится mesh-превью; анализ коллизий всё равно запускается",
                 4000,
+                icon_name="status_busy.svg",
             )
 
         snap = CollisionAnalysisSnapshot.from_panels(all_panels, min_volume=0.1)
@@ -1521,7 +1534,10 @@ class MainWindow(QMainWindow):
             return
 
         if async_run:
-            self.analysis_dock.list_widget.addItem("⏳ Анализ пересечений…")
+            if hasattr(self.analysis_dock, "set_busy_message"):
+                self.analysis_dock.set_busy_message("Анализ пересечений…")
+            else:
+                self.analysis_dock.list_widget.addItem("Анализ пересечений…")
 
         task_id, _snap = self.bg_tasks.submit_collision_analysis(
             snap,
@@ -1540,9 +1556,11 @@ class MainWindow(QMainWindow):
         self._collision_cache_sig = None if has_errors else result.scene_sig
         self._collision_cache_hits = None if has_errors else live_hits
         self._apply_collision_results(vp, all_panels, live_hits)
-        self.statusBar().showMessage(
-            f"✅ Анализ пересечений завершён (найдено: {len(live_hits)})",
+        self._show_status(
+            f"Анализ пересечений завершён (найдено: {len(live_hits)})",
             4000,
+            icon_name="status_ok.svg",
+            color_hex=current_theme().success,
         )
 
     def _on_collision_worker_finished(
@@ -1830,7 +1848,12 @@ class MainWindow(QMainWindow):
         else:
             self.properties_dock.show_object_properties(None)
         vp.update()
-        self.statusBar().showMessage(f"✅ Проект загружен: {self.project_name}", 4000)
+        self._show_status(
+            f"Проект загружен: {self.project_name}",
+            4000,
+            icon_name="status_ok.svg",
+            color_hex=current_theme().success,
+        )
         self._show_load_warnings_in_problems_dock(warnings)
         return True
 
@@ -2050,8 +2073,9 @@ class MainWindow(QMainWindow):
     def _on_fastener_message(self, text: str):
         if not text:
             return
-        self.statusBar().showMessage(text, 10000)
-        if "⚠️" in text:
+        self._show_status(text, 10000)
+        low = text.lower()
+        if "пересечение" in low or "ошибка" in low or "предупреждение" in low:
             self._refresh_issues_only()
         if text.startswith("Стык не найден"):
             from PyQt6.QtWidgets import QMessageBox
@@ -2062,7 +2086,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "act_measure") and vp is not None:
             self.act_measure.setChecked(vp.measure_mode)
         if msg:
-            self.statusBar().showMessage(msg, 6000)
+            self._show_status(msg, 6000)
         else:
             self.statusBar().clearMessage()
 
@@ -2355,13 +2379,13 @@ class MainWindow(QMainWindow):
         act_dup.triggered.connect(self.duplicate_selected_panel)
         edit_menu.addAction(act_dup)
 
-        self.act_mirror = QAction("🪞 Зеркальная копия… (Ctrl+M)", self)
+        self.act_mirror = QAction("Зеркальная копия… (Ctrl+M)", self)
         self.act_mirror.setShortcut(QKeySequence("Ctrl+M"))
         self.act_mirror.setToolTip("Создать зеркальную копию детали с отражением кромок, пазов и присадки (Ctrl+M)")
         self.act_mirror.triggered.connect(self.mirror_selected_panel)
         edit_menu.addAction(self.act_mirror)
 
-        self.act_array = QAction("▤ Линейный массив… (Ctrl+Shift+A)", self)
+        self.act_array = QAction("Линейный массив… (Ctrl+Shift+A)", self)
         self.act_array.setShortcut(QKeySequence("Ctrl+Shift+A"))
         self.act_array.setToolTip("Размножить деталь с шагом, просветом или делением проёма на равные ниши (Ctrl+Shift+A)")
         self.act_array.triggered.connect(self.array_selected_panel)
@@ -2473,10 +2497,10 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(act_assoc)
 
         tools_menu.addSeparator()
-        act_catalog = QAction("📚 Библиотека материалов и крепежа…", self)
-        act_catalog.setShortcut(QKeySequence("Ctrl+Shift+M"))
-        act_catalog.triggered.connect(self.open_catalog_browser)
-        tools_menu.addAction(act_catalog)
+        self.act_catalog = QAction("Библиотека материалов и крепежа…", self)
+        self.act_catalog.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        self.act_catalog.triggered.connect(self.open_catalog_browser)
+        tools_menu.addAction(self.act_catalog)
 
         product_menu = menubar.addMenu("Изделие")
         self.act_product_params = QAction("Параметры изделия…", self)
@@ -2569,28 +2593,33 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, top_tb1)
         self._editor_toolbars = [top_tb1]
 
-        act_clear = QAction("🧹 Сцена с нуля", self)
-        act_clear.triggered.connect(self.clear_scene)
-        top_tb1.addAction(act_clear)
+        top_tb1.setIconSize(QSize(18, 18))
+        top_tb1.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+
+        self.act_clear = QAction("Сцена с нуля", self)
+        self.act_clear.triggered.connect(self.clear_scene)
+        top_tb1.addAction(self.act_clear)
         top_tb1.addSeparator()
 
         # Кнопки быстрого переключения проекций
         view_buttons = [
-            ("🧊 3D Изометрия", "iso"),
-            ("📐 Спереди", "front"),
-            ("📐 Сверху", "top"),
-            ("📐 Слева", "left"),
-            ("📐 Справа", "right"),
-            ("📐 Сзади", "back"),
+            ("3D Изометрия", "iso", "view_iso.svg"),
+            ("Спереди", "front", "view_front.svg"),
+            ("Сверху", "top", "view_top.svg"),
+            ("Слева", "left", "view_left.svg"),
+            ("Справа", "right", "view_right.svg"),
+            ("Сзади", "back", "view_back.svg"),
         ]
-        for label, code in view_buttons:
+        self._view_toolbar_actions: list[tuple[QAction, str]] = []
+        for label, code, icon_name in view_buttons:
             btn = QAction(label, self)
             btn.triggered.connect(lambda checked, c=code: self._set_standard_view(c))
             top_tb1.addAction(btn)
+            self._view_toolbar_actions.append((btn, icon_name))
 
         top_tb1.addSeparator()
 
-        self.act_grid = QAction("▦ Сетка", self)
+        self.act_grid = QAction("Сетка", self)
         self.act_grid.setCheckable(True)
         self.act_grid.setChecked(True)
         self.act_grid.setToolTip(
@@ -2600,11 +2629,11 @@ class MainWindow(QMainWindow):
         self.act_grid.triggered.connect(self._toggle_grid)
         top_tb1.addAction(self.act_grid)
 
-        self.act_face_snap = QAction("🧲 Магнит", self)
+        self.act_face_snap = QAction("Магнит", self)
         self.act_face_snap.setCheckable(True)
         self.act_face_snap.setChecked(True)
         self.act_face_snap.setToolTip(
-            "Магнитная привязка (🧲) к точкам, рёбрам и граням других деталей "
+            "Магнитная привязка к точкам, рёбрам и граням других деталей "
             "при перемещении (G), вставке (Ctrl+V) и растягивании торцов/углов.\n"
             "Снимите галочку, чтобы отключить (или удерживайте Ctrl для временного магнита)."
         )
@@ -2699,16 +2728,16 @@ class MainWindow(QMainWindow):
         top_tb2.addWidget(self.section_axis_combo)
 
         self.section_flip_btn = QToolButton()
-        self.section_flip_btn.setText("⇄")
         self.section_flip_btn.setCheckable(True)
+        self.section_flip_btn.setIconSize(QSize(16, 16))
         self.section_flip_btn.setToolTip("Инвертировать отсекаемую половину сцены")
         self.section_flip_btn.toggled.connect(self._on_section_flip_toggled)
         top_tb2.addWidget(self.section_flip_btn)
 
         self.section_cap_btn = QToolButton()
-        self.section_cap_btn.setText("▤")
         self.section_cap_btn.setCheckable(True)
         self.section_cap_btn.setChecked(True)
+        self.section_cap_btn.setIconSize(QSize(16, 16))
         self.section_cap_btn.setToolTip(
             "Сплошная заглушка и штриховка среза (Stencil Cap)\n"
             "Отключите для просмотра полого контура сечения"
@@ -2789,8 +2818,33 @@ class MainWindow(QMainWindow):
         vis_btn.setMenu(self._room_vis_menu)
         self._room_vis_btn = vis_btn
         self._room_vis_btn_action = self._room_toolbar.addWidget(vis_btn)
+        self._refresh_ui_icons()
         self._refresh_room_toolbar_icons()
         self._room_toolbar.setVisible(False)
+
+    def _refresh_ui_icons(self) -> None:
+        """Назначает и перекрашивает тематические SVG-иконки действий главного окна."""
+        c = current_theme()
+        action_specs = (
+            ("act_mirror", "action_mirror.svg", 16),
+            ("act_array", "action_array.svg", 16),
+            ("act_catalog", "action_library.svg", 16),
+            ("act_clear", "action_clear.svg", 16),
+            ("act_grid", "tool_grid.svg", 16),
+            ("act_face_snap", "tool_magnet.svg", 16),
+            ("section_flip_btn", "section_flip.svg", 16),
+            ("section_cap_btn", "section_cap.svg", 16),
+        )
+        for attr, icon_name, sz in action_specs:
+            obj = getattr(self, attr, None)
+            if obj is not None and hasattr(obj, "setIcon"):
+                ico = render_svg_icon(icon_name, c.text, sz)
+                if ico is not None:
+                    obj.setIcon(ico)
+        for btn, icon_name in getattr(self, "_view_toolbar_actions", []):
+            ico = render_svg_icon(icon_name, c.text, 16)
+            if ico is not None:
+                btn.setIcon(ico)
 
     # ── Методы режима «Габаритная рамка помещения» ────────────────
 
@@ -3552,5 +3606,86 @@ class MainWindow(QMainWindow):
     def _create_status_bar(self):
         status = QStatusBar()
         self.setStatusBar(status)
+        self._status_icon_label = QLabel()
+        self._status_icon_label.setFixedSize(16, 16)
+        self._status_icon_label.setVisible(False)
+        status.addWidget(self._status_icon_label)
         mat_label = QLabel("Крепёж: панель → Ctrl+H → вторая панель → мышь + ЛКМ | Esc | Ctrl+Z")
-        status.addWidget(mat_label)
+        status.addPermanentWidget(mat_label)
+        status.messageChanged.connect(self._on_status_message_changed)
+
+    def _on_status_message_changed(self, message: str) -> None:
+        if not message and hasattr(self, "_status_icon_label"):
+            self._status_icon_label.clear()
+            self._status_icon_label.setVisible(False)
+
+    @staticmethod
+    def _infer_status_icon(text: str) -> tuple[str | None, str | None]:
+        c = current_theme()
+        low = text.lower()
+        if "пересечение" in low or "предупреждение" in low:
+            return "status_warning.svg", c.warning
+        if "ошибка" in low:
+            return "status_error.svg", c.error
+        if "заглушка сечения" in low:
+            return "section_cap.svg", c.accent
+        if "направление сечения" in low:
+            return "section_flip.svg", c.accent
+        if "сечение" in low or "плоскость сечения" in low or "ось сечения" in low:
+            return "view_section.svg", c.accent
+        if "призраки окружения" in low:
+            return "view_isolate.svg", c.accent
+        if "магнит" in low:
+            return "tool_magnet.svg", c.accent
+        if "скопировано" in low or "вставка" in low or "вставлено" in low or "буфер" in low or "копирование" in low or "точка привязки" in low:
+            return "status_clipboard.svg", c.text
+        if "свободное перемещение" in low:
+            return "status_unlock.svg", c.text
+        if low.startswith("ось x") or low.startswith("ось y") or low.startswith("ось z"):
+            return "status_lock.svg", c.accent
+        if "вид: домой" in low:
+            return "status_home.svg", c.text
+        if low.startswith("вид:"):
+            return "view_iso.svg", c.text
+        if "угол" in low:
+            return "status_angle.svg", c.accent
+        if "отверстие" in low or "шаг ø" in low:
+            return "status_hole.svg", c.accent
+        if "отрезок" in low or "отступ" in low or "точка 1" in low or "точка 2" in low or "расстояние" in low or "выбрана грань" in low:
+            return "tool_measure.svg", c.accent
+        if "драйвер" in low or "формула" in low:
+            return "status_formula.svg", c.accent
+        if "поставлено" in low or "зафиксирована" in low or "размер [" in low or "завершён" in low or "загружен" in low:
+            return "status_ok.svg", c.success
+        if "анализ" in low or "загрузка" in low or "автосохранение" in low or "выполнение" in low:
+            return "status_busy.svg", c.accent
+        if "δx=" in low or "Δx=" in text or "ΔX=" in text:
+            return "tool_move.svg", c.accent
+        return None, None
+
+    def _show_status(
+        self,
+        text: str,
+        timeout: int = 4000,
+        *,
+        icon_name: str | None = None,
+        color_hex: str | None = None,
+    ) -> None:
+        if not hasattr(self, "statusBar") or self.statusBar() is None:
+            return
+        if icon_name is None:
+            icon_name, inferred_color = self._infer_status_icon(text)
+            if color_hex is None:
+                color_hex = inferred_color
+        if hasattr(self, "_status_icon_label"):
+            if icon_name:
+                pm = render_svg_pixmap(icon_name, color_hex or current_theme().text, 14)
+                if pm is not None and not pm.isNull():
+                    self._status_icon_label.setPixmap(pm)
+                    self._status_icon_label.setVisible(True)
+                else:
+                    self._status_icon_label.setVisible(False)
+            else:
+                self._status_icon_label.clear()
+                self._status_icon_label.setVisible(False)
+        self.statusBar().showMessage(text, timeout)

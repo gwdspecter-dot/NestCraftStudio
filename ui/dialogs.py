@@ -139,9 +139,23 @@ class CreatePanelDialog(QDialog):
 
         layout.addLayout(form)
 
-        hint = QLabel("💡 После создания панель можно двигать стрелками (← → ↑ ↓ и PgUp/PgDn)")
-        hint.setStyleSheet("color: #666666; font-size: 11px;")
-        layout.addWidget(hint)
+        from PyQt6.QtWidgets import QHBoxLayout
+        from ui.icon_utils import render_svg_pixmap
+        from ui.theme import current_theme
+
+        c = current_theme()
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        hint_row.setSpacing(6)
+        hint_icon = QLabel()
+        pm = render_svg_pixmap("status_info.svg", c.text_dim, 14)
+        if pm is not None and not pm.isNull():
+            hint_icon.setPixmap(pm)
+        hint_row.addWidget(hint_icon)
+        hint = QLabel("После создания панель можно двигать стрелками (← → ↑ ↓ и PgUp/PgDn)")
+        hint.setStyleSheet(f"color: {c.text_dim}; font-size: 11px;")
+        hint_row.addWidget(hint, 1)
+        layout.addLayout(hint_row)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel

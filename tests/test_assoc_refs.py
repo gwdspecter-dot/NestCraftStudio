@@ -397,24 +397,24 @@ def test_assoc_dock_headless_status_and_recovery_actions():
     dock.assoc_modified.connect(_apply_mod)
     dock.load_assocs([block])
 
-    assert "⚠ 1" in dock._title
+    assert "проблем: 1" in dock._title
     item0 = dock.list_widget.item(0)
     assert item0 is not None
-    assert "⚠" in item0.text() and "сдвиг грани" in item0.text()
+    assert "сдвиг грани" in item0.text()
     assert "Z+" in dock.status_label.text()
 
     # 1. Нажимаем «Подобрать грань» -> assoc_modified перепривязывает на Z+, проблемы исчезают
     assert dock.rebind_selected_assoc() is True
     assert len(modifications) == 1
     assert modifications[-1][1]["source_face"] == "Z+"
-    assert "⚠" not in dock._title
+    assert "проблем:" not in dock._title
 
     # 2. Нажимаем «Зафиксировать» -> fixed=True и кнопка меняется на «Привязать»
     assert dock.toggle_fixed_selected_assoc() is True
     assert modifications[-1][1].get("fixed") is True
     assert "Привязать" in dock.btn_toggle_fixed.text()
     item_fixed = dock.list_widget.item(0)
-    assert item_fixed is not None and "📌" in item_fixed.text()
+    assert item_fixed is not None and "[фикс.]" in item_fixed.text()
 
     # 3. Нажимаем «Привязать» -> fixed снимается обратно
     assert dock.toggle_fixed_selected_assoc() is True

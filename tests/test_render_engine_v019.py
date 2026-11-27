@@ -599,7 +599,7 @@ class TestRenderEngineV019(unittest.TestCase):
         self.assertAlmostEqual(float(target_3d[2]), 250.0)
 
     def test_toggleable_magnetic_snap_replaces_face_to_face(self):
-        """Кнопка «🧲 Магнит» (face_snap_enabled) включает и отключает магнитную привязку для перемещения и растягивания."""
+        """Кнопка «Магнит» (face_snap_enabled) с SVG-иконкой включает и отключает магнитную привязку для перемещения и растягивания."""
         mw_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "ui",
@@ -607,7 +607,8 @@ class TestRenderEngineV019(unittest.TestCase):
         )
         with open(mw_path, "r", encoding="utf-8") as f:
             mw_src = f.read()
-        self.assertIn('QAction("🧲 Магнит", self)', mw_src)
+        self.assertIn('QAction("Магнит", self)', mw_src)
+        self.assertIn("tool_magnet.svg", mw_src)
         self.assertNotIn("📐 Грань↔грань", mw_src)
 
 

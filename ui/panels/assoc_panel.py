@@ -305,18 +305,18 @@ class AssocPanelWidget(QWidget):
         layout.setSpacing(6)
 
         top = QHBoxLayout()
-        self.btn_add = QPushButton("➕ Добавить")
+        self.btn_add = QPushButton("Добавить")
         self.btn_add.setToolTip("Создать ассоциативное отверстие (Ctrl+Shift+H)")
         self.btn_add.clicked.connect(self.add_assoc_requested.emit)
         top.addWidget(self.btn_add)
 
-        self.btn_edit = QPushButton("✎ Правка…")
+        self.btn_edit = QPushButton("Правка…")
         self.btn_edit.setToolTip("Открыть полный диалог выбранной ссылки")
         self.btn_edit.setEnabled(False)
         self.btn_edit.clicked.connect(self._emit_edit_requested)
         top.addWidget(self.btn_edit)
 
-        self.btn_delete = QPushButton("🗑 Удалить")
+        self.btn_delete = QPushButton("Удалить")
         self.btn_delete.setToolTip("Удалить выбранную ассоциацию и её отверстия")
         self.btn_delete.setEnabled(False)
         self.btn_delete.clicked.connect(self.delete_selected_assoc)
@@ -324,7 +324,7 @@ class AssocPanelWidget(QWidget):
         layout.addLayout(top)
 
         recovery_row = QHBoxLayout()
-        self.btn_toggle_fixed = QPushButton("📌 Зафиксировать")
+        self.btn_toggle_fixed = QPushButton("Зафиксировать")
         self.btn_toggle_fixed.setToolTip(
             "Заморозить текущие координаты отверстия на target (отвязать от грани source) или вернуть привязку"
         )
@@ -332,7 +332,7 @@ class AssocPanelWidget(QWidget):
         self.btn_toggle_fixed.clicked.connect(self.toggle_fixed_selected_assoc)
         recovery_row.addWidget(self.btn_toggle_fixed)
 
-        self.btn_rebind_face = QPushButton("🧭 Подобрать грань")
+        self.btn_rebind_face = QPushButton("Подобрать грань")
         self.btn_rebind_face.setToolTip(
             "Подобрать актуальную грань source (после поворота или перемещения) и обновить привязку"
         )
@@ -414,13 +414,34 @@ class AssocPanelWidget(QWidget):
 
         self._hint_label = QLabel(
             "Отверстие на target считается от грани source с учётом якоря.\n"
-            "📌 Зафиксировать — заморозить позицию на target; 🧭 Подобрать грань — восстановить после поворота."
+            "«Зафиксировать» — заморозить позицию на target; «Подобрать грань» — восстановить после поворота."
         )
         self._hint_label.setWordWrap(True)
         self._hint_label.setStyleSheet(f"color: {dim_col}; font-size: 11px;")
         layout.addWidget(self._hint_label)
 
+        self._apply_button_icons(fixed_mode=False)
         self._set_controls_enabled(False)
+
+    def _apply_button_icons(self, *, fixed_mode: bool = False) -> None:
+        try:
+            from ui.icon_utils import render_svg_icon
+            from ui.theme import current_theme
+
+            c = current_theme()
+            pairs = [
+                (self.btn_add, "action_add.svg"),
+                (self.btn_edit, "action_edit.svg"),
+                (self.btn_delete, "action_delete.svg"),
+                (self.btn_toggle_fixed, "struct_assoc.svg" if fixed_mode else "action_pin.svg"),
+                (self.btn_rebind_face, "action_rebind.svg"),
+            ]
+            for btn, icon_name in pairs:
+                ico = render_svg_icon(icon_name, c.text, 15)
+                if hasattr(btn, "setIcon") and ico is not None:
+                    btn.setIcon(ico)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("Unable to apply assoc button SVG icons (headless): %s", exc)
 
     def panel_title(self) -> str:
         return self._title
@@ -432,10 +453,14 @@ class AssocPanelWidget(QWidget):
     def refresh_theme(self) -> None:
         _, _, _, _, dim_col = _theme_colors()
         self._hint_label.setStyleSheet(f"color: {dim_col}; font-size: 11px;")
+        is_fixed_btn = "Привязать" in self.btn_toggle_fixed.text()
+        self._apply_button_icons(fixed_mode=is_fixed_btn)
         if self._last_status is not None:
             self._update_status_banner(self._last_status)
         else:
             self.status_label.setStyleSheet(f"color: {dim_col}; font-size: 11px;")
+        if self.blocks_ref:
+            self.load_assocs(self.blocks_ref)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for w in (
@@ -453,21 +478,22 @@ class AssocPanelWidget(QWidget):
         ):
             w.setEnabled(enabled)
         if not enabled:
-            self.btn_toggle_fixed.setText("📌 Зафиксировать")
+            self.btn_toggle_fixed.setText("Зафиксировать")
+            self._apply_button_icons(fixed_mode=False)
             self._last_status = None
             self.status_label.setText("")
 
     @staticmethod
     def _status_badge(status: AssocAttachmentStatus | None, ref: AssocRef) -> tuple[str, str]:
-        """Возвращает `(префикс, суффикс)` для строки списка."""
+        """Возвращает `(имя_svg_иконки, текстовый_суффикс)` для строки списка."""
         if status is None:
-            return ("📌", " [фикс.]") if ref.fixed else ("🔗", "")
+            return ("action_pin.svg", " [фикс.]") if ref.fixed else ("struct_assoc.svg", "")
         if status.severity == "error":
             if status.state == "broken_missing_panel":
-                return ("❌", " [нет детали]")
+                return ("status_error.svg", " [нет детали]")
             if status.state == "broken_same_panel":
-                return ("❌", " [та же деталь]")
-            return ("❌", " [ошибка]")
+                return ("status_error.svg", " [та же деталь]")
+            return ("status_error.svg", " [ошибка]")
         if status.severity == "warning":
             tags = {
                 "out_of_target": " [вне детали]",
@@ -478,10 +504,10 @@ class AssocPanelWidget(QWidget):
                     else " [сдвиг грани]"
                 ),
             }
-            return ("⚠", tags.get(status.state, " [предупр.]"))
+            return ("status_warning.svg", tags.get(status.state, " [предупр.]"))
         if status.state == "fixed" or ref.fixed:
-            return ("📌", " [фикс.]")
-        return ("🔗", "")
+            return ("action_pin.svg", " [фикс.]")
+        return ("struct_assoc.svg", "")
 
     @staticmethod
     def _format_item(
@@ -504,10 +530,10 @@ class AssocPanelWidget(QWidget):
         src = by_uid.get(ref.source_uid, (ref.source_uid or "?")[:8])
         dia = float(ref.params.get("diameter") or 0.0)
         face = ref.source_face or "?"
-        prefix, suffix = AssocPanelWidget._status_badge(status, ref)
+        _icon_name, suffix = AssocPanelWidget._status_badge(status, ref)
         if ref.fixed and (status is None or status.state == "fixed"):
-            return f"{prefix} {tgt}  Ø{dia:g}{suffix}"
-        return f"{prefix} {tgt} ← {src}.{face}  Ø{dia:g}{suffix}"
+            return f"{tgt}  Ø{dia:g}{suffix}"
+        return f"{tgt} ← {src}.{face}  Ø{dia:g}{suffix}"
 
     @staticmethod
     def _apply_item_color(item: QListWidgetItem, status: AssocAttachmentStatus) -> None:
@@ -555,6 +581,22 @@ class AssocPanelWidget(QWidget):
                     txt = self._format_item(b, ref, st, all_panels_by_uid=all_by_uid)
                     item = QListWidgetItem(txt)
                     item.setData(Qt.ItemDataRole.UserRole, (b, ref.uid))
+                    if hasattr(item, "setIcon"):
+                        from ui.icon_utils import render_svg_icon
+
+                        err_col, warn_col, acc_col, ok_col, _dim_col = _theme_colors()
+                        icon_name, _suf = self._status_badge(st, ref)
+                        if st.severity == "error":
+                            icon_col = err_col
+                        elif st.severity == "warning":
+                            icon_col = warn_col
+                        elif st.state == "fixed" or ref.fixed:
+                            icon_col = acc_col
+                        else:
+                            icon_col = ok_col
+                        ico = render_svg_icon(icon_name, icon_col, 15)
+                        if ico is not None:
+                            item.setIcon(ico)
                     tip = st.message + (f"\n{st.remedy}" if st.remedy else "")
                     if hasattr(item, "setToolTip"):
                         item.setToolTip(tip)
@@ -566,7 +608,7 @@ class AssocPanelWidget(QWidget):
 
             if total > 0:
                 if problems > 0:
-                    self._set_panel_title(f"Ассоциации ({total} · ⚠ {problems})")
+                    self._set_panel_title(f"Ассоциации ({total} · проблем: {problems})")
                 else:
                     self._set_panel_title(f"Ассоциации ({total})")
                 if selected_row >= 0:
@@ -666,10 +708,12 @@ class AssocPanelWidget(QWidget):
                 w.setEnabled(not is_fixed)
 
             if is_fixed:
-                self.btn_toggle_fixed.setText("🔗 Привязать")
+                self.btn_toggle_fixed.setText("Привязать")
+                self._apply_button_icons(fixed_mode=True)
                 self.btn_toggle_fixed.setEnabled(target is not None and source is not None)
             else:
-                self.btn_toggle_fixed.setText("📌 Зафиксировать")
+                self.btn_toggle_fixed.setText("Зафиксировать")
+                self._apply_button_icons(fixed_mode=False)
                 self.btn_toggle_fixed.setEnabled(target is not None)
 
             can_rebind = (

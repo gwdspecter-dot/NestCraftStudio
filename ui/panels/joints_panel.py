@@ -279,12 +279,12 @@ class JointsPanelWidget(QWidget):
         layout.setSpacing(6)
 
         top_row = QHBoxLayout()
-        self.btn_add = QPushButton("➕ Добавить стык (2 панели)")
+        self.btn_add = QPushButton("Добавить стык (2 панели)")
         self.btn_add.setToolTip("Создать параметрический стык между двумя выделенными панелями")
         self.btn_add.clicked.connect(self.add_joint_requested.emit)
         top_row.addWidget(self.btn_add)
 
-        self.btn_delete = QPushButton("🗑 Удалить стык")
+        self.btn_delete = QPushButton("Удалить стык")
         self.btn_delete.setToolTip("Удалить выбранный стык и все созданные им отверстия")
         self.btn_delete.setEnabled(False)
         self.btn_delete.clicked.connect(self.delete_selected_joint)
@@ -333,7 +333,31 @@ class JointsPanelWidget(QWidget):
         form.addRow(QLabel("Точек:"), self.count_spin)
 
         layout.addWidget(form_widget)
+        self._apply_button_icons()
         self._set_controls_enabled(False)
+
+    def _apply_button_icons(self) -> None:
+        try:
+            from ui.icon_utils import render_svg_icon
+            from ui.theme import current_theme
+
+            c = current_theme()
+            ico_add = render_svg_icon("action_add.svg", c.text, 15)
+            ico_del = render_svg_icon("action_delete.svg", c.text, 15)
+            if hasattr(self.btn_add, "setIcon") and ico_add is not None:
+                self.btn_add.setIcon(ico_add)
+            if hasattr(self.btn_delete, "setIcon") and ico_del is not None:
+                self.btn_delete.setIcon(ico_del)
+        except Exception as exc:  # noqa: BLE001
+            # headless / без графического контекста Qt
+            import logging
+
+            logging.getLogger(__name__).debug("Unable to apply joint button SVG icons: %s", exc)
+
+    def refresh_theme(self) -> None:
+        self._apply_button_icons()
+        if self.blocks_ref:
+            self.load_joints(self.blocks_ref)
 
     def panel_title(self) -> str:
         return self._title
@@ -376,7 +400,7 @@ class JointsPanelWidget(QWidget):
             step_txt = f"шаг {float(pitch):g} мм"
         else:
             step_txt = f"×{count}"
-        return f"🔩 {name_a} ↔ {name_b} [{preset_lbl}, {step_txt}, отст. {margin:g} мм]"
+        return f"{name_a} ↔ {name_b} [{preset_lbl}, {step_txt}, отст. {margin:g} мм]"
 
     def load_joints(self, blocks: list) -> None:
         """Обновляет список стыков по всем блокам сцены."""
@@ -405,20 +429,37 @@ class JointsPanelWidget(QWidget):
                     pb = all_by_uid.get(str(rec.panel_b_uid or ""))
                     if pa is None or pb is None:
                         broken = True
-                        txt = "⚠ " + txt + " [нет детали]"
+                        txt = txt + " [нет детали]"
                     else:
                         try:
                             from core.joint import find_joint
 
                             if find_joint(pa, pb) is None and find_joint(pa, pb, tol=3.0) is None:
                                 broken = True
-                                txt = "⚠ " + txt + " [не касаются]"
+                                txt = txt + " [не касаются]"
                         except Exception as exc:
                             broken = True
-                            txt = "⚠ " + txt + " [ошибка проверки]"
+                            txt = txt + " [ошибка проверки]"
                             _ = exc
                     item = QListWidgetItem(txt)
                     item.setData(Qt.ItemDataRole.UserRole, (b, rec.uid))
+                    try:
+                        from ui.icon_utils import render_svg_icon
+                        from ui.theme import current_theme
+
+                        c = current_theme()
+                        ico = render_svg_icon(
+                            "status_warning.svg" if broken else "struct_joint.svg",
+                            c.error if broken else c.accent,
+                            16,
+                        )
+                        if hasattr(item, "setIcon") and ico is not None:
+                            item.setIcon(ico)
+                    except Exception as exc:  # noqa: BLE001
+                        # headless / без графического контекста Qt
+                        import logging
+
+                        logging.getLogger(__name__).debug("Unable to apply joint item SVG icon: %s", exc)
                     if broken:
                         try:
                             from PyQt6.QtGui import QBrush, QColor
@@ -426,7 +467,7 @@ class JointsPanelWidget(QWidget):
 
                             item.setForeground(QBrush(QColor(current_theme().error)))
                         except Exception as exc:
-                            # headless / без QtGui — текст уже с ⚠
+                            # headless / без QtGui — статус указан в тексте [нет детали] / [не касаются]
                             _ = exc
                     self.list_widget.addItem(item)
                     if prev_uid and rec.uid == prev_uid and (prev_block is None or b is prev_block):

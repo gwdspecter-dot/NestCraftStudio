@@ -36,10 +36,10 @@ def test_issue_dataclass_and_registry():
     assert iss.panel_uid == "uid-123"
     assert iss.code == "missing_material"
     assert iss.message == "Материал не найден"
-    assert "⚠️" in iss.format_line()
+    assert "[Предупреждение]" in iss.format_line()
 
     err = Issue("error", "uid-456", "panel_collision", "Пересечение")
-    assert "❌" in err.format_line()
+    assert "[Ошибка]" in err.format_line()
 
     assert isinstance(ISSUE_CHECKS, list)
     assert len(ISSUE_CHECKS) >= 6

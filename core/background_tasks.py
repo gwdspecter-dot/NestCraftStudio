@@ -294,7 +294,7 @@ class BackgroundTaskManager(QObject):
             TASK_AUTOSAVE,
             snapshot,
             _work,
-            start_message="⏳ Автосохранение проекта…",
+            start_message="Автосохранение проекта…",
             sync=sync,
         )
 
@@ -316,7 +316,7 @@ class BackgroundTaskManager(QObject):
             TASK_PROJECT_LOAD,
             target_path,
             _work,
-            start_message=f"⏳ Загрузка файла «{target_path.name}»…",
+            start_message=f"Загрузка файла «{target_path.name}»…",
             sync=sync,
         )
 
@@ -341,7 +341,7 @@ class BackgroundTaskManager(QObject):
                 list(s.panels),
                 min_volume=s.min_volume,
                 progress_cb=lambda cur, tot: progress_cb(
-                    cur, tot, f"⏳ Анализ пересечений: {cur}/{tot} пар…"
+                    cur, tot, f"Анализ пересечений: {cur}/{tot} пар…"
                 ),
             )
             return CollisionAnalysisResult(scene_sig=s.scene_sig, hits=hits)
@@ -350,7 +350,7 @@ class BackgroundTaskManager(QObject):
             TASK_COLLISION,
             snap,
             _work,
-            start_message="⏳ Анализ пересечений…",
+            start_message="Анализ пересечений…",
             sync=sync,
         )
         return task_id, snap

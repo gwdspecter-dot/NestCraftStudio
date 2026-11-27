@@ -472,7 +472,7 @@ class Viewport3D(QOpenGLWidget):
         self._active_hole_owner: tuple[object, str, str] | None = None
         self._right_press_pos: QPoint | None = None
         self._right_did_drag: bool = False
-        # Магнитная привязка (🧲) при перемещении (G), вставке и растягивании граней/углов
+        # Магнитная привязка при перемещении (G), вставке и растягивании граней/углов
         self.face_snap_enabled = True
         self.drag_face_snap_desc = ""
 
@@ -686,9 +686,9 @@ class Viewport3D(QOpenGLWidget):
         exclude_panel: Panel | None = None,
         base_radius: float = 20.0,
     ) -> tuple[np.ndarray | None, str]:
-        """Ищет ближайшую к курсору `(mx, my)` магнитную точку привязки (`🧲`) на других деталях сцены.
+        """Ищет ближайшую к курсору `(mx, my)` магнитную точку привязки на других деталях сцены.
 
-        Управляется переключателем `self.face_snap_enabled` (кнопка «🧲 Магнит» на верхней панели)
+        Управляется переключателем `self.face_snap_enabled` (кнопка «Магнит» на верхней панели)
         или временным удержанием клавиши `[Ctrl]`.
         """
         is_ctrl = bool(getattr(self, "ctrl_held", False))
@@ -776,7 +776,7 @@ class Viewport3D(QOpenGLWidget):
                     _log.debug("Ошибка проекции точки привязки помещения: %s", exc)
 
         if best_pt is not None:
-            prefix = "🧲 [Ctrl] " if is_ctrl else "🧲 "
+            prefix = "Магнит [Ctrl]: " if is_ctrl else "Магнит: "
             return best_pt, f"{prefix}{best_desc}"
         return None, ""
 
@@ -2921,11 +2921,11 @@ class Viewport3D(QOpenGLWidget):
             off = self.current_section_offset()
             sign_str = "≥" if self.section_flip else "≤"
             self.fastener_message.emit(
-                f"🔪 Сечение ВКЛ: ось {self.section_axis} {sign_str} {off:.0f} мм "
+                f"Сечение ВКЛ: ось {self.section_axis} {sign_str} {off:.0f} мм "
                 f"({self.section_ratio * 100:.0f}%) | Alt+колесо — сдвиг плоскости"
             )
         else:
-            self.fastener_message.emit("🔪 Сечение ВЫКЛ")
+            self.fastener_message.emit("Сечение ВЫКЛ")
         self.update()
         return self.section_enabled
 
@@ -2938,7 +2938,7 @@ class Viewport3D(QOpenGLWidget):
         if self.section_enabled:
             off = self.current_section_offset()
             self.fastener_message.emit(
-                f"🔪 Ось сечения: {self.section_axis} ({off:.0f} мм, {self.section_ratio * 100:.0f}%)"
+                f"Ось сечения: {self.section_axis} ({off:.0f} мм, {self.section_ratio * 100:.0f}%)"
             )
         self.update()
 
@@ -2948,7 +2948,7 @@ class Viewport3D(QOpenGLWidget):
         if self.section_enabled:
             off = self.current_section_offset()
             self.fastener_message.emit(
-                f"🔪 Плоскость сечения {self.section_axis}: {off:.0f} мм ({self.section_ratio * 100:.0f}%)"
+                f"Плоскость сечения {self.section_axis}: {off:.0f} мм ({self.section_ratio * 100:.0f}%)"
             )
         self.update()
 
@@ -2959,7 +2959,7 @@ class Viewport3D(QOpenGLWidget):
             off = self.current_section_offset()
             sign_str = "≥" if self.section_flip else "≤"
             self.fastener_message.emit(
-                f"🔪 Направление сечения: оставляем {self.section_axis} {sign_str} {off:.0f} мм"
+                f"Направление сечения: оставляем {self.section_axis} {sign_str} {off:.0f} мм"
             )
         self.update()
         return self.section_flip
@@ -2973,11 +2973,11 @@ class Viewport3D(QOpenGLWidget):
         if self.section_enabled:
             if self.section_cap_enabled and self._gl_ready and not self._has_stencil_buffer:
                 self.fastener_message.emit(
-                    "▤ Заглушка сечения недоступна: драйвер OpenGL не выделил stencil-буфер (активен полый срез)"
+                    "Заглушка сечения недоступна: драйвер OpenGL не выделил stencil-буфер (активен полый срез)"
                 )
             else:
                 state_str = "ВКЛ (штриховка)" if self.section_cap_enabled else "ВЫКЛ (полый срез)"
-                self.fastener_message.emit(f"▤ Заглушка сечения: {state_str}")
+                self.fastener_message.emit(f"Заглушка сечения: {state_str}")
         self.update()
         return self.section_cap_enabled
 
@@ -3138,14 +3138,14 @@ class Viewport3D(QOpenGLWidget):
             fset = self._get_focus_panels_set()
             if fset:
                 self.fastener_message.emit(
-                    f"👁 Призраки окружения ВКЛ: в фокусе деталей — {len(fset)} (остальные прозрачны и пропускают клик)"
+                    f"Призраки окружения ВКЛ: в фокусе деталей — {len(fset)} (остальные прозрачны и пропускают клик)"
                 )
             else:
                 self.fastener_message.emit(
-                    "👁 Призраки окружения ВКЛ: выделите деталь или стык, чтобы приглушить остальные панели"
+                    "Призраки окружения ВКЛ: выделите деталь или стык, чтобы приглушить остальные панели"
                 )
         else:
-            self.fastener_message.emit("👁 Призраки окружения ВЫКЛ")
+            self.fastener_message.emit("Призраки окружения ВЫКЛ")
         self.update()
         return self.ghost_others_mode
 
@@ -4394,7 +4394,7 @@ class Viewport3D(QOpenGLWidget):
         self.measure_snap_dist_px = snap_dist
         self.measure_snap_panel = snap_panel
 
-        ctrl_badge = " [🧲 Ctrl захват]" if (ctrl_held and is_magnetic) else ""
+        ctrl_badge = " [Ctrl захват]" if (ctrl_held and is_magnetic) else ""
 
         if self.measure_mode:
             if self.measure_pt1 is not None and self.measure_pt2 is not None:
@@ -4444,11 +4444,11 @@ class Viewport3D(QOpenGLWidget):
         else:
             # Общий режим (рулетка выключена): примагничивание по нажатию Ctrl без выделения панели
             if is_magnetic:
-                msg = f"🧲 [Ctrl] Магнитная привязка: {snap_desc} ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f} мм) | ЛКМ — выделить деталь"
+                msg = f"Магнитная привязка [Ctrl]: {snap_desc} ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f} мм) | ЛКМ — выделить деталь"
                 self.fastener_message.emit(msg)
                 self.coordinates_changed.emit(float(snap_pt[0]), float(snap_pt[1]), float(snap_pt[2]))
             elif ctrl_held:
-                msg = "🧲 [Ctrl] Магнитный захват активен (54px) — наведите на угол, ребро или отверстие детали"
+                msg = "Магнитный захват [Ctrl] активен (54px) — наведите на угол, ребро или отверстие детали"
                 self.fastener_message.emit(msg)
 
         self.update()
@@ -4468,11 +4468,11 @@ class Viewport3D(QOpenGLWidget):
             self.measure_preview_dim = None
             self.measure_preview_angle = None
             if cur_target.is_face:
-                msg = f"▭ Выбрана грань 1 ({snap_desc}). Кликните вторую грань (в свету / угол) или отверстие."
+                msg = f"Выбрана грань 1 ({snap_desc}). Кликните вторую грань (в свету / угол) или отверстие."
             elif cur_target.is_hole:
-                msg = f"🕳 Выбрано отверстие 1 ({snap_desc}). Кликните второе отверстие (шаг) или грань (отступ)."
+                msg = f"Выбрано отверстие 1 ({snap_desc}). Кликните второе отверстие (шаг) или грань (отступ)."
             else:
-                msg = f"📏 Точка 1 ({snap_desc}): ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}). Кликните точку 2."
+                msg = f"Точка 1 ({snap_desc}): ({snap_pt[0]:.1f}, {snap_pt[1]:.1f}, {snap_pt[2]:.1f}). Кликните точку 2."
             self.measurement_updated.emit(msg)
             self.fastener_message.emit(msg)
         elif self.measure_pt2 is None:
@@ -4488,7 +4488,7 @@ class Viewport3D(QOpenGLWidget):
 
             if not smart.allows_third_point_angle:
                 # Умное измерение 2 объектов (грани в свету, угол граней, шаг отверстий, отступ от грани) завершено
-                msg = f"✅ {smart.status_message}"
+                msg = f"{smart.status_message}"
                 self.measurement_updated.emit(msg)
                 self.fastener_message.emit(msg)
                 self.measure_pt1 = None
@@ -4504,7 +4504,7 @@ class Viewport3D(QOpenGLWidget):
                 self.measure_preview_dim = None
                 self.measure_preview_angle = None
                 msg = (
-                    f"📏 Точка 2 установлена: L1 = {smart.dimension_line.distance:.1f} мм. "
+                    f"Точка 2 установлена: L1 = {smart.dimension_line.distance:.1f} мм. "
                     f"Кликните Точку 3 для замера УГЛА (или Esc / ПКМ — оставить линейный размер)."
                 )
                 self.measurement_updated.emit(msg)
@@ -4528,7 +4528,7 @@ class Viewport3D(QOpenGLWidget):
             self.angles.append(ang)
             deg = ang.angle_deg
             right_tag = " [Прямой угол 90°]" if ang.is_right_angle else ""
-            msg = f"✅ Угол зафиксирован: {deg:.1f}°{right_tag} (L1: {ang.distance1:.1f} мм, L2: {ang.distance2:.1f} мм)"
+            msg = f"Угол зафиксирован: {deg:.1f}°{right_tag} (L1: {ang.distance1:.1f} мм, L2: {ang.distance2:.1f} мм)"
             self.measurement_updated.emit(msg)
             self.fastener_message.emit(msg)
             self.measure_pt1 = None
@@ -4939,7 +4939,7 @@ class Viewport3D(QOpenGLWidget):
             self.stop_fastener_mode()
         payload = capture_selection(self.blocks)
         if payload is None:
-            self.fastener_message.emit("📋 Копирование: сначала выделите панели или блок")
+            self.fastener_message.emit("Копирование: сначала выделите панели или блок")
             return
         self.clipboard = payload
         self.clipboard_await_anchor = True
@@ -4948,7 +4948,7 @@ class Viewport3D(QOpenGLWidget):
         n = payload.count_panels
         b = payload.count_blocks
         self.fastener_message.emit(
-            f"📋 Скопировано: панелей {n}" + (f", блоков {b}" if b else "")
+            f"Скопировано: панелей {n}" + (f", блоков {b}" if b else "")
             + " — кликните точку привязки на оригинале, затем Ctrl+V"
         )
         self.update()
@@ -4964,18 +4964,18 @@ class Viewport3D(QOpenGLWidget):
     def begin_paste_mode(self) -> None:
         """Ctrl+V: превью вставки (нужны буфер и точка привязки)."""
         if self.clipboard is None:
-            self.fastener_message.emit("📋 Буфер пуст — сначала Ctrl+C")
+            self.fastener_message.emit("Буфер пуст — сначала Ctrl+C")
             return
         if self.clipboard.anchor is None:
             self.clipboard_await_anchor = True
-            self.fastener_message.emit("📋 Сначала кликните точку привязки на оригинале")
+            self.fastener_message.emit("Сначала кликните точку привязки на оригинале")
             return
         self.cancel_drag_mode(quiet=True)
         self.paste_mode = True
         self.clipboard_await_anchor = False
         self.setMouseTracking(True)
         self.fastener_message.emit(
-            "📋 Вставка: наведите курсор и кликните место размещения | Esc — отмена"
+            "Вставка: наведите курсор и кликните место размещения | Esc — отмена"
         )
         self.update()
 
@@ -4989,10 +4989,10 @@ class Viewport3D(QOpenGLWidget):
             )
         except Exception as exc:
             _log.exception("paste failed")
-            self.fastener_message.emit(f"📋 Ошибка вставки: {exc}")
+            self.fastener_message.emit(f"Ошибка вставки: {exc}")
             return
         if not new_blocks:
-            self.fastener_message.emit("📋 Нечего вставлять")
+            self.fastener_message.emit("Нечего вставлять")
             return
         # снять выделение со старых
         for b in self.blocks:
@@ -5005,7 +5005,7 @@ class Viewport3D(QOpenGLWidget):
         self.paste_target_point = None
         # буфер оставляем — можно вставлять ещё раз
         n = sum(len(b.panels) for b in new_blocks)
-        self.fastener_message.emit(f"📋 Вставлено панелей: {n}")
+        self.fastener_message.emit(f"Вставлено панелей: {n}")
         self.scene_structure_changed.emit()
         self.update()
 
@@ -5107,7 +5107,7 @@ class Viewport3D(QOpenGLWidget):
                             continue
                         min_t = t_hit
                         hit_pt = cand_pt
-                        prefix = "🧲 [Ctrl] " if is_ctrl else "🧲 "
+                        prefix = "Магнит [Ctrl]: " if is_ctrl else "Магнит: "
                         hit_desc = f"{prefix}Поверхность [{p.name}]"
 
             if hit_pt is not None:
@@ -5461,7 +5461,7 @@ class Viewport3D(QOpenGLWidget):
                 f"Поставлено крепежей: {n} (Ø{self.fastener_diameter:.0f}) | {warn_txt}"
             )
         else:
-            self.fastener_message.emit(f"✅ Поставлено крепежей: {n} (Ø{self.fastener_diameter:.0f})")
+            self.fastener_message.emit(f"Поставлено крепежей: {n} (Ø{self.fastener_diameter:.0f})")
         self.update()
         return True
 
@@ -5824,7 +5824,7 @@ class Viewport3D(QOpenGLWidget):
         """Вытягивает угол `corner = (sx, sy, sz)` одновременно вдоль его рабочих торцов в 3D (Push-Pull),
         идентично вытягиванию грани (`_apply_face_push_pull`):
         - Если активна только 1 рабочая ось (например, в 2D-виде с торца) — делегирует `_apply_face_push_pull`;
-        - Поддерживает магнитную привязку `🧲` к углам, рёбрам и точкам соседних деталей (или с `[Ctrl]`);
+        - Поддерживает магнитную привязку к углам, рёбрам и точкам соседних деталей (или с `[Ctrl]`);
         - Проецирует луч курсора на 3D-плоскость самой плиты через захваченный угол (без начального скачка и без переворота бокса);
         - При скользящем ракурсе камеры проецирует луч на 3D-оси рёбер угла (ближайшая точка скрещивающихся прямых).
         """
@@ -5844,7 +5844,7 @@ class Viewport3D(QOpenGLWidget):
             ax_only = active_axes[0]
             return self._apply_face_push_pull(panel, (ax_only, int(corner[ax_only])), mx, my)
 
-        # 1. Магнитная привязка к точкам других панелей сцены (если включён «🧲 Магнит» или зажат [Ctrl])
+        # 1. Магнитная привязка к точкам других панелей сцены (если включён «Магнит» или зажат [Ctrl])
         best_snap_pt, best_snap_label = self._find_magnetic_snap_point(
             mx, my, exclude_panel=panel, base_radius=18.0
         )
@@ -5948,7 +5948,7 @@ class Viewport3D(QOpenGLWidget):
         if un > 1e-12:
             u = u / un
 
-        # Магнитная привязка к точкам других панелей сцены (если включён «🧲 Магнит» или зажат [Ctrl])
+        # Магнитная привязка к точкам других панелей сцены (если включён «Магнит» или зажат [Ctrl])
         best_snap_pt, best_snap_label = self._find_magnetic_snap_point(
             mx, my, exclude_panel=panel, base_radius=18.0
         )
@@ -6271,7 +6271,7 @@ class Viewport3D(QOpenGLWidget):
                     set_anchor(self.clipboard, float(pt[0]), float(pt[1]), float(pt[2]))
                     self.clipboard_await_anchor = False
                     self.fastener_message.emit(
-                        f"📋 Точка привязки: {desc if desc else 'точка'} "
+                        f"Точка привязки: {desc if desc else 'точка'} "
                         f"({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}) — Ctrl+V для вставки"
                     )
                     self.update()
@@ -6437,7 +6437,7 @@ class Viewport3D(QOpenGLWidget):
             if raw is None:
                 raw = self._ray_hit_workplane(event.pos().x(), event.pos().y())
             if raw is not None:
-                is_mag_snap = bool(desc and desc.startswith("🧲"))
+                is_mag_snap = bool(desc and desc.startswith("Магнит"))
                 snapped = (
                     raw
                     if is_mag_snap
@@ -6448,7 +6448,7 @@ class Viewport3D(QOpenGLWidget):
                 d = snapped - np.asarray(ax, dtype=float)
                 snap_str = f" | {desc}" if is_mag_snap else ""
                 self.fastener_message.emit(
-                    f"📋 Вставка Δ ({d[0]:.1f}, {d[1]:.1f}, {d[2]:.1f}){snap_str} | клик — поставить, Esc — отмена"
+                    f"Вставка Δ ({d[0]:.1f}, {d[1]:.1f}, {d[2]:.1f}){snap_str} | клик — поставить, Esc — отмена"
                 )
             self.update()
             return
@@ -6463,7 +6463,7 @@ class Viewport3D(QOpenGLWidget):
                 raw_target, self.drag_target_desc = self._find_target_snap_point(event.pos().x(), event.pos().y())
                 if self.drag_base_point is not None and raw_target is not None and self.drag_panel is not None:
                     delta = self._apply_axis_lock(raw_target - self.drag_base_point)
-                    is_mag_snap = bool(self.drag_target_desc and self.drag_target_desc.startswith("🧲"))
+                    is_mag_snap = bool(self.drag_target_desc and self.drag_target_desc.startswith("Магнит"))
                     self.drag_face_snap_desc = self.drag_target_desc if is_mag_snap else ""
                     target = self.drag_base_point + delta
                     if not is_mag_snap:
@@ -6477,7 +6477,7 @@ class Viewport3D(QOpenGLWidget):
                     if self.grid_enabled and self.is_ortho and not is_mag_snap:
                         grid_str = f" | сетка {self.grid_step:g} мм"
                     msg = (
-                        f"📍 ΔX={delta[0]:+.1f} ΔY={delta[1]:+.1f} ΔZ={delta[2]:+.1f} "
+                        f"ΔX={delta[0]:+.1f} ΔY={delta[1]:+.1f} ΔZ={delta[2]:+.1f} "
                         f"(L={dist:.1f}) | {self.drag_target_desc}{grid_str}{axis_str} | ЛКМ — OK"
                     )
                     self.fastener_message.emit(msg)
@@ -6570,12 +6570,12 @@ class Viewport3D(QOpenGLWidget):
         kind, key = hit
         if kind == "home":
             self.go_home_view(animate=True)
-            self.fastener_message.emit("⌂ Вид: Домой (изометрия)")
+            self.fastener_message.emit("Вид: Домой (изометрия)")
             return True
         rx, ry, ortho, label = target_for_hit(kind, key)
         self.view_name = key if kind == "face" else "custom"
         self.animate_camera_to(rx, ry, is_ortho=ortho)
-        self.fastener_message.emit(f"🧭 Вид: {label}")
+        self.fastener_message.emit(f"Вид: {label}")
         return True
 
     def _try_viewcube_click(self, mx: int, my: int) -> bool:
@@ -6718,7 +6718,7 @@ class Viewport3D(QOpenGLWidget):
                     self.scene_structure_changed.emit()
                     self.panel_clicked.emit(p)
                     self.fastener_message.emit(
-                        f"✅ Размер [{p.name}]: {p.width:.1f} × {p.height:.1f} × {p.depth:.1f} мм"
+                        f"Размер [{p.name}]: {p.width:.1f} × {p.height:.1f} × {p.depth:.1f} мм"
                     )
                 self.update()
                 self.is_dragging = False
@@ -6759,12 +6759,12 @@ class Viewport3D(QOpenGLWidget):
                         hits = self._check_panel_collisions(moved)
                         if hits:
                             names = ", ".join(f"{p.name} ({int(v)} мм³)" for p, v in hits[:4])
-                            msg = f"⚠️ '{moved.name}' на ({new_xyz[0]:.1f}, {new_xyz[1]:.1f}, {new_xyz[2]:.1f}) — пересечение: {names}"
+                            msg = f"'{moved.name}' на ({new_xyz[0]:.1f}, {new_xyz[1]:.1f}, {new_xyz[2]:.1f}) — пересечение: {names}"
                             for p, _v in hits:
                                 p.selected = True
                             moved.selected = True
                         else:
-                            msg = f"✅ '{moved.name}' зафиксирована: ({new_xyz[0]:.1f}, {new_xyz[1]:.1f}, {new_xyz[2]:.1f})"
+                            msg = f"'{moved.name}' зафиксирована: ({new_xyz[0]:.1f}, {new_xyz[1]:.1f}, {new_xyz[2]:.1f})"
                         self.fastener_message.emit(msg)
                         self.cancel_drag_mode(quiet=True)
                         self.update()
@@ -7200,22 +7200,22 @@ class Viewport3D(QOpenGLWidget):
         if self.drag_mode and self.drag_stage == 2:
             if event.key() == Qt.Key.Key_X:
                 self.drag_axis_lock = "X"
-                self.fastener_message.emit("🔒 Ось X (только горизонталь по ширине сцены)")
+                self.fastener_message.emit("Ось X (только горизонталь по ширине сцены)")
                 self.update()
                 return
             if event.key() == Qt.Key.Key_Y:
                 self.drag_axis_lock = "Y"
-                self.fastener_message.emit("🔒 Ось Y (только высота)")
+                self.fastener_message.emit("Ось Y (только высота)")
                 self.update()
                 return
             if event.key() == Qt.Key.Key_Z:
                 self.drag_axis_lock = "Z"
-                self.fastener_message.emit("🔒 Ось Z (только глубина)")
+                self.fastener_message.emit("Ось Z (только глубина)")
                 self.update()
                 return
             if event.key() == Qt.Key.Key_Shift:
                 self.drag_axis_lock = None
-                self.fastener_message.emit("🔓 Свободное перемещение (все оси)")
+                self.fastener_message.emit("Свободное перемещение (все оси)")
                 self.update()
                 return
         # Крепёж: Tab — пресет; 2/3/4 — число точек (сбрасывает pitch)
@@ -7287,7 +7287,7 @@ class Viewport3D(QOpenGLWidget):
                 hits = self._check_panel_collisions(sel)
                 if hits:
                     names = ", ".join(p.name for p, _ in hits[:3])
-                    self.fastener_message.emit(f"⚠️ Пересечение после сдвига: {sel.name} ↔ {names}")
+                    self.fastener_message.emit(f"Пересечение после сдвига: {sel.name} ↔ {names}")
                 self.update()
                 return
 

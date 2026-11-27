@@ -73,6 +73,8 @@ class PropertiesDock(QDockWidget):
         return "properties"
 
     def refresh_theme(self) -> None:
+        if hasattr(self.joints_panel, "refresh_theme"):
+            self.joints_panel.refresh_theme()
         if hasattr(self.assoc_panel, "refresh_theme"):
             self.assoc_panel.refresh_theme()
 
@@ -504,7 +506,14 @@ class PropertiesDock(QDockWidget):
                 selected_idx = i + 1
 
         if current_edge_id and selected_idx == 0:
-            combo.addItem(f"⚠ Не найдена в каталоге ({current_edge_id})", current_edge_id)
+            from ui.icon_utils import render_svg_icon
+            from ui.theme import current_theme
+
+            warn_ico = render_svg_icon("status_warning.svg", current_theme().warning, 14)
+            if warn_ico is not None:
+                combo.addItem(warn_ico, f"Не найдена в каталоге ({current_edge_id})", current_edge_id)
+            else:
+                combo.addItem(f"Не найдена в каталоге ({current_edge_id})", current_edge_id)
             selected_idx = combo.count() - 1
 
         combo.setCurrentIndex(selected_idx)
@@ -668,8 +677,8 @@ class PropertiesDock(QDockWidget):
                     item.setText(f"{new_val:g}" if isinstance(new_val, float) else str(new_val))
                 finally:
                     self._updating = False
-                mark = "📌" if self._pending_driver_expr else "🧮"
-                self.validation_failed.emit(f"{mark} Формула [{attr_name}]: {raw_input} = {new_val:g}")
+                prefix = "Драйвер" if self._pending_driver_expr else "Формула"
+                self.validation_failed.emit(f"{prefix} [{attr_name}]: {raw_input} = {new_val:g}")
 
         if old_val == new_val and self._pending_driver_expr is None:
             return

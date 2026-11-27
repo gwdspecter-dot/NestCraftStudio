@@ -30,10 +30,12 @@ from PyQt6.QtWidgets import (
     QMenu,
     QSizePolicy,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush, QAction
 
 from core.logging_setup import get_logger
+from ui.icon_utils import render_svg_icon
+from ui.theme import current_theme
 
 _log = get_logger("catalog_ui")
 
@@ -176,7 +178,7 @@ class CatalogBrowserDialog(QDialog):
         root.addLayout(bottom, stretch=0)
 
         self._refresh_stats()
-        self._reload_group_tree()
+        self.refresh_theme()
         self._reload_all()
         self._update_assign_button()
         self._update_material_action_buttons()
@@ -221,13 +223,13 @@ class CatalogBrowserDialog(QDialog):
         self.add_mat_btn.clicked.connect(self._on_add_material)
         filters.addWidget(self.add_mat_btn)
 
-        self.edit_mat_btn = QPushButton("✎ Изменить")
+        self.edit_mat_btn = QPushButton("Изменить")
         self.edit_mat_btn.setToolTip("Редактировать выбранный материал")
         self.edit_mat_btn.setEnabled(False)
         self.edit_mat_btn.clicked.connect(self._on_edit_material)
         filters.addWidget(self.edit_mat_btn)
 
-        self.del_mat_btn = QPushButton("✕ Удалить")
+        self.del_mat_btn = QPushButton("Удалить")
         self.del_mat_btn.setToolTip("Удалить выбранный материал из каталога")
         self.del_mat_btn.setEnabled(False)
         self.del_mat_btn.clicked.connect(self._on_delete_material)
@@ -371,13 +373,13 @@ class CatalogBrowserDialog(QDialog):
         self.add_edge_btn.clicked.connect(self._on_add_edge)
         filters.addWidget(self.add_edge_btn)
 
-        self.edit_edge_btn = QPushButton("✎ Изменить")
+        self.edit_edge_btn = QPushButton("Изменить")
         self.edit_edge_btn.setToolTip("Редактировать выбранную кромку")
         self.edit_edge_btn.setEnabled(False)
         self.edit_edge_btn.clicked.connect(self._on_edit_edge)
         filters.addWidget(self.edit_edge_btn)
 
-        self.del_edge_btn = QPushButton("✕ Удалить")
+        self.del_edge_btn = QPushButton("Удалить")
         self.del_edge_btn.setToolTip("Удалить выбранную кромку из каталога")
         self.del_edge_btn.setEnabled(False)
         self.del_edge_btn.clicked.connect(self._on_delete_edge)
@@ -411,7 +413,7 @@ class CatalogBrowserDialog(QDialog):
         assign_box = QGroupBox("Нанесение кромки на деталь")
         ab_layout = QVBoxLayout(assign_box)
 
-        self.btn_edge_all = QPushButton("🔲 На все 4 стороны")
+        self.btn_edge_all = QPushButton("На все 4 стороны")
         self.btn_edge_all.setToolTip("Облицевать выбранной кромкой все 4 торца (верх, низ, лево, право)")
         self.btn_edge_all.setEnabled(False)
         self.btn_edge_all.clicked.connect(self._on_assign_edge_all)
@@ -794,9 +796,9 @@ class CatalogBrowserDialog(QDialog):
         if hasattr(self, "btn_edge_all"):
             self.btn_edge_all.setEnabled(can_assign)
             if can_assign:
-                self.btn_edge_all.setText(f"🔲 На все 4 стороны → {self._target_panel_name}")
+                self.btn_edge_all.setText(f"На все 4 стороны → {self._target_panel_name}")
             else:
-                self.btn_edge_all.setText("🔲 На все 4 стороны")
+                self.btn_edge_all.setText("На все 4 стороны")
         if hasattr(self, "btn_edge_side"):
             self.btn_edge_side.setEnabled(can_assign)
 
@@ -979,11 +981,38 @@ class CatalogBrowserDialog(QDialog):
     #  Дерево групп
     # ══════════════════════════════════════════════════════════
 
+    def refresh_theme(self) -> None:
+        c = current_theme()
+        icon_map = (
+            ("add_mat_btn", "action_add.svg", c.text),
+            ("edit_mat_btn", "action_edit.svg", c.text),
+            ("del_mat_btn", "action_delete.svg", c.text),
+            ("add_edge_btn", "action_add.svg", c.text),
+            ("edit_edge_btn", "action_edit.svg", c.text),
+            ("del_edge_btn", "action_delete.svg", c.text),
+            ("btn_edge_all", "action_edge_all.svg", c.text),
+        )
+        for attr, fname, color in icon_map:
+            btn = getattr(self, attr, None)
+            if btn is not None and hasattr(btn, "setIcon"):
+                ico = render_svg_icon(fname, color, 15)
+                if ico is not None:
+                    btn.setIcon(ico)
+        if hasattr(self, "group_tree"):
+            self.group_tree.setIconSize(QSize(16, 16))
+            self._reload_group_tree()
+
     def _reload_group_tree(self) -> None:
+        c = current_theme()
         self.group_tree.blockSignals(True)
         self.group_tree.clear()
+        self.group_tree.setIconSize(QSize(16, 16))
         if not self._catalog:
-            self.group_tree.addTopLevelItem(QTreeWidgetItem(["⚠ Каталог недоступен"]))
+            warn_item = QTreeWidgetItem(["Каталог недоступен"])
+            warn_ico = render_svg_icon("status_warning.svg", c.warning, 16)
+            if warn_ico is not None:
+                warn_item.setIcon(0, warn_ico)
+            self.group_tree.addTopLevelItem(warn_item)
             self.group_tree.blockSignals(False)
             return
         try:
@@ -991,7 +1020,11 @@ class CatalogBrowserDialog(QDialog):
                 self._catalog.ensure_default_groups()
             groups = self._catalog.list_groups()
         except Exception as e:
-            self.group_tree.addTopLevelItem(QTreeWidgetItem([f"⚠ Ошибка: {e}"]))
+            err_item = QTreeWidgetItem([f"Ошибка: {e}"])
+            err_ico = render_svg_icon("status_warning.svg", c.warning, 16)
+            if err_ico is not None:
+                err_item.setIcon(0, err_ico)
+            self.group_tree.addTopLevelItem(err_item)
             self.group_tree.blockSignals(False)
             return
 
@@ -1023,12 +1056,21 @@ class CatalogBrowserDialog(QDialog):
                 return sum(fst_counts.get(i, 0) for i in ids)
             return sum(mat_counts.get(i, 0) for i in ids)
 
+        scope_icons = {
+            "material": render_svg_icon("action_material.svg", c.text, 16),
+            "edge": render_svg_icon("action_edge.svg", c.text, 16),
+            "fastener": render_svg_icon("struct_fastener.svg", c.accent, 16),
+        }
+        default_folder_ico = render_svg_icon("action_folder.svg", c.text, 16)
+
         def add_children(parent_item, parent_id):
             for g in sorted(by_parent.get(parent_id, []), key=lambda x: (x.sort_order, x.name)):
-                icon = {"material": "📄", "edge": "📏", "fastener": "🔩"}.get(g.scope, "📁")
                 n = count_for(g)
-                label = f"{icon} {g.name}" + (f"  ({n})" if n else "")
+                label = f"{g.name}" + (f"  ({n})" if n else "")
                 item = QTreeWidgetItem([label])
+                ico = scope_icons.get(g.scope, default_folder_ico)
+                if ico is not None:
+                    item.setIcon(0, ico)
                 item.setData(0, Qt.ItemDataRole.UserRole, g.id)
                 item.setData(0, Qt.ItemDataRole.UserRole + 1, g.scope)
                 item.setToolTip(0, f"{g.name} · {g.scope}")
@@ -1038,7 +1080,10 @@ class CatalogBrowserDialog(QDialog):
                     parent_item.addChild(item)
                 add_children(item, g.id)
 
-        root = QTreeWidgetItem(["📚 Все позиции"])
+        root = QTreeWidgetItem(["Все позиции"])
+        lib_ico = render_svg_icon("action_library.svg", c.accent, 16)
+        if lib_ico is not None:
+            root.setIcon(0, lib_ico)
         root.setData(0, Qt.ItemDataRole.UserRole, None)
         root.setData(0, Qt.ItemDataRole.UserRole + 1, "all")
         self.group_tree.addTopLevelItem(root)

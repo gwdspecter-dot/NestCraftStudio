@@ -1,5 +1,8 @@
 from PyQt6.QtWidgets import QDockWidget, QWidget, QVBoxLayout, QPushButton, QListWidget, QListWidgetItem
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal, Qt, QSize
+
+from ui.icon_utils import render_svg_icon
+from ui.theme import current_theme
 
 
 class AnalysisDock(QDockWidget):
@@ -12,16 +15,54 @@ class AnalysisDock(QDockWidget):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        self.btn_check = QPushButton("🔍 Проверить модель (Проблемы и пересечения 3D)")
+        self.btn_check = QPushButton("Проверить модель (Проблемы и пересечения 3D)")
+        self.btn_check.setIconSize(QSize(16, 16))
         self.btn_check.clicked.connect(self.run_analysis_requested.emit)
         layout.addWidget(self.btn_check)
 
         self.list_widget = QListWidget()
+        self.list_widget.setIconSize(QSize(16, 16))
         self.list_widget.addItem("Готово к проверке через ядро OpenCASCADE (B-Rep)")
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self.list_widget)
 
+        self.refresh_theme()
         self.setWidget(container)
+
+    @staticmethod
+    def _icon_for_severity(severity: str):
+        c = current_theme()
+        if severity == "error":
+            return render_svg_icon("status_error.svg", c.error, 16)
+        if severity == "ok":
+            return render_svg_icon("status_ok.svg", c.success, 16)
+        if severity == "busy":
+            return render_svg_icon("status_busy.svg", c.accent, 16)
+        return render_svg_icon("status_warning.svg", c.warning, 16)
+
+    def refresh_theme(self) -> None:
+        c = current_theme()
+        search_ico = render_svg_icon("action_search.svg", c.text, 16)
+        if search_ico is not None:
+            self.btn_check.setIcon(search_ico)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item is None:
+                continue
+            sev = item.data(Qt.ItemDataRole.UserRole + 2)
+            if sev:
+                ico = self._icon_for_severity(str(sev))
+                if ico is not None:
+                    item.setIcon(ico)
+
+    def set_busy_message(self, text: str = "Анализ пересечений…") -> None:
+        self.list_widget.clear()
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole + 2, "busy")
+        ico = self._icon_for_severity("busy")
+        if ico is not None:
+            item.setIcon(ico)
+        self.list_widget.addItem(item)
 
     def add_issue_item(self, text: str, panel_uid: str = "", code: str = "", severity: str = "warning") -> QListWidgetItem:
         item = QListWidgetItem(text)
@@ -31,16 +72,29 @@ class AnalysisDock(QDockWidget):
             item.setData(Qt.ItemDataRole.UserRole + 1, str(code))
         if severity:
             item.setData(Qt.ItemDataRole.UserRole + 2, str(severity))
+            ico = self._icon_for_severity(str(severity))
+            if ico is not None:
+                item.setIcon(ico)
         self.list_widget.addItem(item)
         return item
 
-    def set_issues(self, issues: list, *, empty_message: str = "✅ Ошибок нет! Замечаний и пересечений деталей не обнаружено.") -> None:
+    def set_issues(
+        self,
+        issues: list,
+        *,
+        empty_message: str = "Ошибок нет! Замечаний и пересечений деталей не обнаружено.",
+    ) -> None:
         """Заполняет единый список замечаний списком объектов Issue."""
         self.list_widget.clear()
         if not issues:
             self.setWindowTitle("Проблемы")
             if empty_message:
-                self.list_widget.addItem(empty_message)
+                item = QListWidgetItem(empty_message)
+                item.setData(Qt.ItemDataRole.UserRole + 2, "ok")
+                ico = self._icon_for_severity("ok")
+                if ico is not None:
+                    item.setIcon(ico)
+                self.list_widget.addItem(item)
             return
         self.setWindowTitle(f"Проблемы ({len(issues)})")
         for iss in issues:

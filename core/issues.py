@@ -29,7 +29,7 @@ class Issue:
     message: str
 
     def format_line(self) -> str:
-        prefix = "❌" if self.severity == "error" else "⚠️"
+        prefix = "[Ошибка]" if self.severity == "error" else "[Предупреждение]"
         return f"{prefix} {self.message}"
 
 
@@ -519,8 +519,7 @@ def issues_from_collision_hits(hits: list) -> list[Issue]:
     for p1, p2, vol in hits or []:
         puid = str(getattr(p1, "uid", "") or getattr(p2, "uid", "") or "")
         text = CADKernel.format_collision_hit(p1, p2, vol)
-        # Срезаем ведущий эмодзи из format_collision_hit, т.к. Issue.format_line() добавляет его сам
-        clean_msg = text.lstrip("❌⚠️ ").strip()
+        clean_msg = text.strip()
         if vol is None or (isinstance(vol, float) and math.isnan(vol)):
             out.append(
                 Issue(
